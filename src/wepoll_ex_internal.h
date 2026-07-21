@@ -1,0 +1,360 @@
+/*
+ * wepoll_ex_internal.h — internal declarations shared across wepoll-ex
+ * translation units.  Not part of the public API.
+ */
+#ifndef WEPOLL_EX_INTERNAL_H_
+#define WEPOLL_EX_INTERNAL_H_
+
+#include "wepoll_ex.h"
+
+#include <stdatomic.h>
+#include <pthread.h>
+#include <limits.h>
+#include <errno.h>
+
+#ifdef _WIN32
+#  include <winsock2.h>
+#  include <mswsock.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
+#  include <winternl.h>
+#else
+/* POSIX shims — let the shared internal header compile on Linux
+ * so the AFD buffer pool + ready queue (which are platform-
+ * independent) can be used in both builds.  The Windows-only
+ * fields are present but never touched at runtime on POSIX. */
+#  ifndef HANDLE
+   typedef void *HANDLE;
+#  endif
+#  ifndef ULONG
+   typedef unsigned long ULONG;
+#  endif
+#  ifndef DWORD
+   typedef unsigned long DWORD;
+#  endif
+#  ifndef NTSTATUS
+   typedef long NTSTATUS;
+#  endif
+#  ifndef SOCKET
+   typedef int SOCKET;
+#  endif
+#  ifndef LARGE_INTEGER
+   typedef struct { long long QuadPart; } LARGE_INTEGER;
+#  endif
+#  ifndef NTAPI
+#    define NTAPI
+#  endif
+   typedef struct { void *Pointer; unsigned long Internal, InternalHigh; } OVERLAPPED;
+   typedef struct { void *lpCompletionKey; OVERLAPPED *lpOverlapped; unsigned long Internal; DWORD dwNumberOfBytesTransferred; } OVERLAPPED_ENTRY;
+   typedef void *PVOID;
+   typedef void *PIO_STATUS_BLOCK;
+#  ifndef STATUS_PENDING
+#    define STATUS_PENDING ((NTSTATUS)0x00000103)
+#  endif
+#  ifndef STATUS_CANCELLED
+#    define STATUS_CANCELLED ((NTSTATUS)0xC0000120)
+#  endif
+#endif
+
+/* ----------------------------------------------------------------------- */
+/* Compile-time configuration.                                             */
+/* ----------------------------------------------------------------------- */
+
+/* Initial size of the per-port fd table.  Grows on demand. */
+#define WEPOLL_INITIAL_FDS       256
+
+/* Number of AFD poll buffers to keep in the per-port pool. */
+#define WEPOLL_AFD_POOL_SIZE     64
+
+/* Maximum number of events returned by a single epoll_wait call. */
+#define WEPOLL_MAX_EVENTS        4096
+
+/* ----------------------------------------------------------------------- */
+/* Forward declarations.                                                   */
+/* ----------------------------------------------------------------------- */
+
+typedef struct ep_port      ep_port_t;
+typedef struct ep_sock      ep_sock_t;
+typedef struct ep_poll_ctx  ep_poll_ctx_t;
+
+/* ----------------------------------------------------------------------- */
+/* AFD — Ancillary Function Driver.                                        */
+/*                                                                         */
+/* wepoll uses NtDeviceIoControlFile against the AFD device to register    */
+/* kernel-side poll requests on sockets.  AFD is undocumented but stable   */
+/* since Windows 8 and is the same mechanism WSAPoll uses internally.      */
+/* ----------------------------------------------------------------------- */
+
+#define AFD_DEVICE_NAME   L"\\Device\\Afd"
+#define AFD_MAX_ADDRESS_LENGTH  32
+
+typedef struct _AFD_POLL_HANDLE_INFO {
+    HANDLE Handle;
+    ULONG Events;
+    NTSTATUS Status;
+} AFD_POLL_HANDLE_INFO, *PAFD_POLL_HANDLE_INFO;
+
+typedef struct _AFD_POLL_INFO {
+    LARGE_INTEGER Timeout;
+    ULONG NumberOfHandles;
+    ULONG Exclusive;
+    AFD_POLL_HANDLE_INFO Handles[1];
+} AFD_POLL_INFO, *PAFD_POLL_INFO;
+
+#define AFD_POLL_RECEIVE_BIT           0
+#define AFD_POLL_RECEIVE               (1 << 0)
+#define AFD_POLL_RECEIVE_EXPEDITED     (1 << 1)
+#define AFD_POLL_RECEIVE_DISCONNECT    (1 << 3)
+#define AFD_POLL_DISCONNECT            (1 << 4)
+#define AFD_POLL_CONNECT_BIT           5
+#define AFD_POLL_CONNECT_FAIL          (1 << 6)
+#define AFD_POLL_ACCEPT_BIT           6
+#define AFD_POLL_ABORT_BIT            7
+#define AFD_POLL_LOCAL_CLOSE_BIT      8
+#define AFD_POLL_LOCAL_CLOSE          (1 << 8)
+#define AFD_POLL_CONNECT               (1 << 9)
+#define AFD_POLL_CANCEL_BIT           10
+#define AFD_POLL_ABORT                (1 << 11)
+#define AFD_POLL_SEND_BIT             12
+#define AFD_POLL_SEND                 (1 << 13)
+
+/* IoControlCode for AFD_POLL.  Reverse-engineered; matches Win8+. */
+#define IOCTL_AFD_POLL  0x00012024
+
+/* Function pointer types for the NTDLL entry points we resolve at startup. */
+typedef NTSTATUS (NTAPI *PNtDeviceIoControlFile)(
+    HANDLE FileHandle,
+    HANDLE Event,
+    PVOID ApcRoutine,
+    PVOID ApcContext,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    ULONG IoControlCode,
+    PVOID InputBuffer,
+    ULONG InputBufferLength,
+    PVOID OutputBuffer,
+    ULONG OutputBufferLength);
+
+/* ----------------------------------------------------------------------- */
+/* ep_sock_t — per-fd state.                                               */
+/*                                                                         */
+/* One of these is allocated for every fd registered with epoll_ctl and    */
+/* kept alive until either EPOLL_CTL_DEL or close().  The poll request     */
+/* is asynchronously pended against AFD; when it completes, the IOCP       */
+/* delivers the OVERLAPPED embedded in this struct.                        */
+/* ----------------------------------------------------------------------- */
+
+typedef enum ep_sock_state {
+    EP_SOCK_INVALID = 0,
+    EP_SOCK_REGISTERED,    /* epoll_ctl ADD succeeded, no poll pending */
+    EP_SOCK_POLLING,       /* AFD poll request pended */
+    EP_SOCK_READY,         /* poll completed, awaiting epoll_wait delivery */
+    EP_SOCK_DELETED        /* pending EPOLL_CTL_DEL, awaiting teardown */
+} ep_sock_state_t;
+
+struct ep_sock {
+    /* Pool linkage (all live sockets on this port). */
+    struct ep_sock *next;
+    struct ep_sock *prev;
+
+    /* The fd this sock tracks. */
+    SOCKET fd;
+
+    /* User-supplied event mask + data + per-fd context. */
+    uint32_t      user_events;    /* EPOLLIN | EPOLLOUT | … */
+    uint32_t      user_flags;     /* EPOLLET | EPOLLONESHOT | … */
+    epoll_data_t  user_data;
+    void         *user_ctx;
+
+    /* State machine. */
+    _Atomic uint32_t state;
+
+    /* Pending AFD events (events the kernel reported but we have not yet
+     * delivered to user via epoll_wait). */
+    uint32_t pending_events;
+
+    /* Whether a poll is currently pended. */
+    uint8_t poll_pending;
+
+    /* Whether the oneshot mask has fired and the fd needs re-arm. */
+    uint8_t oneshot_fired;
+
+    /* IOCP overlapped for the in-flight AFD_POLL request. */
+    OVERLAPPED overlapped;
+
+    /* The AFD poll buffer for this socket.  Allocated separately so the
+     * buffer can be reused across re-arming without copying. */
+    AFD_POLL_INFO *afd_info;
+
+    /* Back-pointer to owning port (for IOCP callback lookup). */
+    ep_port_t *port;
+};
+
+/* ----------------------------------------------------------------------- */
+/* ep_port_t — one per epoll instance.                                     */
+/* ----------------------------------------------------------------------- */
+
+/* ----------------------------------------------------------------------- */
+/* MPSC lock-free ready queue.                                            */
+/*                                                                       */
+/* Multiple producers (IOCP worker threads completing AFD polls) push    */
+/* nodes atomically via compare-and-swap on the tail.  Single consumer  */
+/* (the epoll_wait caller) drains the entire queue with an atomic        */
+/* exchange on the head pointer.                                        */
+/*                                                                       */
+/* This eliminates the pthread_mutex_t contention that previously        */
+/* dominated multi-worker configurations.                               */
+/* ----------------------------------------------------------------------- */
+
+typedef struct ep_ready_node {
+    _Atomic(struct ep_ready_node *) next;
+    ep_sock_t   *sock;        /* owning sock — for user_data lookup */
+    uint32_t      events;
+    uint32_t      flags;      /* WEPOLL_FLAG_* delivery flags */
+    uint64_t      timestamp;
+} ep_ready_node_t;
+
+typedef struct ep_ready_queue {
+    /* MPSC invariant: producers append to tail via CAS; consumer
+     * swaps head with a sentinel and walks the chain. */
+    _Atomic(ep_ready_node_t *) head;
+    _Atomic(ep_ready_node_t *) tail;
+
+    /* Sentinel node — always present.  head/tail always point to
+     * a node (initially the stub).  Pushes append after tail;
+     * drains snap head->next and reposition head. */
+    ep_ready_node_t *stub;
+
+    /* Pre-allocated node freelist — fed by the AFD buffer pool so
+     * the producer path never hits malloc. */
+    _Atomic(ep_ready_node_t *) free_list;
+} ep_ready_queue_t;
+
+/* AFD buffer pool — pre-allocated AFD_POLL_INFO buffers and ready
+ * queue nodes, recycled LIFO.  Eliminates the malloc/calloc on the
+ * EPOLL_CTL_ADD hot path and on every IOCP completion. */
+typedef struct ep_afd_pool {
+    _Atomic(void *) stack;   /* LIFO stack of free buffers */
+    size_t           buf_size;
+    size_t           capacity;
+    _Atomic(size_t)  in_use;
+    _Atomic(size_t)  peak;
+} ep_afd_pool_t;
+
+struct ep_port {
+    /* The IOCP handle that drives this epoll instance. */
+    HANDLE iocp;
+
+    /* Handle to AFD, opened once per port. */
+    HANDLE afd;
+
+    /* Per-port fd table — indexed by SOCKET value masked by fd_mask.
+     * Grows when more than 75 % full.  NULL entries are unused slots. */
+    ep_sock_t      **fd_table;
+    size_t           fd_table_size;
+    size_t           fd_table_count;
+    pthread_mutex_t  fd_table_lock;
+
+    /* All live socks on this port, chained for cleanup. */
+    ep_sock_t       *sock_list_head;
+    pthread_mutex_t  sock_list_lock;
+
+    /* Ready queue — MPSC lock-free.  Drained by epoll_wait. */
+    ep_ready_queue_t ready_queue;
+
+    /* AFD buffer pool — pre-allocated AFD_POLL_INFO buffers and
+     * ready-queue nodes, recycled LIFO.  Eliminates malloc on the
+     * EPOLL_CTL_ADD and IOCP completion hot paths. */
+    ep_afd_pool_t    afd_info_pool;   /* AFD_POLL_INFO buffers */
+    ep_afd_pool_t    ready_node_pool; /* ep_ready_node_t nodes   */
+
+    /* Batched IOCP delivery.  GetQueuedCompletionStatusEx returns
+     * up to `iocp_batch_size` completions in one call, amortising
+     * the syscall cost across multiple events. */
+    OVERLAPPED_ENTRY *iocp_entries;
+    ULONG              iocp_batch_size;
+
+    /* Configuration snapshot. */
+    int close_on_exec;
+
+    /* Atomic generation counter bumped on every ADD/DEL/MOD.  Used by
+     * epoll_wait to detect ABA races when the ready queue is drained. */
+    _Atomic uint64_t generation;
+};
+
+/* ----------------------------------------------------------------------- */
+/* Resolved NTDLL symbols (singleton).                                     */
+/* ----------------------------------------------------------------------- */
+
+typedef struct ep_ntdll {
+    PNtDeviceIoControlFile  NtDeviceIoControlFile;
+    int                     initialized;
+} ep_ntdll_t;
+
+extern ep_ntdll_t g_ntdll;
+
+/* ----------------------------------------------------------------------- */
+/* Internal API.                                                           */
+/* ----------------------------------------------------------------------- */
+
+int  ep_global_init(void);
+void ep_global_fini(void);
+
+int  ep_port_create(int size_hint, int flags, ep_port_t **out);
+void ep_port_destroy(ep_port_t *port);
+
+int  ep_port_register(ep_port_t *port, SOCKET fd,
+                      uint32_t events, uint32_t flags,
+                      epoll_data_t data, void *ctx);
+int  ep_port_modify(ep_port_t *port, SOCKET fd,
+                    uint32_t events, uint32_t flags,
+                    epoll_data_t data, void *ctx);
+int  ep_port_unregister(ep_port_t *port, SOCKET fd);
+int  ep_port_rearm(ep_port_t *port, SOCKET fd);
+
+int  ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
+                  int timeout_ms, const sigset_t *sigmask);
+
+void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes,
+                               NTSTATUS status);
+
+/* errno shim. */
+void ep_set_errno(int e);
+int  ep_last_err(void);
+
+/* Map NTSTATUS -> errno. */
+int  ep_status_to_errno(NTSTATUS s);
+int  ep_winerr_to_errno(DWORD wsaerr);
+
+/* ----------------------------------------------------------------------- */
+/* AFD buffer pool — LIFO stack of pre-allocated buffers.                 */
+/*                                                                       */
+/* ep_afd_pool_init   : allocate `capacity` buffers of `buf_size` bytes. */
+/* ep_afd_pool_destroy: free everything.                                 */
+/* ep_afd_pool_take   : pop a buffer, or malloc a fresh one if pool is   */
+/*                      exhausted (the fresh allocation will be          */
+/*                      returned via ep_afd_pool_give when the caller is */
+/*                      done, growing the pool on-the-fly).              */
+/* ep_afd_pool_give   : return a buffer to the pool.                     */
+/* ----------------------------------------------------------------------- */
+int   ep_afd_pool_init(ep_afd_pool_t *p, size_t buf_size, size_t capacity);
+void  ep_afd_pool_destroy(ep_afd_pool_t *p);
+void *ep_afd_pool_take(ep_afd_pool_t *p);
+void  ep_afd_pool_give(ep_afd_pool_t *p, void *buf);
+
+/* ----------------------------------------------------------------------- */
+/* MPSC lock-free ready queue.                                           */
+/* ----------------------------------------------------------------------- */
+void  ep_ready_init(ep_ready_queue_t *q);
+void  ep_ready_destroy(ep_ready_queue_t *q);
+void  ep_ready_push(ep_ready_queue_t *q, ep_ready_node_t *node);
+/* Drain up to maxevents nodes.  Returns a singly-linked chain that
+ * the caller walks via the `next` field.  Nodes are NOT freed —
+ * caller must return each node to the ready_node_pool. */
+ep_ready_node_t *ep_ready_drain(ep_ready_queue_t *q, int maxevents);
+
+/* Convenience wrappers around the ready_node_pool: alloc returns a
+ * node from the pool (or freshly malloc'd), free returns one. */
+ep_ready_node_t *ep_ready_node_alloc(ep_port_t *port);
+void             ep_ready_node_free(ep_port_t *port, ep_ready_node_t *n);
+
+#endif /* WEPOLL_EX_INTERNAL_H_ */

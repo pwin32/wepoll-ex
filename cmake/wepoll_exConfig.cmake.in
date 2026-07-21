@@ -1,0 +1,16 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/wepoll_exTargets.cmake")
+
+set(WEPOLL_EX_VERSION "@PROJECT_VERSION@")
+
+if(TARGET wepoll_ex::wepoll_ex)
+    set(WEPOLL_EX_FOUND TRUE)
+endif()
+
+include(CMakeFindDependencyMacro)
+
+# On POSIX we depend on Threads.
+if(UNIX)
+    find_dependency(Threads)
+endif()

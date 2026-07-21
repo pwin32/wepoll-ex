@@ -1,0 +1,37 @@
+# Local Codex state and machine-specific launchers
+/.codex/
+/codex.sh
+
+# Out-of-source CMake and other build output
+/build/
+/build-*/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+install_manifest.txt
+compile_commands.json
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dll
+*.exe
+*.pdb
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Reference-only nginx source archive
+/nginx-1.31.3.tar.gz
