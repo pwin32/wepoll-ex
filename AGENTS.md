@@ -1,29 +1,60 @@
 # Repository Guidelines
 
-## Project Structure
+## Project Status and Layout
 
-This is a C11/CMake project. `src/` contains the implementation: Windows IOCP/AFD code, the shared pool and queue, and the POSIX development shim. Public headers live in `include/`. `tests/` contains the CTest-backed API and MPSC/pool tests; `bench/` contains the optional latency benchmark. The nginx adapter is in `nginx/`, with design and integration notes in `docs/`. Keep `nginx-1.31.3.tar.gz` as reference material only—do not stage or commit it.
+`wepoll-ex` is an experimental C11/CMake prototype, not a production-ready
+Windows event library. `src/` contains the Windows IOCP/AFD path and the POSIX
+development wrapper; public headers are in `include/`. API and queue tests are
+in `tests/`, the POSIX-only microbenchmark is in `bench/`, and the unvalidated
+nginx adapter is in `nginx/`. Design notes are in `docs/`. Keep
+`nginx-1.31.3.tar.gz` as reference material only; never stage it.
 
 ## Build, Test, and Development Commands
 
-For MinGW work, use `/path/to/msys64/usr/bin/bash.exe` from the repository root with the toolchain on `PATH`. A POSIX development build is:
+Use a dedicated disposable build directory when investigating failures. The
+intended POSIX commands (using `build/`) are:
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DWEPOLL_EX_BUILD_BENCH=ON
+cmake --build build --target wepoll_ex_shared wepoll_ex_static \
+    test_wepoll_ex test_wepoll_ex_pool bench_latency
 ctest --test-dir build --output-on-failure
+./build/tests/test_wepoll_ex
+./build/tests/test_wepoll_ex_pool
+./build/bench/bench_latency 50000
 ```
 
-For MinGW, add `-G "MinGW Makefiles"` to the configure command. Enable and run the benchmark with `-DWEPOLL_EX_BUILD_BENCH=ON`, then `cmake --build build --target bench_latency` and run the generated `bench_latency` executable. Current tests use POSIX headers and are excluded from the default Windows build; still compile the Windows targets when changing Windows-specific code.
+For MinGW, invoke the requested shell and put its toolchain first:
 
-## Coding Style & Naming
+```sh
+/path/to/msys64/usr/bin/bash.exe -lc \
+  'export PATH=/mingw64/bin:/usr/bin:$PATH; cd /e/personal/wepoll-ex; \
+   cmake -S . -B build-mingw -G "MinGW Makefiles" -DWEPOLL_EX_BUILD_TESTS=OFF; \
+   cmake --build build-mingw --parallel'
+```
 
-Use strict C11, four-space indentation, and the existing brace style. Put the project header before standard-library headers. Use `snake_case` for functions, variables, files, and `_t` for project types; use `ep_*` for internals, `epoll_*`/`wepoll_*` for public APIs, and uppercase names for macros. No formatter or linter is configured, so keep formatting consistent with nearby code.
+The current baseline has known configure and pool-test blockers; see
+`docs/DESIGN.md` before treating a failed command as a regression. Windows
+tests are not yet implemented and are excluded from the default build.
 
-## Testing Guidelines
+NEVER find/rg on root dir or windowsn drive mountpoint.
 
-Tests are plain C executables registered with CTest, not a third-party framework. Add behavior-focused cases to `tests/test_api.c` or `tests/test_pool.c` (using the existing `TEST`/`PASS`/`FAIL` pattern), and run the full CTest command above. There is currently no coverage threshold; include regression coverage for every changed behavior.
+## Coding and Testing Conventions
 
-## Commits & Pull Requests
+Use strict C11, four-space indentation, and the surrounding brace style. Put
+the project header before system headers. Use `snake_case` names, `_t` project
+types, `ep_*` internals, and uppercase macros. There is no configured
+formatter or linter. Add behavior-focused cases to the existing plain-C tests
+and run both named executables plus CTest; record platform and compiler for
+Windows experiments.
 
-The repository has no commits, remote, or contribution template yet. Use a short, imperative subject such as `Fix edge-triggered wakeup handling`. PRs should explain the behavior and rationale, list commands and platform/toolchain results, link related issues, and include before/after benchmark data for performance changes. Screenshots are generally not applicable to this C library. Keep build directories, `.codex/` state, and reference archives out of commits.
+## Commits, Pull Requests, and Network
+
+The repository currently has one local baseline commit, `598db2e` (`Initial
+repository checkpoint`), on `master`. Remote `upstream` is
+`ssh://git@192.168.50.180:2222/congjc/wepoll-ex.git`; do not push without an
+explicit request. Use short, imperative commit subjects. PRs should state the
+behavioral change, tests and toolchain, known limitations, and linked issues.
+When network access is necessary (especially GitHub), use
+`ALL_PROXY=socks5://127.0.0.1:2080` and do not commit credentials or generated
+build state.
