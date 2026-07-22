@@ -49,9 +49,15 @@ mutex-protected LIFO and grow with tracked fallback allocations.
 
 The host owns the basic epoll descriptor and readiness behavior.
 `wepoll_ex_posix.c` maintains metadata for context, extension flags, fd counts,
-and safe close/reuse detection. `epoll_ctl_batch` is sequential and not
-transactional. `epoll_pwait2_ex` converts its timeout to milliseconds; a
-non-null signal mask is not implemented by the extension path.
+and close/reuse detection. A hidden identity registration distinguishes the
+tracked epoll generation from a reused integer; stale metadata is retired and
+`wepoll_close()` returns `EBADF` without closing the replacement descriptor.
+Until that close, metadata stays available as a guard when the integer was
+reused by a non-epoll descriptor. Native close/reuse racing the same call still
+requires caller synchronization.
+`epoll_ctl_batch` is sequential and not transactional. `epoll_pwait2_ex`
+converts its timeout to milliseconds; a non-null signal mask is not implemented
+by the extension path.
 
 ## Supported semantics and boundaries
 

@@ -205,9 +205,11 @@ WEPOLL_EX_API uint32_t wepoll_ex_version(void);
 WEPOLL_EX_API const char *wepoll_ex_version_string(void);
 
 /* Close an epoll fd created by epoll_create / epoll_create1 /
- * epoll_create_ex.  On POSIX this is equivalent to close(); on Windows
- * the user must call wepoll_close() because the integer epfd is
- * virtual and not a real HANDLE. */
+ * epoll_create_ex.  On POSIX this normally behaves like close(); a detected
+ * stale tracked generation returns -1/EBADF without closing the replacement.
+ * Synchronize native close/reuse against this call.  On Windows the user must
+ * call wepoll_close() because the integer epfd is virtual and not a real
+ * HANDLE. */
 WEPOLL_EX_API int wepoll_close(int epfd);
 
 #ifdef __cplusplus

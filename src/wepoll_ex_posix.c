@@ -82,6 +82,15 @@ static void port_remove_locked(posix_port_t *p)
     }
 }
 
+/* Stop new users, wait for existing metadata users, and unlink the port.
+ * The caller holds g_posix_lock and must free p after releasing it. */
+static void port_retire_locked(posix_port_t *p)
+{
+    p->closing = 1;
+    while (p->refs != 0) pthread_cond_wait(&p->idle, &g_posix_lock);
+    port_remove_locked(p);
+}
+
 /* Validate that epfd refers to an epoll instance without changing its
  * interest list.  A newly created pipe endpoint cannot already be present in
  * any epoll set, so DEL returns ENOENT for epoll descriptors and EINVAL for
@@ -164,6 +173,9 @@ static posix_port_t *port_acquire_or_create(int epfd)
 
             int identity_result = port_identity_check(p, epfd);
             if (identity_result < 0) {
+                /* Keep the stale mapping for EINVAL/EBADF as a guard: a
+                 * later wepoll_close() can retire it without closing a
+                 * descriptor that reused this integer. */
                 int saved_errno = errno;
                 pthread_mutex_unlock(&g_posix_lock);
                 errno = saved_errno;
@@ -175,14 +187,10 @@ static posix_port_t *port_acquire_or_create(int epfd)
                 return p;
             }
 
-            /* The integer was reused for a different epoll object after a
-             * plain close().  Retire the old metadata before creating a new
-             * generation for the replacement descriptor. */
-            p->closing = 1;
-            while (p->refs != 0) {
-                pthread_cond_wait(&p->idle, &g_posix_lock);
-            }
-            port_remove_locked(p);
+            /* The integer no longer names the mapped epoll generation.
+             * Retire the old metadata before validating or tracking the
+             * current descriptor. */
+            port_retire_locked(p);
             pthread_mutex_unlock(&g_posix_lock);
             port_free(p);
             continue;
@@ -716,17 +724,8 @@ WEPOLL_EX_API const char *wepoll_ex_version_string(void) {
 
 WEPOLL_EX_API int wepoll_close(int epfd)
 {
-    posix_port_t *p = NULL;
-    int slot = -1;
-
     pthread_mutex_lock(&g_posix_lock);
-    for (int i = 0; i < POSIX_PORT_MAP_SIZE; i++) {
-        if (g_posix_map[i] && g_posix_map[i]->epfd == epfd) {
-            p = g_posix_map[i];
-            slot = i;
-            break;
-        }
-    }
+    posix_port_t *p = port_lookup_locked(epfd);
 
     if (p) {
         if (p->closing) {
@@ -734,15 +733,40 @@ WEPOLL_EX_API int wepoll_close(int epfd)
             errno = EBADF;
             return -1;
         }
+
+        int identity_result = port_identity_check(p, epfd);
+        int identity_errno = errno;
+        if (identity_result != 0) {
+            if (identity_result < 0 && identity_errno != EBADF &&
+                identity_errno != EINVAL) {
+                pthread_mutex_unlock(&g_posix_lock);
+                errno = identity_errno;
+                return -1;
+            }
+
+            /* The tracked epoll descriptor was closed natively and its
+             * integer was either invalid or reused.  Retire only the stale
+             * metadata; never close the replacement descriptor. */
+            port_retire_locked(p);
+            pthread_mutex_unlock(&g_posix_lock);
+            port_free(p);
+            errno = EBADF;
+            return -1;
+        }
+
         p->closing = 1;
-        while (p->refs != 0) pthread_cond_wait(&p->idle, &g_posix_lock);
     }
 
     /* Keep the registry lock across close so no extension call can validate
-     * the old descriptor and create a new metadata port in the final gap. */
+     * the old descriptor and create a new metadata port in the final gap.
+     * Existing metadata users operate on control_epfd, so closing the public
+     * fd before waiting for them also narrows the native close/reuse window. */
     int result = close(epfd);
     int saved_errno = errno;
-    if (p) g_posix_map[slot] = NULL;
+    if (p) {
+        while (p->refs != 0) pthread_cond_wait(&p->idle, &g_posix_lock);
+        port_remove_locked(p);
+    }
     pthread_mutex_unlock(&g_posix_lock);
 
     if (p) port_free(p);

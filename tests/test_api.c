@@ -1399,6 +1399,135 @@ native_close_socket_cleanup:
 }
 
 /* --------------------------------------------------------------------- */
+/* Closing stale metadata must never close an unrelated reused fd.       */
+/* --------------------------------------------------------------------- */
+
+typedef struct stale_close_fixture {
+    int pipe_fds[2];
+    int replacement;
+} stale_close_fixture_t;
+
+static void stale_close_fixture_dispose(stale_close_fixture_t *fixture)
+{
+    if (fixture->replacement >= 0) (void)close(fixture->replacement);
+    if (fixture->pipe_fds[0] >= 0) (void)close(fixture->pipe_fds[0]);
+    if (fixture->pipe_fds[1] >= 0) (void)close(fixture->pipe_fds[1]);
+    fixture->replacement = -1;
+    fixture->pipe_fds[0] = -1;
+    fixture->pipe_fds[1] = -1;
+}
+
+static int stale_close_fixture_open(stale_close_fixture_t *fixture)
+{
+    fixture->pipe_fds[0] = -1;
+    fixture->pipe_fds[1] = -1;
+    fixture->replacement = -1;
+    if (pipe(fixture->pipe_fds) != 0) return -1;
+
+    int epfd = epoll_create_ex(0, 0);
+    if (epfd < 0) {
+        int saved_errno = errno;
+        stale_close_fixture_dispose(fixture);
+        errno = saved_errno;
+        return -1;
+    }
+    int stale_epfd = epfd;
+    if (close(epfd) != 0) {
+        int saved_errno = errno;
+        (void)wepoll_close(epfd);
+        stale_close_fixture_dispose(fixture);
+        errno = saved_errno;
+        return -1;
+    }
+
+    if (dup2(fixture->pipe_fds[0], stale_epfd) != stale_epfd) {
+        int saved_errno = errno;
+        (void)wepoll_close(stale_epfd);
+        stale_close_fixture_dispose(fixture);
+        errno = saved_errno;
+        return -1;
+    }
+    fixture->replacement = stale_epfd;
+    return 0;
+}
+
+static int stale_close_fixture_check(stale_close_fixture_t *fixture,
+                                     char sent)
+{
+    if (fcntl(fixture->replacement, F_GETFD) < 0) return -1;
+
+    char received = 0;
+    if (write(fixture->pipe_fds[1], &sent, 1) != 1 ||
+        read(fixture->replacement, &received, 1) != 1) {
+        return -1;
+    }
+    if (received != sent) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static void test_stale_close_preserves_reused_fd(void)
+{
+    stale_close_fixture_t fixture;
+
+    TEST("stale wepoll_close preserves reused descriptor");
+    if (stale_close_fixture_open(&fixture) != 0) {
+        FAIL("fixture setup");
+        return;
+    }
+    errno = 0;
+    int result = wepoll_close(fixture.replacement);
+    int close_errno = errno;
+    if (result != -1 || close_errno != EBADF) {
+        errno = close_errno;
+        FAIL("stale close should return EBADF");
+        stale_close_fixture_dispose(&fixture);
+        return;
+    }
+    if (stale_close_fixture_check(&fixture, 'x') != 0) {
+        FAIL("replacement pipe is unusable");
+        stale_close_fixture_dispose(&fixture);
+        return;
+    }
+    stale_close_fixture_dispose(&fixture);
+    PASS();
+
+    TEST("stale probe preserves reused descriptor");
+    if (stale_close_fixture_open(&fixture) != 0) {
+        FAIL("fixture setup");
+        return;
+    }
+
+    /* Exercise the path where another extension call notices the stale
+     * generation before wepoll_close() is called. */
+    errno = 0;
+    if (epoll_fd_count(fixture.replacement) != -1 || errno != EINVAL) {
+        FAIL("fd_count should reject the replacement");
+        stale_close_fixture_dispose(&fixture);
+        return;
+    }
+
+    errno = 0;
+    result = wepoll_close(fixture.replacement);
+    close_errno = errno;
+    if (result != -1 || close_errno != EBADF) {
+        errno = close_errno;
+        FAIL("stale close after probe should return EBADF");
+        stale_close_fixture_dispose(&fixture);
+        return;
+    }
+    if (stale_close_fixture_check(&fixture, 'y') != 0) {
+        FAIL("replacement pipe is unusable");
+        stale_close_fixture_dispose(&fixture);
+        return;
+    }
+    stale_close_fixture_dispose(&fixture);
+    PASS();
+}
+
+/* --------------------------------------------------------------------- */
 /* Main.                                                            */
 /* --------------------------------------------------------------------- */
 
@@ -1426,6 +1555,7 @@ int main(void)
     test_invalid_and_closed_descriptors();
     test_concurrent_close_and_reuse();
     test_native_close_and_reuse();
+    test_stale_close_preserves_reused_fd();
 
     printf("\n");
     printf("Summary: %d passed, %d failed\n", tests_passed, tests_failed);
