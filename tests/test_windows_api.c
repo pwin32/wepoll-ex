@@ -430,6 +430,7 @@ static void test_connect_failure(void)
     u_long nonblocking = 1;
     int socket_error = 0;
     int socket_error_length = (int)sizeof(socket_error);
+    int immediate_refusal = 0;
     int epfd = -1;
 
     TEST("refused connect reports OUT and ERR");
@@ -471,6 +472,7 @@ static void test_connect_failure(void)
             closesocket(reserved);
             return;
         }
+        immediate_refusal = connect_error == WSAECONNREFUSED;
     }
 
     epfd = epoll_create1(0);
@@ -483,7 +485,9 @@ static void test_connect_failure(void)
             (EPOLLOUT | EPOLLERR) ||
         getsockopt(client, SOL_SOCKET, SO_ERROR, (char *)&socket_error,
                    &socket_error_length) == SOCKET_ERROR ||
-        socket_error != WSAECONNREFUSED) {
+        (!immediate_refusal && socket_error != WSAECONNREFUSED) ||
+        (immediate_refusal && socket_error != 0 &&
+         socket_error != WSAECONNREFUSED)) {
         FAIL("connect failure delivery");
         if (epfd >= 0) wepoll_close(epfd);
         closesocket(client);
@@ -672,6 +676,7 @@ static void test_native_close_cleanup(void)
     int epfd;
     int first_result;
     int second_result;
+    int saw_event = 0;
 
     TEST("native closesocket removes a registration");
     if (make_tcp_pair(&pair) != 0) {
@@ -700,14 +705,16 @@ static void test_native_close_cleanup(void)
          attempt < 100 && epoll_fd_count(epfd) != 0;
          attempt++) {
         first_result = epoll_wait(epfd, &output, 1, 0);
-        if (first_result < 0) {
+        if (first_result != 0) {
+            saw_event = first_result > 0;
             break;
         }
         Sleep(1);
     }
     errno = 0;
     second_result = epoll_wait(epfd, &output, 1, 0);
-    if (first_result < 0 || second_result != 0 || epoll_fd_count(epfd) != 0) {
+    if (first_result < 0 || saw_event || second_result != 0 ||
+        epoll_fd_count(epfd) != 0) {
         FAIL("close cleanup");
         wepoll_close(epfd);
         tcp_pair_close(&pair);
@@ -725,6 +732,7 @@ static void test_oneshot_native_close_cleanup(void)
     struct epoll_event output;
     int epfd;
     int wait_result = 0;
+    int saw_event = 0;
 
     TEST("native close retires a fired oneshot registration");
     if (make_tcp_pair(&pair) != 0) {
@@ -754,12 +762,13 @@ static void test_oneshot_native_close_cleanup(void)
          attempt < 100 && epoll_fd_count(epfd) != 0;
          attempt++) {
         wait_result = epoll_wait(epfd, &output, 1, 0);
-        if (wait_result < 0) {
+        if (wait_result != 0) {
+            saw_event = wait_result > 0;
             break;
         }
         Sleep(1);
     }
-    if (wait_result < 0 || epoll_fd_count(epfd) != 0) {
+    if (wait_result < 0 || saw_event || epoll_fd_count(epfd) != 0) {
         FAIL("oneshot close cleanup");
         wepoll_close(epfd);
         tcp_pair_close(&pair);

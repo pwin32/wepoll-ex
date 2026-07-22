@@ -183,9 +183,100 @@ static void ep_sock_list_remove_locked(ep_port_t *port, ep_sock_t *sock)
     sock->prev = NULL;
 }
 
+typedef enum ep_identity_check {
+    EP_IDENTITY_ERROR = -1,
+    EP_IDENTITY_MATCH = 0,
+    EP_IDENTITY_STALE,
+    EP_IDENTITY_CLOSED
+} ep_identity_check_t;
+
+static int ep_socket_identity_is_stable(SOCKET fd)
+{
+    int socket_type = 0;
+    int option_length = (int)sizeof(socket_type);
+
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, (char *)&socket_type,
+                   &option_length) == SOCKET_ERROR) {
+        return 0;
+    }
+    if (socket_type != SOCK_STREAM) {
+        return 1;
+    }
+
+    {
+        int accepting = 0;
+        option_length = (int)sizeof(accepting);
+        if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, (char *)&accepting,
+                       &option_length) == 0 && accepting != 0) {
+            return 1;
+        }
+    }
+
+    {
+        struct sockaddr_storage peer;
+        int peer_length = (int)sizeof(peer);
+        return getpeername(fd, (struct sockaddr *)&peer, &peer_length) == 0;
+    }
+}
+
+static ep_identity_check_t ep_sock_validate_identity_locked(
+    ep_sock_t *sock, int allow_transition)
+{
+    uint64_t endpoint_id;
+    int identity_result;
+
+    if (sock->endpoint_id_state == EP_SOCKET_ID_UNAVAILABLE) {
+        return EP_IDENTITY_MATCH;
+    }
+
+    identity_result = ep_socket_get_endpoint_id(sock->fd, &endpoint_id);
+    if (identity_result == 0) {
+        /* A provider that never exposed an ALE token remains supported with
+         * legacy numeric-handle semantics.  Losing a token that was already
+         * observed is not a safe identity match. */
+        ep_set_errno(EIO);
+        return EP_IDENTITY_ERROR;
+    }
+    if (identity_result < 0) {
+        int error = ep_last_err();
+        if (error == 0) {
+            error = EIO;
+            ep_set_errno(error);
+        }
+        if (error == ENOTSOCK || error == EBADF) {
+            return EP_IDENTITY_CLOSED;
+        }
+        return EP_IDENTITY_ERROR;
+    }
+
+    if (endpoint_id == sock->endpoint_id) {
+        if (sock->endpoint_id_state == EP_SOCKET_ID_TRANSITIONAL &&
+            ep_socket_identity_is_stable(sock->fd)) {
+            sock->endpoint_id_state = EP_SOCKET_ID_STABLE;
+        }
+        return EP_IDENTITY_MATCH;
+    }
+
+    if (sock->endpoint_id_state == EP_SOCKET_ID_TRANSITIONAL &&
+        allow_transition) {
+        /* An AFD completion submitted before connect is evidence that this
+         * registration survived the legitimate ALE endpoint transition.
+         * Control-path mismatches have no such evidence and are treated as
+         * native numeric-handle reuse instead. */
+        sock->endpoint_id = endpoint_id;
+        if (ep_socket_identity_is_stable(sock->fd)) {
+            sock->endpoint_id_state = EP_SOCKET_ID_STABLE;
+        }
+        return EP_IDENTITY_MATCH;
+    }
+
+    return EP_IDENTITY_STALE;
+}
+
 static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
 {
     ep_sock_t *sock = (ep_sock_t *)calloc(1, sizeof(*sock));
+    int identity_result;
     if (sock == NULL) {
         ep_set_errno(ENOMEM);
         return NULL;
@@ -197,6 +288,18 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
         return NULL;
     }
 
+    identity_result = ep_socket_get_endpoint_id(fd, &sock->endpoint_id);
+    if (identity_result < 0) {
+        free(sock);
+        return NULL;
+    }
+    if (identity_result == 0) {
+        sock->endpoint_id_state = EP_SOCKET_ID_UNAVAILABLE;
+    } else if (ep_socket_identity_is_stable(fd)) {
+        sock->endpoint_id_state = EP_SOCKET_ID_STABLE;
+    } else {
+        sock->endpoint_id_state = EP_SOCKET_ID_TRANSITIONAL;
+    }
     sock->afd_info = (AFD_POLL_INFO *)ep_afd_pool_take(&port->afd_info_pool);
     if (sock->afd_info == NULL) {
         free(sock);
@@ -251,9 +354,10 @@ static void ep_sock_drop_closed_locked(ep_port_t *port, ep_sock_t *sock)
     }
 }
 
-static int ep_sock_submit_locked(ep_sock_t *sock)
+static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
 {
     ep_port_t *port = sock->port;
+    ep_identity_check_t identity_check;
     uint32_t poll_status =
         atomic_load_explicit(&sock->poll_status, memory_order_relaxed);
 
@@ -262,6 +366,21 @@ static int ep_sock_submit_locked(ep_sock_t *sock)
         atomic_load_explicit(&sock->ready_queued, memory_order_relaxed) ||
         poll_status != EP_POLL_IDLE) {
         return 0;
+    }
+
+    if (!identity_validated) {
+        identity_check = ep_sock_validate_identity_locked(sock, 0);
+        if (identity_check == EP_IDENTITY_ERROR) {
+            return -1;
+        }
+        if (identity_check == EP_IDENTITY_STALE ||
+            identity_check == EP_IDENTITY_CLOSED) {
+            int error = identity_check == EP_IDENTITY_STALE
+                ? ENOENT : ENOTSOCK;
+            ep_sock_drop_closed_locked(port, sock);
+            ep_set_errno(error);
+            return 1;
+        }
     }
 
     if (sock->oneshot_fired) {
@@ -319,12 +438,48 @@ static int ep_sock_cancel_locked(ep_sock_t *sock)
     return 0;
 }
 
+static void ep_sock_retire_stale_locked(ep_port_t *port, ep_sock_t *sock)
+{
+    int saved_errno = ep_last_err();
+
+    if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
+        EP_POLL_PENDING) {
+        (void)ep_sock_cancel_locked(sock);
+    }
+    atomic_fetch_add_explicit(&port->generation, 1, memory_order_relaxed);
+    ep_sock_drop_closed_locked(port, sock);
+    ep_set_errno(saved_errno);
+}
+
+/* Return 0 for the registered socket, 1 after retiring a stale/closed
+ * numeric-handle entry, and -1 for an identity-query failure. */
+static int ep_sock_validate_control_locked(ep_port_t *port, ep_sock_t *sock)
+{
+    ep_identity_check_t identity_check =
+        ep_sock_validate_identity_locked(sock, 0);
+
+    if (identity_check == EP_IDENTITY_MATCH) {
+        return 0;
+    }
+    if (identity_check == EP_IDENTITY_ERROR) {
+        return -1;
+    }
+
+    {
+        int error = identity_check == EP_IDENTITY_STALE
+            ? ENOENT : ENOTSOCK;
+        ep_sock_retire_stale_locked(port, sock);
+        ep_set_errno(error);
+    }
+    return 1;
+}
+
 static int ep_port_arm_pending_locked(ep_port_t *port)
 {
     for (ep_sock_t *sock = port->sock_list_head;
          sock != NULL;) {
         ep_sock_t *next = sock->next;
-        int submit_result = ep_sock_submit_locked(sock);
+        int submit_result = ep_sock_submit_locked(sock, 0);
         if (submit_result < 0) {
             return -1;
         }
@@ -373,7 +528,7 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     }
 
     if (old_poll_status == EP_POLL_CANCELLED || status == STATUS_CANCELLED) {
-        if (ep_sock_submit_locked(sock) < 0) {
+        if (ep_sock_submit_locked(sock, 0) < 0) {
             sock->needs_rearm = 1;
         }
         pthread_mutex_unlock(&port->fd_table_lock);
@@ -390,6 +545,16 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
             pthread_mutex_unlock(&port->fd_table_lock);
             return;
         }
+        if (sock->endpoint_id_state == EP_SOCKET_ID_TRANSITIONAL) {
+            ep_identity_check_t identity_check =
+                ep_sock_validate_identity_locked(sock, 1);
+            if (identity_check == EP_IDENTITY_STALE ||
+                identity_check == EP_IDENTITY_CLOSED) {
+                ep_sock_drop_closed_locked(port, sock);
+                pthread_mutex_unlock(&port->fd_table_lock);
+                return;
+            }
+        }
         delivered = ep_afd_to_epoll_events(
             sock->afd_info->Handles[0].Events);
     } else if (status < 0) {
@@ -399,7 +564,7 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
 
     if (delivered == 0) {
         sock->needs_rearm = 1;
-        if (ep_sock_submit_locked(sock) < 0) {
+        if (ep_sock_submit_locked(sock, 0) < 0) {
             sock->needs_rearm = 1;
         }
         pthread_mutex_unlock(&port->fd_table_lock);
@@ -409,7 +574,7 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     node = ep_ready_node_alloc(port);
     if (node == NULL) {
         sock->needs_rearm = 1;
-        (void)ep_sock_submit_locked(sock);
+        (void)ep_sock_submit_locked(sock, 0);
         pthread_mutex_unlock(&port->fd_table_lock);
         return;
     }
@@ -762,6 +927,7 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
                      uint32_t events, uint32_t flags,
                      epoll_data_t data, void *ctx)
 {
+    ep_sock_t *existing;
     ep_sock_t *sock;
 
     if (fd == INVALID_SOCKET) {
@@ -774,10 +940,22 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
         ep_set_errno(EBADF);
         return -1;
     }
-    if (ep_fd_table_lookup(port, fd) != NULL) {
-        pthread_mutex_unlock(&port->fd_table_lock);
-        ep_set_errno(EEXIST);
-        return -1;
+    existing = ep_fd_table_lookup(port, fd);
+    if (existing != NULL) {
+        int identity_result =
+            ep_sock_validate_control_locked(port, existing);
+        if (identity_result == 0) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            ep_set_errno(EEXIST);
+            return -1;
+        }
+        if (identity_result < 0 || ep_last_err() != ENOENT) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            return -1;
+        }
+        /* A stable endpoint mismatch means this numeric SOCKET now names a
+         * different object.  The stale entry is retired above; ADD may create
+         * the new registration while the old cancellation completion drains. */
     }
 
     sock = ep_sock_alloc_locked(port, fd);
@@ -800,7 +978,7 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
     ep_sock_list_add_locked(port, sock);
 
     {
-        int submit_result = ep_sock_submit_locked(sock);
+        int submit_result = ep_sock_submit_locked(sock, 1);
         if (submit_result < 0) {
             ep_fd_table_remove(port, sock);
             ep_sock_free_locked(port, sock);
@@ -808,8 +986,9 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
             return -1;
         }
         if (submit_result > 0) {
+            int saved_errno = ep_last_err();
             pthread_mutex_unlock(&port->fd_table_lock);
-            ep_set_errno(ENOTSOCK);
+            ep_set_errno(saved_errno);
             return -1;
         }
     }
@@ -822,11 +1001,29 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
                    uint32_t events, uint32_t flags,
                    epoll_data_t data, void *ctx)
 {
+    uint32_t old_pending_events;
+    uint32_t old_ready_queued;
+    uint32_t old_state;
+    uint32_t old_user_events;
+    uint32_t old_user_flags;
+    epoll_data_t old_user_data;
+    void *old_user_ctx;
+    SOCKET old_base_socket;
+    uint64_t old_endpoint_id;
+    uint64_t old_generation;
+    uint8_t old_endpoint_id_state;
+    uint8_t old_needs_rearm;
+    uint8_t old_oneshot_fired;
+
     pthread_mutex_lock(&port->fd_table_lock);
     ep_sock_t *sock = ep_fd_table_lookup(port, fd);
     if (sock == NULL) {
         pthread_mutex_unlock(&port->fd_table_lock);
         ep_set_errno(ENOENT);
+        return -1;
+    }
+    if (ep_sock_validate_control_locked(port, sock) != 0) {
+        pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
     }
 
@@ -836,6 +1033,21 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
         pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
     }
+
+    old_user_events = sock->user_events;
+    old_user_flags = sock->user_flags;
+    old_user_data = sock->user_data;
+    old_user_ctx = sock->user_ctx;
+    old_pending_events = sock->pending_events;
+    old_oneshot_fired = sock->oneshot_fired;
+    old_needs_rearm = sock->needs_rearm;
+    old_base_socket = sock->base_socket;
+    old_endpoint_id = sock->endpoint_id;
+    old_endpoint_id_state = sock->endpoint_id_state;
+    old_generation = sock->generation;
+    old_ready_queued = atomic_load_explicit(&sock->ready_queued,
+                                             memory_order_relaxed);
+    old_state = atomic_load_explicit(&sock->state, memory_order_relaxed);
 
     sock->user_events = events;
     sock->user_flags = flags;
@@ -853,14 +1065,32 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
 
     if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
             EP_POLL_IDLE) {
-        int submit_result = ep_sock_submit_locked(sock);
+        int submit_result = ep_sock_submit_locked(sock, 1);
         if (submit_result > 0) {
+            int saved_errno = ep_last_err();
             pthread_mutex_unlock(&port->fd_table_lock);
-            ep_set_errno(ENOTSOCK);
+            ep_set_errno(saved_errno);
             return -1;
         }
         if (submit_result < 0) {
+            int saved_errno = ep_last_err();
+            sock->user_events = old_user_events;
+            sock->user_flags = old_user_flags;
+            sock->user_data = old_user_data;
+            sock->user_ctx = old_user_ctx;
+            sock->pending_events = old_pending_events;
+            sock->oneshot_fired = old_oneshot_fired;
+            sock->needs_rearm = old_needs_rearm;
+            sock->base_socket = old_base_socket;
+            sock->endpoint_id = old_endpoint_id;
+            sock->endpoint_id_state = old_endpoint_id_state;
+            sock->generation = old_generation;
+            atomic_store_explicit(&sock->ready_queued, old_ready_queued,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&sock->state, old_state,
+                                  memory_order_relaxed);
             pthread_mutex_unlock(&port->fd_table_lock);
+            ep_set_errno(saved_errno);
             return -1;
         }
     }
@@ -876,6 +1106,10 @@ int ep_port_unregister(ep_port_t *port, SOCKET fd)
     if (sock == NULL) {
         pthread_mutex_unlock(&port->fd_table_lock);
         ep_set_errno(ENOENT);
+        return -1;
+    }
+    if (ep_sock_validate_control_locked(port, sock) != 0) {
+        pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
     }
 
@@ -903,6 +1137,16 @@ int ep_port_unregister(ep_port_t *port, SOCKET fd)
 
 int ep_port_rearm(ep_port_t *port, SOCKET fd)
 {
+    uint32_t old_pending_events;
+    uint32_t old_ready_queued;
+    uint32_t old_state;
+    SOCKET old_base_socket;
+    uint64_t old_endpoint_id;
+    uint64_t old_generation;
+    uint8_t old_endpoint_id_state;
+    uint8_t old_needs_rearm;
+    uint8_t old_oneshot_fired;
+
     pthread_mutex_lock(&port->fd_table_lock);
     ep_sock_t *sock = ep_fd_table_lookup(port, fd);
     if (sock == NULL) {
@@ -910,19 +1154,57 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
         ep_set_errno(ENOENT);
         return -1;
     }
+    if (ep_sock_validate_control_locked(port, sock) != 0) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return -1;
+    }
     if (!sock->oneshot_fired) {
         pthread_mutex_unlock(&port->fd_table_lock);
         return 0;
     }
 
+    old_pending_events = sock->pending_events;
+    old_oneshot_fired = sock->oneshot_fired;
+    old_needs_rearm = sock->needs_rearm;
+    old_base_socket = sock->base_socket;
+    old_endpoint_id = sock->endpoint_id;
+    old_endpoint_id_state = sock->endpoint_id_state;
+    old_generation = sock->generation;
+    old_ready_queued = atomic_load_explicit(&sock->ready_queued,
+                                             memory_order_relaxed);
+    old_state = atomic_load_explicit(&sock->state, memory_order_relaxed);
+
     sock->oneshot_fired = 0;
     sock->pending_events = 0;
     sock->needs_rearm = 1;
     atomic_store_explicit(&sock->ready_queued, 0, memory_order_relaxed);
-    int result = ep_sock_submit_locked(sock);
+    sock->generation = ++port->next_sock_generation;
+    if (port->next_sock_generation == 0) {
+        port->next_sock_generation = 1;
+        sock->generation = 1;
+    }
+    int result = ep_sock_submit_locked(sock, 1);
     if (result > 0) {
+        int saved_errno = ep_last_err();
         result = -1;
-        ep_set_errno(ENOTSOCK);
+        ep_set_errno(saved_errno);
+    } else if (result < 0) {
+        int saved_errno = ep_last_err();
+        sock->pending_events = old_pending_events;
+        sock->oneshot_fired = old_oneshot_fired;
+        sock->needs_rearm = old_needs_rearm;
+        sock->base_socket = old_base_socket;
+        sock->endpoint_id = old_endpoint_id;
+        sock->endpoint_id_state = old_endpoint_id_state;
+        sock->generation = old_generation;
+        atomic_store_explicit(&sock->ready_queued, old_ready_queued,
+                              memory_order_relaxed);
+        atomic_store_explicit(&sock->state, old_state,
+                              memory_order_relaxed);
+        ep_set_errno(saved_errno);
+    } else {
+        atomic_fetch_add_explicit(&port->generation, 1,
+                                  memory_order_relaxed);
     }
     pthread_mutex_unlock(&port->fd_table_lock);
     return result;
@@ -950,14 +1232,28 @@ static int ep_drain_to_buffer(ep_port_t *port,
         if (sock != NULL && sock->generation == node->sock_generation &&
             !atomic_load_explicit(&sock->delete_pending,
                                   memory_order_relaxed)) {
-            valid = 1;
-            sock->pending_events = 0;
-            atomic_store_explicit(&sock->ready_queued, 0,
-                                  memory_order_relaxed);
-            atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
-                                  memory_order_relaxed);
-            if (!sock->oneshot_fired) {
-                sock->needs_rearm = 1;
+            ep_identity_check_t identity_check =
+                ep_sock_validate_identity_locked(sock, 0);
+
+            if (identity_check == EP_IDENTITY_STALE ||
+                identity_check == EP_IDENTITY_CLOSED) {
+                /* The completion belongs to the old kernel socket object.
+                 * Retire it before a queued snapshot can surface stale data
+                 * for a replacement that reused the same numeric handle. */
+                ep_sock_retire_stale_locked(port, sock);
+            } else {
+                /* Endpoint identity is an optional hardening layer.  If its
+                 * query fails transiently, retain legacy delivery semantics
+                 * rather than losing a level-triggered or oneshot event. */
+                valid = 1;
+                sock->pending_events = 0;
+                atomic_store_explicit(&sock->ready_queued, 0,
+                                      memory_order_relaxed);
+                atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                      memory_order_relaxed);
+                if (!sock->oneshot_fired) {
+                    sock->needs_rearm = 1;
+                }
             }
         }
         pthread_mutex_unlock(&port->fd_table_lock);

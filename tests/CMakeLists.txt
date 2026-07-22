@@ -22,8 +22,16 @@ else()
         _WIN32_WINNT=0x0602
         WIN32_LEAN_AND_MEAN)
 
+    add_executable(test_wepoll_ex_windows_identity
+        test_windows_identity.c)
+    target_compile_definitions(test_wepoll_ex_windows_identity PRIVATE
+        _WIN32_WINNT=0x0602
+        WIN32_LEAN_AND_MEAN)
+
     if(WEPOLL_EX_BUILD_STATIC)
         target_link_libraries(test_wepoll_ex_windows PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_identity PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
         add_executable(test_wepoll_ex_windows_lifecycle
@@ -34,6 +42,26 @@ else()
             _WIN32_WINNT=0x0602
             WIN32_LEAN_AND_MEAN)
         target_link_libraries(test_wepoll_ex_windows_lifecycle PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+
+        add_executable(test_wepoll_ex_windows_state
+            test_windows_state.c)
+        target_include_directories(test_wepoll_ex_windows_state PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(test_wepoll_ex_windows_state PRIVATE
+            _WIN32_WINNT=0x0602
+            WIN32_LEAN_AND_MEAN)
+        target_link_libraries(test_wepoll_ex_windows_state PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+
+        add_executable(test_wepoll_ex_windows_events
+            test_windows_events.c)
+        target_include_directories(test_wepoll_ex_windows_events PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(test_wepoll_ex_windows_events PRIVATE
+            _WIN32_WINNT=0x0602
+            WIN32_LEAN_AND_MEAN)
+        target_link_libraries(test_wepoll_ex_windows_events PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
         foreach(_lifecycle_mode IN ITEMS
@@ -48,13 +76,48 @@ else()
             set_tests_properties(wepoll_ex_windows_${_lifecycle_name}
                 PROPERTIES TIMEOUT 15)
         endforeach()
+
+        foreach(_state_mode IN ITEMS
+                queued-rearm
+                queued-mod
+                failed-mod
+                failed-rearm
+                rapid-pending-mod)
+            string(REPLACE "-" "_" _state_name "${_state_mode}")
+            add_test(NAME wepoll_ex_windows_state_${_state_name}
+                COMMAND test_wepoll_ex_windows_state ${_state_mode})
+            set_tests_properties(wepoll_ex_windows_state_${_state_name}
+                PROPERTIES TIMEOUT 15)
+        endforeach()
+
+        foreach(_events_mode IN ITEMS mapping fin spin)
+            add_test(NAME wepoll_ex_windows_events_${_events_mode}
+                COMMAND test_wepoll_ex_windows_events ${_events_mode})
+            set_tests_properties(wepoll_ex_windows_events_${_events_mode}
+                PROPERTIES TIMEOUT 10)
+        endforeach()
     else()
         target_link_libraries(test_wepoll_ex_windows PRIVATE
+            wepoll_ex::wepoll_ex ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_identity PRIVATE
             wepoll_ex::wepoll_ex ws2_32)
     endif()
 
     add_test(NAME wepoll_ex_windows_api COMMAND test_wepoll_ex_windows)
     set_tests_properties(wepoll_ex_windows_api PROPERTIES TIMEOUT 120)
+
+    foreach(_identity_mode IN ITEMS
+            pending-add
+            oneshot-rearm
+            queued-ready
+            transitional-connect
+            transitional-reuse)
+        string(REPLACE "-" "_" _identity_name "${_identity_mode}")
+        add_test(NAME wepoll_ex_windows_identity_${_identity_name}
+            COMMAND test_wepoll_ex_windows_identity ${_identity_mode})
+        set_tests_properties(wepoll_ex_windows_identity_${_identity_name}
+            PROPERTIES TIMEOUT 15)
+    endforeach()
 
     if(MINGW)
         add_test(NAME wepoll_ex_windows_no_winpthread
@@ -76,7 +139,14 @@ else()
     endif()
 
     if(WEPOLL_EX_BUILD_SHARED AND NOT WEPOLL_EX_BUILD_STATIC)
-        set_tests_properties(wepoll_ex_windows_api PROPERTIES
+        set_tests_properties(
+            wepoll_ex_windows_api
+            wepoll_ex_windows_identity_pending_add
+            wepoll_ex_windows_identity_oneshot_rearm
+            wepoll_ex_windows_identity_queued_ready
+            wepoll_ex_windows_identity_transitional_connect
+            wepoll_ex_windows_identity_transitional_reuse
+            PROPERTIES
             ENVIRONMENT
                 "PATH=$<TARGET_FILE_DIR:wepoll_ex_shared>\;$ENV{PATH}")
     endif()

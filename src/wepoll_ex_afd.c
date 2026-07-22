@@ -106,6 +106,9 @@ int ep_afd_open(HANDLE iocp, HANDLE *out)
 #  ifndef SIO_BASE_HANDLE
 #    define SIO_BASE_HANDLE 0x48000022
 #  endif
+#  ifndef SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE
+#    define SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE 0x580000CD
+#  endif
 
 static SOCKET ep_socket_ioctl_handle(SOCKET socket, DWORD ioctl)
 {
@@ -161,6 +164,52 @@ SOCKET ep_socket_get_base(SOCKET socket)
     return INVALID_SOCKET;
 #else
     return socket;
+#endif
+}
+
+int ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id)
+{
+#ifdef _WIN32
+    uint64_t result = 0;
+    DWORD bytes = 0;
+
+    if (socket == INVALID_SOCKET || endpoint_id == NULL) {
+        ep_set_errno(socket == INVALID_SOCKET ? ENOTSOCK : EFAULT);
+        return -1;
+    }
+
+    if (WSAIoctl(socket,
+                 SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE,
+                 NULL,
+                 0,
+                 &result,
+                 (DWORD)sizeof(result),
+                 &bytes,
+                 NULL,
+                 NULL) == SOCKET_ERROR) {
+        int error = WSAGetLastError();
+
+        /* Some non-TCP/IP providers do not expose a WFP ALE endpoint.  Keep
+         * them usable with the legacy numeric-handle behavior rather than
+         * rejecting an otherwise pollable Winsock socket. */
+        if (error == WSAEOPNOTSUPP || error == WSAENOPROTOOPT ||
+            error == WSAEINVAL) {
+            return 0;
+        }
+        ep_set_errno(ep_winerr_to_errno((DWORD)error));
+        return -1;
+    }
+    if (bytes != sizeof(result)) {
+        ep_set_errno(EIO);
+        return -1;
+    }
+
+    *endpoint_id = result;
+    return 1;
+#else
+    (void)socket;
+    (void)endpoint_id;
+    return 0;
 #endif
 }
 
@@ -310,17 +359,20 @@ uint32_t ep_afd_to_epoll_events(ULONG afd_events)
     return out;
 }
 
-/* Compute the AFD events mask we should ask for given the user's
- * requested epoll events.  Note that EPOLLERR and EPOLLHUP are always
- * delivered by epoll on Linux even if not requested — we mirror that
- * by always arming AFD for the disconnect/abort events. */
+/* Compute the AFD events mask we should ask for given the user's requested
+ * epoll events.  Abort, connect-failure, and local-close conditions remain
+ * armed because EPOLLERR/EPOLLHUP are delivered even when not requested.
+ * A graceful peer disconnect is readiness/half-close rather than an error;
+ * arm it only when the caller requested a readable or RDHUP notification. */
 uint32_t ep_epoll_to_afd_events(uint32_t epoll_events)
 {
-    uint32_t afd = AFD_POLL_DISCONNECT | AFD_POLL_ABORT |
-                   AFD_POLL_CONNECT_FAIL | AFD_POLL_LOCAL_CLOSE;
+    uint32_t afd = AFD_POLL_ABORT | AFD_POLL_CONNECT_FAIL |
+                   AFD_POLL_LOCAL_CLOSE;
 
     if (epoll_events & (EPOLLIN | EPOLLRDNORM))
         afd |= AFD_POLL_RECEIVE | AFD_POLL_ACCEPT;
+    if (epoll_events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP))
+        afd |= AFD_POLL_DISCONNECT;
     if (epoll_events & (EPOLLPRI | EPOLLRDBAND))
         afd |= AFD_POLL_RECEIVE_EXPEDITED;
     if (epoll_events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND))

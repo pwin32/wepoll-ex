@@ -25,8 +25,10 @@ into that disposable nginx build.
 
 1. `epoll_create*` creates an `ep_port_t`, IOCP, AFD control handle, pools, and
    a virtual integer `epfd` table entry.
-2. `EPOLL_CTL_ADD` validates a Winsock socket, stores the requested data and
-   context, assigns a generation, and submits one asynchronous `AFD_POLL`.
+2. `EPOLL_CTL_ADD` validates a Winsock socket, records an optional WFP ALE
+   endpoint token for stable native-handle reuse detection, stores the
+   requested data and context, assigns a generation, and submits one
+   asynchronous `AFD_POLL`.
 3. IOCP completions are translated to `EPOLL*` bits. Ready nodes snapshot the
    data, context, socket number, and generation; they never retain a raw socket
    pointer.
@@ -38,8 +40,9 @@ into that disposable nginx build.
    registrations require MOD or `epoll_rearm()`.
 5. DEL and close remove public lookup immediately, cancel pending AFD work,
    and retain `ep_sock_t` storage until its cancellation completion is
-   consumed. Reuse is safe after that cleanup; native `closesocket()` plus
-   immediate numeric `SOCKET` reuse remains outside the validated contract.
+   consumed. When the provider exposes a stable WFP ALE endpoint token, a
+   native close followed by immediate numeric `SOCKET` reuse retires the old
+   registration before ADD/MOD/rearm can attach stale data to the replacement.
 6. `wepoll_close()` marks the port closing, wakes waiters, waits for public API
    references to drain, and consumes outstanding completions before destroying
    handles and pools. Cancellation and IOCP draining are bounded; a permanent
@@ -68,11 +71,18 @@ by the extension path.
 
 - Windows registrations accept Winsock sockets only, not files or arbitrary
   HANDLEs.
+- Native socket reuse protection is best-effort: providers without
+  `SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE`, control operations racing an unresolved
+  TCP connect transition, and a close racing the identity query still require
+  caller synchronization. Normal pre-connect registrations adopt the new
+  endpoint token only after an AFD completion proves continuity; stable
+  connected/listening TCP and UDP sockets are covered directly.
 - Windows builds set `_WIN32_WINNT=0x0602`; Windows 8 or later is the current
   compile/runtime assumption, not a validated compatibility floor for every
   AFD revision.
 - `EPOLLONESHOT`, context delivery, RDHUP mapping, zero-timeout waits, native
-  socket close cleanup, and concurrent epoll close have regression coverage.
+  socket close cleanup and stable numeric reuse, and concurrent epoll close
+  have regression coverage.
 - `EPOLLET` and `EPOLLEXCLUSIVE` are rejected with `EOPNOTSUPP`. Silently
   treating AFD's one-shot level notification as an edge would duplicate unread
   readiness.
@@ -93,18 +103,21 @@ by the extension path.
 - If Windows shutdown cannot safely drain an outstanding AFD request, the
   unreachable port is intentionally leaked and `wepoll_close()` returns an
   error; retrying the removed epfd is invalid.
-- The benchmark exercises the POSIX wrapper only.
+- The checked-in benchmark exercises the POSIX wrapper only; disposable nginx
+  loopback comparisons are recorded separately when the Windows adapter is
+  evaluated.
 
 ## Verification baseline
 
 Strict warnings-as-errors builds pass on GCC/POSIX and MinGW. POSIX CTest covers
 the API, MPSC/pool behavior, and installed-package consumer. Windows CTest
-covers read/write readiness, FIN/RDHUP, reset and refused-connect mapping,
-context changes, oneshot/rearm, invalid arguments, batch rollback and immediate
-reuse, descriptor-table collisions, native socket close, concurrent close/wait,
-bounded waits under contention, shutdown fault paths, and the installed-package
-consumer. Shared, static, and combined MinGW configurations are exercised. The
-nginx 1.31.3 adapter also passes strict addon
+covers read/write readiness, FIN/RDHUP filtering, reset and refused-connect
+mapping, context changes, oneshot/rearm state transitions and rollback, stable
+native socket reuse, invalid arguments, batch rollback and descriptor-table
+collisions, native socket close, concurrent close/wait, bounded waits under
+contention, shutdown fault paths, and the installed-package consumer. Shared,
+static, and combined MinGW configurations are exercised. The nginx 1.31.3
+adapter also passes strict addon
 compilation, full minimal and HTTP Win32 links, configuration bounds checks,
 `nginx -t`, 100 loopback HTTP requests across a worker reload, and graceful
 quit using `use wepoll`. MinGW final links explicitly select static
