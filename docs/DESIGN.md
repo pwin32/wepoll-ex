@@ -30,16 +30,21 @@ into that disposable nginx build.
 3. IOCP completions are translated to `EPOLL*` bits. Ready nodes snapshot the
    data, context, socket number, and generation; they never retain a raw socket
    pointer.
-4. `epoll_wait*` serializes consumers, drains ready snapshots, waits for more
-   IOCP packets, and skips stale generations. Level-triggered registrations
-   are armed again on a later wait; oneshot registrations require MOD or
-   `epoll_rearm()`.
+4. `epoll_wait*` serializes consumers because the ready queue is
+   single-consumer, drains ready snapshots, waits for more IOCP packets, and
+   skips stale generations. Lock acquisition is included in finite timeouts;
+   a zero-timeout call returns immediately if another waiter owns the drain.
+   Level-triggered registrations are armed again on a later wait; oneshot
+   registrations require MOD or `epoll_rearm()`.
 5. DEL and close remove public lookup immediately, cancel pending AFD work,
    and retain `ep_sock_t` storage until its cancellation completion is
-   consumed. A later registration may safely reuse the same socket value.
+   consumed. Reuse is safe after that cleanup; native `closesocket()` plus
+   immediate numeric `SOCKET` reuse remains outside the validated contract.
 6. `wepoll_close()` marks the port closing, wakes waiters, waits for public API
-   references to drain, consumes all outstanding completions, and only then
-   destroys handles and pools.
+   references to drain, and consumes outstanding completions before destroying
+   handles and pools. Cancellation and IOCP draining are bounded; a permanent
+   failure closes the logical epfd, reports an error, and quarantines the port
+   storage rather than risking a late-completion use-after-free.
 
 The ready queue is single-consumer MPSC. Producers append without a mutex; the
 consumer uses a sentinel before reclaiming nodes. Both AFD-buffer pools use a
@@ -82,6 +87,12 @@ by the extension path.
   monotonic origin.
 - Cancelled registrations remain internally allocated until a wait or close
   drains their IOCP completion, although they are absent from public lookup.
+- Concurrent finite waits include time spent waiting for the single-consumer
+  drain lock. A zero-timeout call may return no events while another waiter is
+  draining them.
+- If Windows shutdown cannot safely drain an outstanding AFD request, the
+  unreachable port is intentionally leaked and `wepoll_close()` returns an
+  error; retrying the removed epfd is invalid.
 - The benchmark exercises the POSIX wrapper only.
 
 ## Verification baseline
@@ -91,11 +102,12 @@ the API, MPSC/pool behavior, and installed-package consumer. Windows CTest
 covers read/write readiness, FIN/RDHUP, reset and refused-connect mapping,
 context changes, oneshot/rearm, invalid arguments, batch rollback and immediate
 reuse, descriptor-table collisions, native socket close, concurrent close/wait,
-and the installed-package consumer. Shared, static, and combined MinGW
-configurations are exercised. The nginx 1.31.3 adapter also passes strict addon
+bounded waits under contention, shutdown fault paths, and the installed-package
+consumer. Shared, static, and combined MinGW configurations are exercised. The
+nginx 1.31.3 adapter also passes strict addon
 compilation, full minimal and HTTP Win32 links, configuration bounds checks,
 `nginx -t`, 100 loopback HTTP requests across a worker reload, and graceful
 quit using `use wepoll`. MinGW final links explicitly select static
-winpthreads, and dependency checks reject `libwinpthread-1.dll` in the library
+winpthreads, and dependency checks reject `libwinpthread-1.dll` in the library,
 test executable, and installed-package consumers. These results still do not
 constitute a supported Windows/compiler matrix.

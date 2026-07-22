@@ -359,6 +359,7 @@ struct ep_port {
      * polls and waits for their IOCP completions before storage is freed. */
     pthread_mutex_t wait_lock;
     _Atomic int closing;
+    _Atomic int iocp_closed;
     size_t pending_poll_count;
     uint64_t next_sock_generation;
 
@@ -389,7 +390,7 @@ int  ep_global_init(void);
 void ep_global_fini(void);
 
 int  ep_port_create(int size_hint, int flags, ep_port_t **out);
-void ep_port_destroy(ep_port_t *port);
+int  ep_port_destroy(ep_port_t *port);
 void ep_port_begin_close(ep_port_t *port);
 
 int  ep_port_register(ep_port_t *port, SOCKET fd,

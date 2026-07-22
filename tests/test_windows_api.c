@@ -905,7 +905,9 @@ static DWORD WINAPI close_wait_thread(void *opaque)
     close_wait_context_t *context = (close_wait_context_t *)opaque;
     struct epoll_event event;
 
-    SetEvent(context->started);
+    if (context->started != NULL) {
+        SetEvent(context->started);
+    }
     context->result = epoll_wait(context->epfd, &event, 1, -1);
     context->error = errno;
     return 0;
@@ -955,6 +957,131 @@ static void test_concurrent_close(void)
     PASS();
 }
 
+typedef struct bounded_wait_context {
+    int epfd;
+    int timeout;
+    int use_drain;
+    HANDLE started;
+    int result;
+    int error;
+    ULONGLONG elapsed;
+} bounded_wait_context_t;
+
+static DWORD WINAPI bounded_wait_thread(void *opaque)
+{
+    bounded_wait_context_t *context =
+        (bounded_wait_context_t *)opaque;
+    struct epoll_event event;
+    ULONGLONG started = GetTickCount64();
+
+    if (context->started != NULL) {
+        SetEvent(context->started);
+    }
+    if (context->use_drain) {
+        context->result = epoll_drain(context->epfd, &event, 1);
+    } else {
+        context->result = epoll_wait(context->epfd, &event, 1,
+                                     context->timeout);
+    }
+    context->elapsed = GetTickCount64() - started;
+    context->error = errno;
+    return 0;
+}
+
+static void test_bounded_wait_under_contention(void)
+{
+    bounded_wait_context_t first;
+    bounded_wait_context_t second;
+    bounded_wait_context_t timed;
+    HANDLE first_thread = NULL;
+    HANDLE second_thread = NULL;
+    HANDLE timed_thread = NULL;
+    DWORD wait_result;
+    int close_result = -1;
+    int epfd = -1;
+    int ok = 0;
+
+    TEST("bounded waits stay bounded behind an infinite waiter");
+    memset(&first, 0, sizeof(first));
+    memset(&second, 0, sizeof(second));
+    memset(&timed, 0, sizeof(timed));
+    epfd = epoll_create1(0);
+    first.started = CreateEventA(NULL, TRUE, FALSE, NULL);
+    first.epfd = epfd;
+    first.timeout = -1;
+    second.epfd = epfd;
+    second.timeout = 0;
+    second.use_drain = 1;
+    timed.epfd = epfd;
+    timed.timeout = 100;
+    if (epfd < 0 || first.started == NULL) {
+        FAIL("setup bounded wait");
+        goto bounded_wait_cleanup;
+    }
+
+    first_thread = CreateThread(NULL, 0, bounded_wait_thread,
+                                &first, 0, NULL);
+    if (first_thread == NULL ||
+        WaitForSingleObject(first.started, 2000) != WAIT_OBJECT_0) {
+        FAIL("start infinite waiter");
+        goto bounded_wait_cleanup;
+    }
+    Sleep(100);
+
+    second_thread = CreateThread(NULL, 0, bounded_wait_thread,
+                                 &second, 0, NULL);
+    if (second_thread == NULL) {
+        FAIL("start bounded waiter");
+        goto bounded_wait_cleanup;
+    }
+    wait_result = WaitForSingleObject(second_thread, 1500);
+    if (wait_result != WAIT_OBJECT_0 ||
+        second.result != 0 || second.elapsed >= 1200) {
+        goto bounded_wait_cleanup;
+    }
+
+    timed_thread = CreateThread(NULL, 0, bounded_wait_thread,
+                                &timed, 0, NULL);
+    if (timed_thread == NULL) {
+        goto bounded_wait_cleanup;
+    }
+    wait_result = WaitForSingleObject(timed_thread, 1500);
+    if (wait_result == WAIT_OBJECT_0 && timed.result == 0 &&
+        timed.elapsed >= 50 && timed.elapsed < 1200 &&
+        WaitForSingleObject(first_thread, 0) == WAIT_TIMEOUT) {
+        ok = 1;
+    }
+
+bounded_wait_cleanup:
+    if (epfd >= 0) {
+        close_result = wepoll_close(epfd);
+        epfd = -1;
+    }
+    if (first_thread != NULL &&
+        WaitForSingleObject(first_thread, 5000) != WAIT_OBJECT_0) {
+        TerminateThread(first_thread, 1);
+    }
+    if (second_thread != NULL &&
+        WaitForSingleObject(second_thread, 5000) != WAIT_OBJECT_0) {
+        TerminateThread(second_thread, 1);
+    }
+    if (timed_thread != NULL &&
+        WaitForSingleObject(timed_thread, 5000) != WAIT_OBJECT_0) {
+        TerminateThread(timed_thread, 1);
+    }
+    if (first_thread != NULL) CloseHandle(first_thread);
+    if (second_thread != NULL) CloseHandle(second_thread);
+    if (timed_thread != NULL) CloseHandle(timed_thread);
+    if (first.started != NULL) CloseHandle(first.started);
+
+    if (!ok || close_result != 0 || first.result != -1 ||
+        first.error != EBADF) {
+        FAIL("bounded waiter contention");
+        return;
+    }
+    PASS();
+}
+
 int main(void)
 {
     WSADATA wsa_data;
@@ -980,6 +1107,7 @@ int main(void)
     test_batch_safety();
     test_epfd_collision_and_reuse();
     test_concurrent_close();
+    test_bounded_wait_under_contention();
 
     printf("\n%d passed, %d failed\n", tests_passed, tests_failed);
     WSACleanup();

@@ -25,6 +25,29 @@ else()
     if(WEPOLL_EX_BUILD_STATIC)
         target_link_libraries(test_wepoll_ex_windows PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
+
+        add_executable(test_wepoll_ex_windows_lifecycle
+            test_windows_lifecycle.c)
+        target_include_directories(test_wepoll_ex_windows_lifecycle PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(test_wepoll_ex_windows_lifecycle PRIVATE
+            _WIN32_WINNT=0x0602
+            WIN32_LEAN_AND_MEAN)
+        target_link_libraries(test_wepoll_ex_windows_lifecycle PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+
+        foreach(_lifecycle_mode IN ITEMS
+                cancel-failure
+                iocp-failure
+                drain-timeout
+                wake-failure)
+            string(REPLACE "-" "_" _lifecycle_name "${_lifecycle_mode}")
+            add_test(NAME wepoll_ex_windows_${_lifecycle_name}
+                COMMAND test_wepoll_ex_windows_lifecycle
+                    ${_lifecycle_mode})
+            set_tests_properties(wepoll_ex_windows_${_lifecycle_name}
+                PROPERTIES TIMEOUT 15)
+        endforeach()
     else()
         target_link_libraries(test_wepoll_ex_windows PRIVATE
             wepoll_ex::wepoll_ex ws2_32)

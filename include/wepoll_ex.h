@@ -209,7 +209,8 @@ WEPOLL_EX_API const char *wepoll_ex_version_string(void);
  * stale tracked generation returns -1/EBADF without closing the replacement.
  * Synchronize native close/reuse against this call.  On Windows the user must
  * call wepoll_close() because the integer epfd is virtual and not a real
- * HANDLE. */
+ * HANDLE.  A Windows teardown failure can return -1 after the virtual epfd has
+ * been removed; that descriptor is still closed and must not be retried. */
 WEPOLL_EX_API int wepoll_close(int epfd);
 
 #ifdef __cplusplus

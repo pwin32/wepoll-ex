@@ -67,6 +67,7 @@ int ep_winerr_to_errno(DWORD wsaerr)
                                return EMFILE;
     case ERROR_ACCESS_DENIED: return EACCES;
     case ERROR_INVALID_HANDLE:
+    case ERROR_ABANDONED_WAIT_0:
                                return EBADF;
     case ERROR_NOT_ENOUGH_MEMORY:
     case ERROR_OUTOFMEMORY:

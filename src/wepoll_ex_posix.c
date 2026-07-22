@@ -793,7 +793,7 @@ void ep_global_fini(void)            { g_ntdll.initialized = 0; }
 /* Windows-only entry points — provide no-op stubs so the linker is
  * happy if a static lib references them. */
 int  ep_port_create(int s, int f, ep_port_t **o)  { (void)s;(void)f;(void)o; errno=ENOSYS; return -1; }
-void ep_port_destroy(ep_port_t *p)                 { (void)p; }
+int  ep_port_destroy(ep_port_t *p)                { (void)p; return 0; }
 int  ep_port_register(ep_port_t *p, SOCKET f, uint32_t e, uint32_t fl,
                       epoll_data_t d, void *c)     { (void)p;(void)f;(void)e;(void)fl;(void)d;(void)c; errno=ENOSYS; return -1; }
 int  ep_port_modify(ep_port_t *p, SOCKET f, uint32_t e, uint32_t fl,

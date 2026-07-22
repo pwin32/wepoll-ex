@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define EP_CLOSE_DRAIN_TIMEOUT_MS UINT64_C(5000)
+#define EP_CLOSE_DRAIN_SLICE_MS   100U
+
 /* ------------------------------------------------------------------------- */
 /* Time and fd-table helpers.                                                */
 /* ------------------------------------------------------------------------- */
@@ -533,6 +536,7 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
 
     port->close_on_exec = (flags & EPOLL_CLOEXEC) != 0;
     atomic_init(&port->closing, 0);
+    atomic_init(&port->iocp_closed, 0);
     atomic_init(&port->generation, 0);
     port->next_sock_generation = 0;
     *out = port;
@@ -577,19 +581,50 @@ void ep_port_begin_close(ep_port_t *port)
     }
     if (atomic_exchange_explicit(&port->closing, 1, memory_order_acq_rel) == 0 &&
         port->iocp != NULL) {
-        (void)PostQueuedCompletionStatus(port->iocp, 0, 0, NULL);
+        if (!PostQueuedCompletionStatus(port->iocp, 0, 0, NULL)) {
+            /* A failed wake must not leave an API waiter holding the port
+             * reference forever.  Closing the completion port wakes blocked
+             * GetQueuedCompletionStatusEx calls with an abandoned-wait error.
+             * Pending request storage is quarantined later if it cannot be
+             * drained safely. */
+            (void)CloseHandle(port->iocp);
+            atomic_store_explicit(&port->iocp_closed, 1,
+                                  memory_order_release);
+        }
     }
 }
 
-void ep_port_destroy(ep_port_t *port)
+static int ep_port_quarantine(ep_port_t *port, int error)
+{
+    if (port->afd != NULL) {
+        (void)CloseHandle(port->afd);
+        port->afd = NULL;
+    }
+    if (port->iocp != NULL &&
+        atomic_exchange_explicit(&port->iocp_closed, 1,
+                                 memory_order_acq_rel) == 0) {
+        (void)CloseHandle(port->iocp);
+    }
+    port->iocp = NULL;
+
+    /* Outstanding AFD operations still reference sock->io_status_block and
+     * afd_info.  Leaking this unreachable port is safer than freeing storage
+     * that the kernel may complete asynchronously. */
+    pthread_mutex_unlock(&port->wait_lock);
+    ep_set_errno(error);
+    return -1;
+}
+
+int ep_port_destroy(ep_port_t *port)
 {
     if (port == NULL) {
-        return;
+        return 0;
     }
 
     ep_port_begin_close(port);
     pthread_mutex_lock(&port->wait_lock);
 
+    int cancel_failed = 0;
     pthread_mutex_lock(&port->fd_table_lock);
     for (ep_sock_t *sock = port->sock_list_head;
          sock != NULL;
@@ -598,7 +633,15 @@ void ep_port_destroy(ep_port_t *port)
         atomic_store_explicit(&sock->state, EP_SOCK_DELETED,
                               memory_order_relaxed);
         sock->needs_rearm = 0;
-        (void)ep_sock_cancel_locked(sock);
+        if (ep_sock_cancel_locked(sock) != 0) {
+            cancel_failed = 1;
+        }
+    }
+    if (cancel_failed && port->afd != NULL) {
+        /* Closing the AFD control handle is a bulk cancellation fallback.
+         * Completions remain asynchronous and must still be drained. */
+        (void)CloseHandle(port->afd);
+        port->afd = NULL;
     }
     if (port->fd_table != NULL) {
         memset(port->fd_table, 0,
@@ -617,6 +660,8 @@ void ep_port_destroy(ep_port_t *port)
     }
     pthread_mutex_unlock(&port->fd_table_lock);
 
+    uint64_t drain_deadline =
+        GetTickCount64() + EP_CLOSE_DRAIN_TIMEOUT_MS;
     for (;;) {
         size_t pending;
         pthread_mutex_lock(&port->fd_table_lock);
@@ -625,13 +670,29 @@ void ep_port_destroy(ep_port_t *port)
         if (pending == 0) {
             break;
         }
+        if (atomic_load_explicit(&port->iocp_closed,
+                                 memory_order_acquire)) {
+            return ep_port_quarantine(port, EIO);
+        }
+
+        uint64_t now = GetTickCount64();
+        if (now >= drain_deadline) {
+            return ep_port_quarantine(port, ETIMEDOUT);
+        }
+        uint64_t remaining = drain_deadline - now;
+        DWORD wait_ms = remaining < EP_CLOSE_DRAIN_SLICE_MS
+            ? (DWORD)remaining : EP_CLOSE_DRAIN_SLICE_MS;
 
         ULONG removed = 0;
         BOOL ok = GetQueuedCompletionStatusEx(
             port->iocp, port->iocp_entries, port->iocp_batch_size,
-            &removed, INFINITE, FALSE);
+            &removed, wait_ms, FALSE);
         if (!ok) {
-            continue;
+            DWORD error = GetLastError();
+            if (error == WAIT_TIMEOUT) {
+                continue;
+            }
+            return ep_port_quarantine(port, ep_winerr_to_errno(error));
         }
         for (ULONG i = 0; i < removed; i++) {
             OVERLAPPED *overlapped = port->iocp_entries[i].lpOverlapped;
@@ -672,11 +733,15 @@ void ep_port_destroy(ep_port_t *port)
     ep_ready_destroy(&port->ready_queue);
 
     if (port->afd != NULL) {
-        CloseHandle(port->afd);
+        (void)CloseHandle(port->afd);
+        port->afd = NULL;
     }
-    if (port->iocp != NULL) {
-        CloseHandle(port->iocp);
+    if (port->iocp != NULL &&
+        atomic_exchange_explicit(&port->iocp_closed, 1,
+                                 memory_order_acq_rel) == 0) {
+        (void)CloseHandle(port->iocp);
     }
+    port->iocp = NULL;
     ep_afd_pool_destroy(&port->afd_info_pool);
     ep_afd_pool_destroy(&port->ready_node_pool);
     free(port->fd_table);
@@ -686,6 +751,7 @@ void ep_port_destroy(ep_port_t *port)
     pthread_mutex_destroy(&port->wait_lock);
     pthread_mutex_destroy(&port->fd_table_lock);
     free(port);
+    return 0;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -909,11 +975,56 @@ static int ep_drain_to_buffer(ep_port_t *port,
     return delivered;
 }
 
+/* The ready queue has one consumer, so waiters still serialize their drain
+ * operation.  Do not let that serialization turn a bounded wait into an
+ * unbounded mutex wait: a zero-timeout drain returns immediately when another
+ * consumer owns the lock, and a positive timeout includes lock acquisition. */
+static int ep_wait_lock_acquire(ep_port_t *port, int timeout_ms,
+                                uint64_t deadline)
+{
+    if (timeout_ms < 0) {
+        int lock_result = pthread_mutex_lock(&port->wait_lock);
+        if (lock_result != 0) {
+            ep_set_errno(lock_result);
+            return -1;
+        }
+        return 1;
+    }
+
+    int first_attempt = 1;
+    for (;;) {
+        if (!first_attempt && timeout_ms > 0 &&
+            GetTickCount64() >= deadline) {
+            return 0;
+        }
+        first_attempt = 0;
+
+        int lock_result = pthread_mutex_trylock(&port->wait_lock);
+        if (lock_result == 0) {
+            return 1;
+        }
+        if (lock_result != EBUSY) {
+            ep_set_errno(lock_result);
+            return -1;
+        }
+        if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
+            ep_set_errno(EBADF);
+            return -1;
+        }
+        if (timeout_ms == 0 ||
+            (timeout_ms > 0 && GetTickCount64() >= deadline)) {
+            return 0;
+        }
+        Sleep(1);
+    }
+}
+
 int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
                  int timeout_ms, const wepoll_sigset_t *sigmask)
 {
     uint64_t deadline = 0;
     int result = -1;
+    int lock_result;
 
     if (out == NULL) {
         ep_set_errno(EFAULT);
@@ -928,9 +1039,12 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
         return -1;
     }
 
-    pthread_mutex_lock(&port->wait_lock);
     if (timeout_ms > 0) {
         deadline = GetTickCount64() + (uint64_t)timeout_ms;
+    }
+    lock_result = ep_wait_lock_acquire(port, timeout_ms, deadline);
+    if (lock_result <= 0) {
+        return lock_result == 0 ? 0 : -1;
     }
 
     for (;;) {

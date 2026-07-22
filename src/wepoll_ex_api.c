@@ -287,8 +287,10 @@ WEPOLL_EX_API int epoll_create_ex(int size, int flags)
 
     fd = epfd_alloc(port);
     if (fd < 0) {
+        int saved_errno = ep_last_err();
         ep_port_begin_close(port);
-        ep_port_destroy(port);
+        (void)ep_port_destroy(port);
+        ep_set_errno(saved_errno);
     }
     return fd;
 }
@@ -598,8 +600,12 @@ WEPOLL_EX_API int wepoll_close(int epfd)
     epfd_unlink_locked(entry);
     pthread_mutex_unlock(&g_epfd_lock);
 
-    ep_port_destroy(port);
+    int result = ep_port_destroy(port);
+    int saved_errno = ep_last_err();
     pthread_cond_destroy(&entry->refs_drained);
     free(entry);
-    return 0;
+    if (result != 0) {
+        ep_set_errno(saved_errno);
+    }
+    return result;
 }
