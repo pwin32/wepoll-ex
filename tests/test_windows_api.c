@@ -1,0 +1,764 @@
+/*
+ * test_windows_api.c -- runtime coverage for the native Windows API.
+ *
+ * The Windows implementation has no socketpair(2), so the tests use a
+ * loopback TCP connection for ADD/WAIT/DEL and context/oneshot coverage.
+ */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602
+#endif
+
+#include "wepoll_ex.h"
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct tcp_pair {
+    SOCKET listener;
+    SOCKET client;
+    SOCKET server;
+} tcp_pair_t;
+
+static int tests_passed;
+static int tests_failed;
+
+#define TEST(name) do { \
+    printf("  [test] %s ", name); \
+    fflush(stdout); \
+} while (0)
+
+#define PASS() do { \
+    puts("OK"); \
+    tests_passed++; \
+} while (0)
+
+#define FAIL(reason) do { \
+    printf("FAIL: %s (errno=%d)\n", reason, errno); \
+    tests_failed++; \
+} while (0)
+
+static void tcp_pair_init(tcp_pair_t *pair)
+{
+    pair->listener = INVALID_SOCKET;
+    pair->client = INVALID_SOCKET;
+    pair->server = INVALID_SOCKET;
+}
+
+static void tcp_pair_close(tcp_pair_t *pair)
+{
+    if (pair->server != INVALID_SOCKET) {
+        closesocket(pair->server);
+        pair->server = INVALID_SOCKET;
+    }
+    if (pair->client != INVALID_SOCKET) {
+        closesocket(pair->client);
+        pair->client = INVALID_SOCKET;
+    }
+    if (pair->listener != INVALID_SOCKET) {
+        closesocket(pair->listener);
+        pair->listener = INVALID_SOCKET;
+    }
+}
+
+static int make_tcp_pair(tcp_pair_t *pair)
+{
+    struct sockaddr_in address;
+    int address_length = (int)sizeof(address);
+    u_long nonblocking = 1;
+
+    tcp_pair_init(pair);
+    pair->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (pair->listener == INVALID_SOCKET) {
+        return -1;
+    }
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(0);
+    if (bind(pair->listener, (const struct sockaddr *)&address,
+             (int)sizeof(address)) == SOCKET_ERROR ||
+        listen(pair->listener, 1) == SOCKET_ERROR ||
+        getsockname(pair->listener, (struct sockaddr *)&address,
+                    &address_length) == SOCKET_ERROR) {
+        tcp_pair_close(pair);
+        return -1;
+    }
+
+    pair->client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (pair->client == INVALID_SOCKET ||
+        ioctlsocket(pair->client, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+        tcp_pair_close(pair);
+        return -1;
+    }
+    if (connect(pair->client, (const struct sockaddr *)&address,
+                (int)sizeof(address)) == SOCKET_ERROR) {
+        int connect_error = WSAGetLastError();
+
+        /* A nonblocking connect commonly reports WSAEWOULDBLOCK.  The
+         * local listener still accepts it, so only hard errors fail setup. */
+        if (connect_error != WSAEWOULDBLOCK &&
+            connect_error != WSAEINPROGRESS &&
+            connect_error != WSAEALREADY) {
+            tcp_pair_close(pair);
+            return -1;
+        }
+    }
+
+    pair->server = accept(pair->listener, NULL, NULL);
+    if (pair->server == INVALID_SOCKET ||
+        ioctlsocket(pair->server, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+        tcp_pair_close(pair);
+        return -1;
+    }
+    return 0;
+}
+
+static int send_byte(SOCKET client)
+{
+    const char byte = 'x';
+    return send(client, &byte, 1, 0) == 1 ? 0 : -1;
+}
+
+static int recv_byte(SOCKET server)
+{
+    char byte;
+    return recv(server, &byte, 1, 0) == 1 ? 0 : -1;
+}
+
+static void test_create_close(void)
+{
+    int epfd;
+
+    TEST("create and close epoll instances");
+    epfd = epoll_create1(0);
+    if (epfd < 0 || wepoll_close(epfd) != 0) {
+        FAIL("create/close");
+        return;
+    }
+    errno = 0;
+    if (wepoll_close(epfd) != -1 || errno != EBADF) {
+        FAIL("double close should be EBADF");
+        return;
+    }
+    PASS();
+}
+
+static void test_invalid_args(void)
+{
+    struct epoll_event event;
+    struct epoll_event output[1];
+    struct timespec invalid_time;
+    int epfd;
+
+    TEST("invalid create, wait, ctl, and batch arguments");
+    errno = 0;
+    if (epoll_create(0) != -1 || errno != EINVAL) {
+        FAIL("epoll_create(0)");
+        return;
+    }
+    errno = 0;
+    if (epoll_create1(0x4000) != -1 || errno != EINVAL) {
+        FAIL("epoll_create1 flags");
+        return;
+    }
+    errno = 0;
+    if (epoll_create_ex(-1, 0) != -1 || errno != EINVAL) {
+        FAIL("epoll_create_ex size");
+        return;
+    }
+
+    memset(&event, 0, sizeof(event));
+    errno = 0;
+    if (epoll_wait(-1, output, 1, 0) != -1 || errno != EBADF) {
+        FAIL("bad epfd wait");
+        return;
+    }
+
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        return;
+    }
+    errno = 0;
+    if (epoll_wait(epfd, NULL, 1, 0) != -1 || errno != EFAULT) {
+        FAIL("NULL wait events");
+        wepoll_close(epfd);
+        return;
+    }
+    errno = 0;
+    if (epoll_wait(epfd, output, 0, 0) != -1 || errno != EINVAL) {
+        FAIL("zero maxevents");
+        wepoll_close(epfd);
+        return;
+    }
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, EPOLL_FD_INVALID,
+                  &event) != -1 || errno != EBADF) {
+        FAIL("invalid socket fd");
+        wepoll_close(epfd);
+        return;
+    }
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, (epoll_fd_t)1,
+                  NULL) != -1 || errno != EFAULT) {
+        FAIL("NULL ADD event");
+        wepoll_close(epfd);
+        return;
+    }
+    errno = 0;
+    if (epoll_ctl(epfd, 99, (epoll_fd_t)1,
+                  &event) != -1 || errno != EINVAL) {
+        FAIL("invalid ctl operation");
+        wepoll_close(epfd);
+        return;
+    }
+
+    invalid_time.tv_sec = 0;
+    invalid_time.tv_nsec = 1000000000L;
+    errno = 0;
+    if (epoll_pwait2(epfd, output, 1, &invalid_time, NULL) != -1 ||
+        errno != EINVAL) {
+        FAIL("invalid timespec");
+        wepoll_close(epfd);
+        return;
+    }
+    errno = 0;
+    if (epoll_ctl_batch(epfd, NULL, NULL, NULL, 1) != -1 ||
+        errno != EFAULT) {
+        FAIL("NULL batch arrays");
+        wepoll_close(epfd);
+        return;
+    }
+    wepoll_close(epfd);
+    PASS();
+}
+
+static void test_basic_io(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    struct epoll_event output;
+    int epfd = -1;
+    int count;
+
+    TEST("loopback ADD/send/WAIT/DEL cycle");
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("make_tcp_pair");
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        tcp_pair_close(&pair);
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = UINT64_C(0x12345678);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
+        send_byte(pair.client) != 0) {
+        FAIL("ADD/send");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    count = epoll_wait(epfd, &output, 1, 1000);
+    if (count != 1 || (output.events & EPOLLIN) == 0 ||
+        output.data.u64 != event.data.u64 || recv_byte(pair.server) != 0) {
+        FAIL("WAIT event");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL) != 0 ||
+        epoll_wait(epfd, &output, 1, 0) != 0) {
+        FAIL("DEL/zero wait");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    wepoll_close(epfd);
+    tcp_pair_close(&pair);
+    PASS();
+}
+
+static void test_zero_timeout(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    struct epoll_event_ex extended;
+    struct timespec zero = { 0, 0 };
+    int epfd;
+
+    TEST("zero timeout never blocks");
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("make_tcp_pair");
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        tcp_pair_close(&pair);
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
+        epoll_wait(epfd, &event, 1, 0) != 0 ||
+        epoll_wait_ex(epfd, &extended, 1, 0) != 0 ||
+        epoll_pwait2(epfd, &event, 1, &zero, NULL) != 0) {
+        FAIL("zero timeout");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    wepoll_close(epfd);
+    tcp_pair_close(&pair);
+    PASS();
+}
+
+static void test_context_clear(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    struct epoll_event_ex output;
+    int context_a = 1;
+    int context_b = 2;
+    int epfd;
+
+    TEST("MOD updates and clears user context");
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("make_tcp_pair");
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        tcp_pair_close(&pair);
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = 7;
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, pair.server,
+                      &event, &context_a) != 0 ||
+        send_byte(pair.client) != 0 ||
+        epoll_wait_ex(epfd, &output, 1, 1000) != 1 ||
+        output.user_ctx != &context_a || recv_byte(pair.server) != 0) {
+        FAIL("initial context");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_MOD, pair.server,
+                      &event, &context_b) != 0 ||
+        send_byte(pair.client) != 0 ||
+        epoll_wait_ex(epfd, &output, 1, 1000) != 1 ||
+        output.user_ctx != &context_b || recv_byte(pair.server) != 0 ||
+        epoll_ctl_ctx(epfd, EPOLL_CTL_MOD, pair.server,
+                      &event, NULL) != 0 ||
+        send_byte(pair.client) != 0 ||
+        epoll_wait_ex(epfd, &output, 1, 1000) != 1 ||
+        output.user_ctx != NULL || recv_byte(pair.server) != 0) {
+        FAIL("MOD context update/clear");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    wepoll_close(epfd);
+    tcp_pair_close(&pair);
+    PASS();
+}
+
+static void test_oneshot_rearm(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    struct epoll_event output;
+    int epfd;
+
+    TEST("EPOLLONESHOT requires explicit rearm");
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("make_tcp_pair");
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        tcp_pair_close(&pair);
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLONESHOT;
+    event.data.u64 = 11;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
+        send_byte(pair.client) != 0 ||
+        epoll_wait(epfd, &output, 1, 1000) != 1 ||
+        epoll_wait(epfd, &output, 1, 0) != 0 ||
+        epoll_rearm(epfd, pair.server) != 0 ||
+        epoll_wait(epfd, &output, 1, 1000) != 1 ||
+        recv_byte(pair.server) != 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL) != 0) {
+        FAIL("oneshot/rearm");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    wepoll_close(epfd);
+    tcp_pair_close(&pair);
+    PASS();
+}
+
+static void test_unsupported_edge_trigger(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    int epfd;
+
+    TEST("reject unsupported edge-triggered mode");
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("make_tcp_pair");
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        tcp_pair_close(&pair);
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLET;
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != -1 ||
+        errno != EOPNOTSUPP || epoll_fd_count(epfd) != 0) {
+        FAIL("EPOLLET should be rejected");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    wepoll_close(epfd);
+    tcp_pair_close(&pair);
+    PASS();
+}
+
+static void test_native_close_cleanup(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    struct epoll_event output;
+    int epfd;
+    int first_result;
+    int second_result;
+
+    TEST("native closesocket removes a registration");
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("make_tcp_pair");
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        tcp_pair_close(&pair);
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0) {
+        FAIL("ADD");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    closesocket(pair.server);
+    pair.server = INVALID_SOCKET;
+
+    first_result = 0;
+    for (int attempt = 0;
+         attempt < 100 && epoll_fd_count(epfd) != 0;
+         attempt++) {
+        first_result = epoll_wait(epfd, &output, 1, 0);
+        if (first_result < 0) {
+            break;
+        }
+        Sleep(1);
+    }
+    errno = 0;
+    second_result = epoll_wait(epfd, &output, 1, 0);
+    if (first_result < 0 || second_result != 0 || epoll_fd_count(epfd) != 0) {
+        FAIL("close cleanup");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    wepoll_close(epfd);
+    tcp_pair_close(&pair);
+    PASS();
+}
+
+static void test_oneshot_native_close_cleanup(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    struct epoll_event output;
+    int epfd;
+    int wait_result = 0;
+
+    TEST("native close retires a fired oneshot registration");
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("make_tcp_pair");
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        tcp_pair_close(&pair);
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLONESHOT;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
+        send_byte(pair.client) != 0 ||
+        epoll_wait(epfd, &output, 1, 1000) != 1) {
+        FAIL("oneshot setup");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    closesocket(pair.server);
+    pair.server = INVALID_SOCKET;
+
+    for (int attempt = 0;
+         attempt < 100 && epoll_fd_count(epfd) != 0;
+         attempt++) {
+        wait_result = epoll_wait(epfd, &output, 1, 0);
+        if (wait_result < 0) {
+            break;
+        }
+        Sleep(1);
+    }
+    if (wait_result < 0 || epoll_fd_count(epfd) != 0) {
+        FAIL("oneshot close cleanup");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    wepoll_close(epfd);
+    tcp_pair_close(&pair);
+    PASS();
+}
+
+static void test_batch_safety(void)
+{
+    tcp_pair_t first;
+    tcp_pair_t second;
+    struct epoll_event events[2];
+    epoll_fd_t fds[2];
+    int duplicate_ops[2] = { EPOLL_CTL_ADD, EPOLL_CTL_ADD };
+    int add_ops[2] = { EPOLL_CTL_ADD, EPOLL_CTL_ADD };
+    int del_ops[2] = { EPOLL_CTL_DEL, EPOLL_CTL_DEL };
+    int epfd;
+
+    TEST("batch validation and ADD rollback");
+    if (make_tcp_pair(&first) != 0 || make_tcp_pair(&second) != 0) {
+        FAIL("make_tcp_pair");
+        tcp_pair_close(&first);
+        tcp_pair_close(&second);
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        tcp_pair_close(&first);
+        tcp_pair_close(&second);
+        return;
+    }
+    memset(events, 0, sizeof(events));
+    events[0].events = EPOLLIN;
+    events[1].events = EPOLLIN;
+    fds[0] = first.server;
+    fds[1] = first.server;
+    if (epoll_ctl_batch(epfd, duplicate_ops, fds, events, 2) != -1 ||
+        epoll_fd_count(epfd) != 0) {
+        FAIL("duplicate ADD rollback");
+        wepoll_close(epfd);
+        tcp_pair_close(&first);
+        tcp_pair_close(&second);
+        return;
+    }
+    /* Rollback removes the public registration immediately even though its
+     * cancelled AFD completion may still be queued internally. */
+    fds[1] = second.server;
+    if (epoll_ctl_batch(epfd, add_ops, fds, events, 2) != 0 ||
+        epoll_fd_count(epfd) != 2 ||
+        epoll_ctl_batch(epfd, del_ops, fds, NULL, 2) != 0 ||
+        epoll_fd_count(epfd) != 0) {
+        FAIL("valid ADD/DEL batch");
+        wepoll_close(epfd);
+        tcp_pair_close(&first);
+        tcp_pair_close(&second);
+        return;
+    }
+    wepoll_close(epfd);
+    tcp_pair_close(&first);
+    tcp_pair_close(&second);
+    PASS();
+}
+
+static void test_epfd_collision_and_reuse(void)
+{
+    enum { EPFD_COUNT = 70, CLOSE_COUNT = 6 };
+    int epfds[EPFD_COUNT];
+    int replacements[CLOSE_COUNT];
+
+    for (int i = 0; i < EPFD_COUNT; i++) {
+        epfds[i] = -1;
+    }
+    for (int i = 0; i < CLOSE_COUNT; i++) {
+        replacements[i] = -1;
+    }
+
+    TEST("epoll descriptor collisions survive close and reuse");
+    for (int i = 0; i < EPFD_COUNT; i++) {
+        epfds[i] = epoll_create1(0);
+        if (epfds[i] < 0) {
+            FAIL("create collision set");
+            for (int j = 0; j < i; j++) {
+                wepoll_close(epfds[j]);
+            }
+            return;
+        }
+    }
+    for (int i = 0; i < CLOSE_COUNT; i++) {
+        if (wepoll_close(epfds[i]) != 0) {
+            FAIL("close collision entry");
+            for (int j = i + 1; j < EPFD_COUNT; j++) {
+                wepoll_close(epfds[j]);
+            }
+            return;
+        }
+    }
+    for (int i = CLOSE_COUNT; i < EPFD_COUNT; i++) {
+        if (epoll_fd_count(epfds[i]) != 0) {
+            FAIL("lookup after collision deletion");
+            for (int j = i; j < EPFD_COUNT; j++) {
+                wepoll_close(epfds[j]);
+            }
+            return;
+        }
+    }
+    for (int i = 0; i < CLOSE_COUNT; i++) {
+        replacements[i] = epoll_create1(0);
+        if (replacements[i] < 0) {
+            FAIL("descriptor reuse");
+            for (int j = 0; j < CLOSE_COUNT; j++) {
+                if (replacements[j] > 0) {
+                    wepoll_close(replacements[j]);
+                }
+            }
+            for (int j = CLOSE_COUNT; j < EPFD_COUNT; j++) {
+                wepoll_close(epfds[j]);
+            }
+            return;
+        }
+    }
+    for (int i = CLOSE_COUNT; i < EPFD_COUNT; i++) {
+        wepoll_close(epfds[i]);
+    }
+    for (int i = 0; i < CLOSE_COUNT; i++) {
+        wepoll_close(replacements[i]);
+    }
+    PASS();
+}
+
+typedef struct close_wait_context {
+    int epfd;
+    HANDLE started;
+    int result;
+    int error;
+} close_wait_context_t;
+
+static DWORD WINAPI close_wait_thread(void *opaque)
+{
+    close_wait_context_t *context = (close_wait_context_t *)opaque;
+    struct epoll_event event;
+
+    SetEvent(context->started);
+    context->result = epoll_wait(context->epfd, &event, 1, -1);
+    context->error = errno;
+    return 0;
+}
+
+static void test_concurrent_close(void)
+{
+    close_wait_context_t context;
+    HANDLE thread;
+    DWORD wait_result;
+
+    TEST("close wakes a concurrent infinite wait");
+    context.epfd = epoll_create1(0);
+    context.started = CreateEventA(NULL, TRUE, FALSE, NULL);
+    context.result = 0;
+    context.error = 0;
+    if (context.epfd < 0 || context.started == NULL) {
+        FAIL("setup concurrent close");
+        if (context.epfd > 0) {
+            wepoll_close(context.epfd);
+        }
+        if (context.started != NULL) {
+            CloseHandle(context.started);
+        }
+        return;
+    }
+
+    thread = CreateThread(NULL, 0, close_wait_thread, &context, 0, NULL);
+    if (thread == NULL) {
+        FAIL("CreateThread");
+        wepoll_close(context.epfd);
+        CloseHandle(context.started);
+        return;
+    }
+    wait_result = WaitForSingleObject(context.started, 2000);
+    if (wait_result != WAIT_OBJECT_0 || wepoll_close(context.epfd) != 0 ||
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0 ||
+        context.result != -1) {
+        FAIL("concurrent close/wait");
+        TerminateThread(thread, 1);
+        CloseHandle(thread);
+        CloseHandle(context.started);
+        return;
+    }
+    CloseHandle(thread);
+    CloseHandle(context.started);
+    PASS();
+}
+
+int main(void)
+{
+    WSADATA wsa_data;
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        return 2;
+    }
+
+    test_create_close();
+    test_invalid_args();
+    test_basic_io();
+    test_zero_timeout();
+    test_context_clear();
+    test_oneshot_rearm();
+    test_unsupported_edge_trigger();
+    test_native_close_cleanup();
+    test_oneshot_native_close_cleanup();
+    test_batch_safety();
+    test_epfd_collision_and_reuse();
+    test_concurrent_close();
+
+    printf("\n%d passed, %d failed\n", tests_passed, tests_failed);
+    WSACleanup();
+    return tests_failed == 0 ? 0 : 1;
+}

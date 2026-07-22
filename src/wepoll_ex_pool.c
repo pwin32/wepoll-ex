@@ -387,7 +387,10 @@ ep_ready_node_t *ep_ready_node_alloc(ep_port_t *port)
     if (buf == NULL) return NULL;
     ep_ready_node_t *n = (ep_ready_node_t *)buf;
     atomic_init(&n->next, (ep_ready_node_t *)NULL);
-    n->sock      = NULL;
+    memset(&n->data, 0, sizeof(n->data));
+    n->user_ctx = NULL;
+    n->fd = (SOCKET)EPOLL_FD_INVALID;
+    n->sock_generation = 0;
     n->events    = 0;
     n->flags     = 0;
     n->timestamp = 0;

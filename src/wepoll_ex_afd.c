@@ -7,9 +7,8 @@
  *
  * This is the same mechanism WSAPoll uses internally, but going through
  * the driver directly gives us:
- *   - One-shot edge-triggered semantics (by re-arming after each
- *     completion)
- *   - EPOLLRDHUP-style detection via AFD_POLL_RECEIVE_DISCONNECT
+ *   - Asynchronous, one-completion-at-a-time readiness notification
+ *   - EPOLLRDHUP-style detection via AFD_POLL_DISCONNECT
  *   - Sub-microsecond notification latency (no user-mode polling)
  *
  * The driver is undocumented but has been stable since Windows 8.
@@ -19,6 +18,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 #  include <winsock2.h>
@@ -32,24 +32,21 @@
 /* socket fd.                                                            */
 /* --------------------------------------------------------------------- */
 
-#define AFD_OPEN_PACKET_SIZE  (sizeof(AFD_OPEN_PACKET) + sizeof(WCHAR))
-
-typedef struct _AFD_OPEN_PACKET {
-    ULONG TransportNameLength;
-    LARGE_INTEGER EndpointAddress;
-} AFD_OPEN_PACKET;
-
-int ep_afd_open(HANDLE *out)
+int ep_afd_open(HANDLE iocp, HANDLE *out)
 {
 #ifdef _WIN32
     UNICODE_STRING name;
     OBJECT_ATTRIBUTES oa;
     IO_STATUS_BLOCK iosb;
     NTSTATUS status;
-    HANDLE h;
+    HANDLE h = NULL;
 
-    /* Build the AFD device path: \Device\Afd\WepollEx */
-    static const WCHAR afd_name[] = L"\\Device\\Afd\\WepollEx";
+    if (iocp == NULL || out == NULL || g_ntdll.NtCreateFile == NULL) {
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+
+    static const WCHAR afd_name[] = AFD_DEVICE_NAME;
 
     name.Buffer        = (PWSTR)afd_name;
     name.Length        = sizeof(afd_name) - sizeof(WCHAR);
@@ -57,32 +54,41 @@ int ep_afd_open(HANDLE *out)
 
     InitializeObjectAttributes(&oa, &name, 0, NULL, NULL);
 
-    /* We need to pass an AFD_OPEN_PACKET as the EaBuffer.  The
-     * EndpointAddress field can be zero for our purposes (we never
-     * actually use this handle to send/recv — we only IOCTL on it). */
-    AFD_OPEN_PACKET pkt;
-    memset(&pkt, 0, sizeof(pkt));
-    pkt.TransportNameLength = 0;
-    pkt.EndpointAddress.QuadPart = 0;
-
-    status = NtCreateFile(&h,
-                          GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
-                          &oa,
-                          &iosb,
-                          NULL,
-                          0,
-                          FILE_SHARE_READ | FILE_SHARE_WRITE,
-                          FILE_OPEN_IF,
-                          0,
-                          &pkt,
-                          sizeof(pkt));
-    if (status < 0) {
+    /* Opening without extended attributes returns a control handle that has
+     * no socket endpoint and is suitable for IOCTL_AFD_POLL. */
+    status = g_ntdll.NtCreateFile(&h,
+                                  SYNCHRONIZE,
+                                  &oa,
+                                  &iosb,
+                                  NULL,
+                                  0,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  FILE_OPEN,
+                                  0,
+                                  NULL,
+                                  0);
+    if (status != STATUS_SUCCESS) {
         ep_set_errno(ep_status_to_errno(status));
         return -1;
     }
+
+    if (CreateIoCompletionPort(h, iocp, 0, 0) == NULL) {
+        ep_set_errno(ep_winerr_to_errno(GetLastError()));
+        CloseHandle(h);
+        return -1;
+    }
+
+    if (!SetFileCompletionNotificationModes(h,
+                                            FILE_SKIP_SET_EVENT_ON_HANDLE)) {
+        ep_set_errno(ep_winerr_to_errno(GetLastError()));
+        CloseHandle(h);
+        return -1;
+    }
+
     *out = h;
     return 0;
 #else
+    (void)iocp;
     (void)out;
     ep_set_errno(ENOSYS);
     return -1;
@@ -90,18 +96,96 @@ int ep_afd_open(HANDLE *out)
 }
 
 /* --------------------------------------------------------------------- */
+/* Resolve the underlying provider socket used by AFD.                  */
+/* --------------------------------------------------------------------- */
+
+#ifdef _WIN32
+#  ifndef SIO_BSP_HANDLE_POLL
+#    define SIO_BSP_HANDLE_POLL 0x4800001D
+#  endif
+#  ifndef SIO_BASE_HANDLE
+#    define SIO_BASE_HANDLE 0x48000022
+#  endif
+
+static SOCKET ep_socket_ioctl_handle(SOCKET socket, DWORD ioctl)
+{
+    SOCKET result = INVALID_SOCKET;
+    DWORD bytes = 0;
+
+    if (WSAIoctl(socket,
+                 ioctl,
+                 NULL,
+                 0,
+                 &result,
+                 (DWORD)sizeof(result),
+                 &bytes,
+                 NULL,
+                 NULL) == SOCKET_ERROR)
+        return INVALID_SOCKET;
+
+    return result;
+}
+#endif
+
+SOCKET ep_socket_get_base(SOCKET socket)
+{
+#ifdef _WIN32
+    SOCKET current = socket;
+
+    if (current == INVALID_SOCKET) {
+        ep_set_errno(ENOTSOCK);
+        return INVALID_SOCKET;
+    }
+
+    /* A finite bound protects against a broken provider returning a cycle. */
+    for (unsigned int depth = 0; depth < 32; depth++) {
+        SOCKET base = ep_socket_ioctl_handle(current, SIO_BASE_HANDLE);
+        if (base != INVALID_SOCKET)
+            return base;
+
+        int error = WSAGetLastError();
+        if (error == WSAENOTSOCK) {
+            ep_set_errno(ENOTSOCK);
+            return INVALID_SOCKET;
+        }
+
+        base = ep_socket_ioctl_handle(current, SIO_BSP_HANDLE_POLL);
+        if (base == INVALID_SOCKET || base == current) {
+            ep_set_errno(ep_winerr_to_errno((DWORD)error));
+            return INVALID_SOCKET;
+        }
+        current = base;
+    }
+
+    ep_set_errno(ELOOP);
+    return INVALID_SOCKET;
+#else
+    return socket;
+#endif
+}
+
+/* --------------------------------------------------------------------- */
 /* Submit an AFD poll request.                                          */
 /*                                                                     */
 /* The poll is asynchronous: it completes via the IOCP associated with */
-/* the port.  When it completes, the OVERLAPPED embedded in ep_sock_t */
-/* is signalled.                                                       */
+/* the port.  The completion packet carries the embedded IO_STATUS_BLOCK. */
 /* --------------------------------------------------------------------- */
 
 int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
 {
 #ifdef _WIN32
-    IO_STATUS_BLOCK *iosb;
     NTSTATUS status;
+
+    if (sock == NULL || sock->port == NULL || sock->port->afd == NULL ||
+        g_ntdll.NtDeviceIoControlFile == NULL) {
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+
+    if (atomic_load(&sock->poll_status) != EP_POLL_IDLE) {
+        ep_set_errno(EALREADY);
+        return -1;
+    }
 
     if (sock->afd_info == NULL) {
         sock->afd_info = (AFD_POLL_INFO *)calloc(1, sizeof(AFD_POLL_INFO));
@@ -111,28 +195,32 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
         }
     }
 
+    sock->base_socket = ep_socket_get_base(sock->fd);
+    if (sock->base_socket == INVALID_SOCKET)
+        return -1;
+
     AFD_POLL_INFO *info = sock->afd_info;
     memset(info, 0, sizeof(*info));
-    info->Timeout.QuadPart  = LLONG_MAX;
+    info->Timeout.QuadPart  = INT64_MAX;
     info->NumberOfHandles   = 1;
     info->Exclusive         = FALSE;
-    info->Handles[0].Handle = (HANDLE)sock->fd;
+    info->Handles[0].Handle = (HANDLE)sock->base_socket;
     info->Handles[0].Events = afd_events;
 
-    memset(&sock->overlapped, 0, sizeof(sock->overlapped));
+    memset(&sock->io_status_block, 0, sizeof(sock->io_status_block));
+    sock->io_status_block.Status = STATUS_PENDING;
 
-    /* IO_STATUS_BLOCK lives in the same memory as the OVERLAPPED's
-     * Internal/InternalHigh fields.  This is documented by Microsoft
-     * for NtDeviceIoControlFile consumers. */
-    iosb = (IO_STATUS_BLOCK *)&sock->overlapped;
-    iosb->Status = STATUS_PENDING;
+    /* Publish PENDING before entering the kernel: an immediately satisfied
+     * poll can enqueue its completion on another thread before this call
+     * returns. */
+    atomic_store(&sock->poll_status, EP_POLL_PENDING);
 
     status = g_ntdll.NtDeviceIoControlFile(
-        sock->port->afd,                /* FileHandle — actually AFD handle */
+        sock->port->afd,
         NULL,                           /* Event — we use IOCP instead */
         NULL,                           /* ApcRoutine */
-        (PVOID)sock,                    /* ApcContext — used by IOCP */
-        iosb,                           /* IoStatusBlock */
+        &sock->io_status_block,         /* ApcContext returned by IOCP */
+        &sock->io_status_block,
         IOCTL_AFD_POLL,                 /* IoControlCode */
         info,                           /* InputBuffer */
         sizeof(*info),                  /* InputBufferLength */
@@ -142,14 +230,54 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
     /* STATUS_PENDING means the request was queued.  Any other success
      * code means it already completed (e.g. socket already readable),
      * which we treat as a normal completion via the IOCP path. */
-    if (status != STATUS_PENDING && status < 0) {
+    if (status != STATUS_SUCCESS && status != STATUS_PENDING) {
+        atomic_store(&sock->poll_status, EP_POLL_IDLE);
         ep_set_errno(ep_status_to_errno(status));
         return -1;
     }
-    sock->poll_pending = 1;
     return 0;
 #else
     (void)sock; (void)afd_events;
+    ep_set_errno(ENOSYS);
+    return -1;
+#endif
+}
+
+int ep_afd_cancel(ep_sock_t *sock)
+{
+#ifdef _WIN32
+    IO_STATUS_BLOCK cancel_status_block;
+    NTSTATUS status;
+
+    if (sock == NULL || sock->port == NULL ||
+        g_ntdll.NtCancelIoFileEx == NULL) {
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+
+    if (atomic_load(&sock->poll_status) != EP_POLL_PENDING ||
+        sock->io_status_block.Status != STATUS_PENDING)
+        return 0;
+
+    memset(&cancel_status_block, 0, sizeof(cancel_status_block));
+    status = g_ntdll.NtCancelIoFileEx(sock->port->afd,
+                                     &sock->io_status_block,
+                                     &cancel_status_block);
+
+    if (status == STATUS_SUCCESS) {
+        atomic_store(&sock->poll_status, EP_POLL_CANCELLED);
+        return 0;
+    }
+
+    /* The operation raced with cancellation and its completion packet is
+     * already queued (or about to be queued). */
+    if (status == STATUS_NOT_FOUND)
+        return 0;
+
+    ep_set_errno(ep_status_to_errno(status));
+    return -1;
+#else
+    (void)sock;
     ep_set_errno(ENOSYS);
     return -1;
 #endif
@@ -163,15 +291,21 @@ uint32_t ep_afd_to_epoll_events(ULONG afd_events)
 {
     uint32_t out = 0;
 
-    if (afd_events & AFD_POLL_RECEIVE)            out |= EPOLLIN;
-    if (afd_events & AFD_POLL_RECEIVE_EXPEDITED)  out |= EPOLLPRI;
-    if (afd_events & AFD_POLL_SEND)               out |= EPOLLOUT;
-    if (afd_events & AFD_POLL_DISCONNECT)         out |= EPOLLHUP;
-    if (afd_events & AFD_POLL_RECEIVE_DISCONNECT) out |= EPOLLRDHUP;
-    if (afd_events & AFD_POLL_ABORT)              out |= (EPOLLERR | EPOLLHUP);
-    if (afd_events & AFD_POLL_CONNECT_FAIL)       out |= EPOLLERR;
-    if (afd_events & AFD_POLL_CONNECT)            out |= EPOLLOUT;
-    if (afd_events & AFD_POLL_LOCAL_CLOSE)        out |= EPOLLHUP;
+    if (afd_events & (AFD_POLL_RECEIVE | AFD_POLL_ACCEPT))
+        out |= EPOLLIN | EPOLLRDNORM;
+    if (afd_events & AFD_POLL_RECEIVE_EXPEDITED)
+        out |= EPOLLPRI | EPOLLRDBAND;
+    if (afd_events & AFD_POLL_SEND)
+        out |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
+    if (afd_events & AFD_POLL_DISCONNECT)
+        out |= EPOLLIN | EPOLLRDNORM | EPOLLRDHUP;
+    if (afd_events & AFD_POLL_ABORT)
+        out |= EPOLLHUP;
+    if (afd_events & AFD_POLL_CONNECT_FAIL)
+        out |= EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLRDNORM |
+               EPOLLWRNORM | EPOLLRDHUP;
+    if (afd_events & AFD_POLL_LOCAL_CLOSE)
+        out |= EPOLLHUP;
 
     return out;
 }
@@ -182,21 +316,14 @@ uint32_t ep_afd_to_epoll_events(ULONG afd_events)
  * by always arming AFD for the disconnect/abort events. */
 uint32_t ep_epoll_to_afd_events(uint32_t epoll_events)
 {
-    uint32_t afd = 0;
+    uint32_t afd = AFD_POLL_DISCONNECT | AFD_POLL_ABORT |
+                   AFD_POLL_CONNECT_FAIL | AFD_POLL_LOCAL_CLOSE;
 
-    if (epoll_events & (EPOLLIN | EPOLLRDNORM | EPOLLRDBAND | EPOLLMSG))
-        afd |= AFD_POLL_RECEIVE | AFD_POLL_RECEIVE_EXPEDITED;
-    if (epoll_events & EPOLLPRI)
+    if (epoll_events & (EPOLLIN | EPOLLRDNORM))
+        afd |= AFD_POLL_RECEIVE | AFD_POLL_ACCEPT;
+    if (epoll_events & (EPOLLPRI | EPOLLRDBAND))
         afd |= AFD_POLL_RECEIVE_EXPEDITED;
     if (epoll_events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND))
         afd |= AFD_POLL_SEND;
-    if (epoll_events & EPOLLRDHUP)
-        afd |= AFD_POLL_RECEIVE_DISCONNECT;
-
-    /* Always arm for these — they're edge events that fire once and
-     * need no user request to be delivered. */
-    afd |= AFD_POLL_DISCONNECT | AFD_POLL_ABORT | AFD_POLL_CONNECT_FAIL
-         | AFD_POLL_CONNECT | AFD_POLL_LOCAL_CLOSE;
-
     return afd;
 }

@@ -41,19 +41,56 @@
 #  ifndef LARGE_INTEGER
    typedef struct { long long QuadPart; } LARGE_INTEGER;
 #  endif
+#  ifndef PHANDLE
+   typedef HANDLE *PHANDLE;
+#  endif
+#  ifndef ACCESS_MASK
+   typedef unsigned long ACCESS_MASK;
+#  endif
+#  ifndef POBJECT_ATTRIBUTES
+   typedef void *POBJECT_ATTRIBUTES;
+#  endif
+#  ifndef PLARGE_INTEGER
+   typedef LARGE_INTEGER *PLARGE_INTEGER;
+#  endif
 #  ifndef NTAPI
 #    define NTAPI
 #  endif
    typedef struct { void *Pointer; unsigned long Internal, InternalHigh; } OVERLAPPED;
    typedef struct { void *lpCompletionKey; OVERLAPPED *lpOverlapped; unsigned long Internal; DWORD dwNumberOfBytesTransferred; } OVERLAPPED_ENTRY;
    typedef void *PVOID;
-   typedef void *PIO_STATUS_BLOCK;
+   typedef struct _IO_STATUS_BLOCK {
+       union { NTSTATUS Status; PVOID Pointer; } DUMMYUNIONNAME;
+       uintptr_t Information;
+   } IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
+   typedef void (*PIO_APC_ROUTINE)(PVOID, PIO_STATUS_BLOCK, ULONG);
 #  ifndef STATUS_PENDING
 #    define STATUS_PENDING ((NTSTATUS)0x00000103)
+#  endif
+#  ifndef STATUS_SUCCESS
+#    define STATUS_SUCCESS ((NTSTATUS)0x00000000)
 #  endif
 #  ifndef STATUS_CANCELLED
 #    define STATUS_CANCELLED ((NTSTATUS)0xC0000120)
 #  endif
+#  ifndef STATUS_NOT_FOUND
+#    define STATUS_NOT_FOUND ((NTSTATUS)0xC0000225)
+#  endif
+#endif
+
+/* winternl.h does not expose every NTSTATUS constant in all MinGW SDK
+ * revisions.  Keep the values local and portable across those headers. */
+#ifndef STATUS_SUCCESS
+#  define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
+#endif
+#ifndef STATUS_PENDING
+#  define STATUS_PENDING ((NTSTATUS)0x00000103L)
+#endif
+#ifndef STATUS_CANCELLED
+#  define STATUS_CANCELLED ((NTSTATUS)0xC0000120L)
+#endif
+#ifndef STATUS_NOT_FOUND
+#  define STATUS_NOT_FOUND ((NTSTATUS)0xC0000225L)
 #endif
 
 /* ----------------------------------------------------------------------- */
@@ -85,7 +122,7 @@ typedef struct ep_poll_ctx  ep_poll_ctx_t;
 /* since Windows 8 and is the same mechanism WSAPoll uses internally.      */
 /* ----------------------------------------------------------------------- */
 
-#define AFD_DEVICE_NAME   L"\\Device\\Afd"
+#define AFD_DEVICE_NAME   L"\\Device\\Afd\\Wepoll"
 #define AFD_MAX_ADDRESS_LENGTH  32
 
 typedef struct _AFD_POLL_HANDLE_INFO {
@@ -101,22 +138,14 @@ typedef struct _AFD_POLL_INFO {
     AFD_POLL_HANDLE_INFO Handles[1];
 } AFD_POLL_INFO, *PAFD_POLL_INFO;
 
-#define AFD_POLL_RECEIVE_BIT           0
-#define AFD_POLL_RECEIVE               (1 << 0)
-#define AFD_POLL_RECEIVE_EXPEDITED     (1 << 1)
-#define AFD_POLL_RECEIVE_DISCONNECT    (1 << 3)
-#define AFD_POLL_DISCONNECT            (1 << 4)
-#define AFD_POLL_CONNECT_BIT           5
-#define AFD_POLL_CONNECT_FAIL          (1 << 6)
-#define AFD_POLL_ACCEPT_BIT           6
-#define AFD_POLL_ABORT_BIT            7
-#define AFD_POLL_LOCAL_CLOSE_BIT      8
-#define AFD_POLL_LOCAL_CLOSE          (1 << 8)
-#define AFD_POLL_CONNECT               (1 << 9)
-#define AFD_POLL_CANCEL_BIT           10
-#define AFD_POLL_ABORT                (1 << 11)
-#define AFD_POLL_SEND_BIT             12
-#define AFD_POLL_SEND                 (1 << 13)
+#define AFD_POLL_RECEIVE           0x0001UL
+#define AFD_POLL_RECEIVE_EXPEDITED 0x0002UL
+#define AFD_POLL_SEND              0x0004UL
+#define AFD_POLL_DISCONNECT        0x0008UL
+#define AFD_POLL_ABORT             0x0010UL
+#define AFD_POLL_LOCAL_CLOSE       0x0020UL
+#define AFD_POLL_ACCEPT            0x0080UL
+#define AFD_POLL_CONNECT_FAIL      0x0100UL
 
 /* IoControlCode for AFD_POLL.  Reverse-engineered; matches Win8+. */
 #define IOCTL_AFD_POLL  0x00012024
@@ -125,7 +154,7 @@ typedef struct _AFD_POLL_INFO {
 typedef NTSTATUS (NTAPI *PNtDeviceIoControlFile)(
     HANDLE FileHandle,
     HANDLE Event,
-    PVOID ApcRoutine,
+    PIO_APC_ROUTINE ApcRoutine,
     PVOID ApcContext,
     PIO_STATUS_BLOCK IoStatusBlock,
     ULONG IoControlCode,
@@ -134,13 +163,31 @@ typedef NTSTATUS (NTAPI *PNtDeviceIoControlFile)(
     PVOID OutputBuffer,
     ULONG OutputBufferLength);
 
+typedef NTSTATUS (NTAPI *PNtCreateFile)(
+    PHANDLE FileHandle,
+    ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PLARGE_INTEGER AllocationSize,
+    ULONG FileAttributes,
+    ULONG ShareAccess,
+    ULONG CreateDisposition,
+    ULONG CreateOptions,
+    PVOID EaBuffer,
+    ULONG EaLength);
+
+typedef NTSTATUS (NTAPI *PNtCancelIoFileEx)(
+    HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoRequestToCancel,
+    PIO_STATUS_BLOCK IoStatusBlock);
+
 /* ----------------------------------------------------------------------- */
 /* ep_sock_t — per-fd state.                                               */
 /*                                                                         */
 /* One of these is allocated for every fd registered with epoll_ctl and    */
 /* kept alive until either EPOLL_CTL_DEL or close().  The poll request     */
 /* is asynchronously pended against AFD; when it completes, the IOCP       */
-/* delivers the OVERLAPPED embedded in this struct.                        */
+/* delivers the IO_STATUS_BLOCK address embedded in this struct.           */
 /* ----------------------------------------------------------------------- */
 
 typedef enum ep_sock_state {
@@ -151,13 +198,21 @@ typedef enum ep_sock_state {
     EP_SOCK_DELETED        /* pending EPOLL_CTL_DEL, awaiting teardown */
 } ep_sock_state_t;
 
+typedef enum ep_poll_status {
+    EP_POLL_IDLE = 0,
+    EP_POLL_PENDING,
+    EP_POLL_CANCELLED
+} ep_poll_status_t;
+
 struct ep_sock {
     /* Pool linkage (all live sockets on this port). */
     struct ep_sock *next;
     struct ep_sock *prev;
 
-    /* The fd this sock tracks. */
+    /* The descriptor supplied by the caller and the unwrapped provider
+     * socket used in AFD_POLL. */
     SOCKET fd;
+    SOCKET base_socket;
 
     /* User-supplied event mask + data + per-fd context. */
     uint32_t      user_events;    /* EPOLLIN | EPOLLOUT | … */
@@ -172,14 +227,16 @@ struct ep_sock {
      * delivered to user via epoll_wait). */
     uint32_t pending_events;
 
-    /* Whether a poll is currently pended. */
-    uint8_t poll_pending;
-
-    /* Whether the oneshot mask has fired and the fd needs re-arm. */
+    /* Poll lifecycle.  The IO_STATUS_BLOCK is also used as the ApcContext
+     * returned in the IOCP packet, so it must remain embedded until the
+     * cancellation completion has been observed. */
+    _Atomic uint32_t poll_status;
+    _Atomic uint32_t delete_pending;
+    _Atomic uint32_t ready_queued;
     uint8_t oneshot_fired;
-
-    /* IOCP overlapped for the in-flight AFD_POLL request. */
-    OVERLAPPED overlapped;
+    uint8_t needs_rearm;
+    IO_STATUS_BLOCK io_status_block;
+    uint64_t generation;
 
     /* The AFD poll buffer for this socket.  Allocated separately so the
      * buffer can be reused across re-arming without copying. */
@@ -204,7 +261,10 @@ struct ep_sock {
 
 typedef struct ep_ready_node {
     _Atomic(struct ep_ready_node *) next;
-    ep_sock_t   *sock;        /* owning sock — for user_data lookup */
+    epoll_data_t data;        /* immutable registration snapshot */
+    void         *user_ctx;
+    SOCKET        fd;
+    uint64_t      sock_generation;
     uint32_t      events;
     uint32_t      flags;      /* WEPOLL_FLAG_* delivery flags */
     uint64_t      timestamp;
@@ -264,7 +324,6 @@ struct ep_port {
 
     /* All live socks on this port, chained for cleanup. */
     ep_sock_t       *sock_list_head;
-    pthread_mutex_t  sock_list_lock;
 
     /* Ready queue — MPSC lock-free.  Drained by epoll_wait. */
     ep_ready_queue_t ready_queue;
@@ -284,6 +343,13 @@ struct ep_port {
     /* Configuration snapshot. */
     int close_on_exec;
 
+    /* Close/wait coordination.  A closing port cancels all outstanding AFD
+     * polls and waits for their IOCP completions before storage is freed. */
+    pthread_mutex_t wait_lock;
+    _Atomic int closing;
+    size_t pending_poll_count;
+    uint64_t next_sock_generation;
+
     /* Atomic generation counter bumped on every ADD/DEL/MOD.  Used by
      * epoll_wait to detect ABA races when the ready queue is drained. */
     _Atomic uint64_t generation;
@@ -295,7 +361,10 @@ struct ep_port {
 
 typedef struct ep_ntdll {
     PNtDeviceIoControlFile  NtDeviceIoControlFile;
+    PNtCreateFile           NtCreateFile;
+    PNtCancelIoFileEx       NtCancelIoFileEx;
     int                     initialized;
+    int                     wsa_initialized;
 } ep_ntdll_t;
 
 extern ep_ntdll_t g_ntdll;
@@ -309,6 +378,7 @@ void ep_global_fini(void);
 
 int  ep_port_create(int size_hint, int flags, ep_port_t **out);
 void ep_port_destroy(ep_port_t *port);
+void ep_port_begin_close(ep_port_t *port);
 
 int  ep_port_register(ep_port_t *port, SOCKET fd,
                       uint32_t events, uint32_t flags,
@@ -320,7 +390,7 @@ int  ep_port_unregister(ep_port_t *port, SOCKET fd);
 int  ep_port_rearm(ep_port_t *port, SOCKET fd);
 
 int  ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
-                  int timeout_ms, const sigset_t *sigmask);
+                  int timeout_ms, const wepoll_sigset_t *sigmask);
 
 void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes,
                                NTSTATUS status);
@@ -332,6 +402,15 @@ int  ep_last_err(void);
 /* Map NTSTATUS -> errno. */
 int  ep_status_to_errno(NTSTATUS s);
 int  ep_winerr_to_errno(DWORD wsaerr);
+DWORD ep_ntstatus_to_winerr(NTSTATUS status);
+
+/* AFD/NT helpers implemented in wepoll_ex_afd.c. */
+int      ep_afd_open(HANDLE iocp, HANDLE *out);
+int      ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events);
+int      ep_afd_cancel(ep_sock_t *sock);
+uint32_t ep_afd_to_epoll_events(ULONG afd_events);
+uint32_t ep_epoll_to_afd_events(uint32_t epoll_events);
+SOCKET   ep_socket_get_base(SOCKET socket);
 
 /* ----------------------------------------------------------------------- */
 /* AFD buffer pool — LIFO stack of pre-allocated buffers.                 */

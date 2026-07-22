@@ -1,23 +1,42 @@
-if(NOT WEPOLL_EX_PLATFORM_POSIX)
-    return()
-endif()
+if(WEPOLL_EX_PLATFORM_POSIX)
+    add_executable(test_wepoll_ex test_api.c)
+    target_link_libraries(test_wepoll_ex PRIVATE wepoll_ex::wepoll_ex)
 
-add_executable(test_wepoll_ex test_api.c)
-target_link_libraries(test_wepoll_ex PRIVATE wepoll_ex::wepoll_ex)
+    add_test(NAME wepoll_ex_api COMMAND test_wepoll_ex)
+    set_tests_properties(wepoll_ex_api PROPERTIES TIMEOUT 30)
 
-add_test(NAME wepoll_ex_api COMMAND test_wepoll_ex)
-set_tests_properties(wepoll_ex_api PROPERTIES TIMEOUT 30)
+    if(WEPOLL_EX_BUILD_STATIC)
+        add_executable(test_wepoll_ex_pool test_pool.c)
+        target_include_directories(test_wepoll_ex_pool PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+        target_link_libraries(test_wepoll_ex_pool PRIVATE wepoll_ex_static)
 
-if(WEPOLL_EX_BUILD_STATIC)
-    add_executable(test_wepoll_ex_pool test_pool.c)
-    target_include_directories(test_wepoll_ex_pool PRIVATE
-        ${PROJECT_SOURCE_DIR}/src)
-    target_link_libraries(test_wepoll_ex_pool PRIVATE wepoll_ex_static)
-
-    add_test(NAME wepoll_ex_pool_mpsc COMMAND test_wepoll_ex_pool)
-    set_tests_properties(wepoll_ex_pool_mpsc PROPERTIES TIMEOUT 60)
+        add_test(NAME wepoll_ex_pool_mpsc COMMAND test_wepoll_ex_pool)
+        set_tests_properties(wepoll_ex_pool_mpsc PROPERTIES TIMEOUT 60)
+    else()
+        message(STATUS "Skipping pool test: it requires the internal static library symbols")
+    endif()
 else()
-    message(STATUS "Skipping pool test: it requires the internal static library symbols")
+    add_executable(test_wepoll_ex_windows test_windows_api.c)
+    target_compile_definitions(test_wepoll_ex_windows PRIVATE
+        _WIN32_WINNT=0x0602
+        WIN32_LEAN_AND_MEAN)
+
+    if(WEPOLL_EX_BUILD_STATIC)
+        target_link_libraries(test_wepoll_ex_windows PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+    else()
+        target_link_libraries(test_wepoll_ex_windows PRIVATE
+            wepoll_ex::wepoll_ex ws2_32)
+    endif()
+
+    add_test(NAME wepoll_ex_windows_api COMMAND test_wepoll_ex_windows)
+    set_tests_properties(wepoll_ex_windows_api PROPERTIES TIMEOUT 120)
+    if(WEPOLL_EX_BUILD_SHARED AND NOT WEPOLL_EX_BUILD_STATIC)
+        set_tests_properties(wepoll_ex_windows_api PROPERTIES
+            ENVIRONMENT
+                "PATH=$<TARGET_FILE_DIR:wepoll_ex_shared>\;$ENV{PATH}")
+    endif()
 endif()
 
 set(_package_test_prefix ${CMAKE_CURRENT_BINARY_DIR}/package-consumer-install)

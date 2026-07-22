@@ -111,7 +111,10 @@ static ep_ready_node_t *node_take(test_fixture_t *fixture, uint32_t value)
         (ep_ready_node_t *)ep_afd_pool_take(&fixture->pool);
     if (node != NULL) {
         atomic_init(&node->next, (ep_ready_node_t *)NULL);
-        node->sock = NULL;
+        memset(&node->data, 0, sizeof(node->data));
+        node->user_ctx = NULL;
+        node->fd = (SOCKET)EPOLL_FD_INVALID;
+        node->sock_generation = 0;
         node->events = value;
         node->flags = 0;
         node->timestamp = 0;

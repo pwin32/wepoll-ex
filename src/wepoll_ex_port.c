@@ -1,76 +1,68 @@
 /*
- * wepoll_ex_port.c — ep_port_t lifecycle, fd table, IOCP loop.
+ * wepoll_ex_port.c -- Windows IOCP/AFD port and socket lifecycle.
  *
- * One ep_port_t corresponds to one epoll instance.  Internally it owns:
- *   - An IOCP handle (CreateIoCompletionPort)
- *   - An AFD handle (NtCreateFile on \Device\Afd\WepollEx)
- *   - A growable fd -> ep_sock_t* table
- *   - An MPSC lock-free ready queue of fired events
- *   - Two AFD buffer pools: one for AFD_POLL_INFO buffers, one for
- *     ready-queue nodes
- *
- * The IOCP is the heart of the design: every AFD poll completion lands
- * on the IOCP, where a worker dequeues it, translates AFD events to
- * epoll events, and pushes the result onto the ready queue.  epoll_wait
- * then drains the ready queue without contention.
- *
- * For nginx-class workloads the IOCP approach scales linearly: each
- * accepted connection costs one AFD_POLL pended and one IOCP packet
- * when activity is detected.  No user-mode polling thread.
+ * All mutable socket state is serialized by fd_table_lock.  AFD requests
+ * keep ep_sock_t storage alive until their IOCP completion is observed;
+ * deletion therefore removes a socket from public lookup immediately but
+ * defers reclamation while a poll is pending.  Ready nodes contain immutable
+ * registration snapshots plus a socket generation, never a reclaimable raw
+ * socket pointer.
  */
 #include "wepoll_ex_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
-#ifdef _WIN32
-#  include <winsock2.h>
-#  include <windows.h>
-#  include <winternl.h>
-#  include <mswsock.h>
-#endif
-
-/* --------------------------------------------------------------------- */
-/* Internal helpers.                                                  */
-/* --------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
+/* Time and fd-table helpers.                                                */
+/* ------------------------------------------------------------------------- */
 
 static uint64_t ep_now_ns(void)
 {
-    /* We use QueryPerformanceCounter on Windows; clock_gettime on
-     * POSIX.  Both are monotonic. */
-#ifdef _WIN32
-    static LARGE_INTEGER freq = {0};
-    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    return (uint64_t)((now.QuadPart * 1000000000ULL) / freq.QuadPart);
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-#endif
-}
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+    uint64_t seconds;
+    uint64_t remainder;
 
-/* --------------------------------------------------------------------- */
-/* fd table.                                                          */
-/* --------------------------------------------------------------------- */
+    if (!QueryPerformanceFrequency(&frequency)) {
+        return 0;
+    }
+    if (!QueryPerformanceCounter(&counter) || frequency.QuadPart <= 0) {
+        return 0;
+    }
+
+    seconds = (uint64_t)(counter.QuadPart / frequency.QuadPart);
+    remainder = (uint64_t)(counter.QuadPart % frequency.QuadPart);
+    return seconds * UINT64_C(1000000000) +
+           (remainder * UINT64_C(1000000000)) /
+               (uint64_t)frequency.QuadPart;
+}
 
 static int ep_fd_table_grow(ep_port_t *port, size_t new_size)
 {
-    ep_sock_t **new_table = (ep_sock_t **)calloc(new_size, sizeof(ep_sock_t *));
+    ep_sock_t **new_table;
+
+    if (new_size == 0 || new_size > SIZE_MAX / sizeof(*new_table)) {
+        ep_set_errno(ENOMEM);
+        return -1;
+    }
+    new_table = (ep_sock_t **)calloc(new_size, sizeof(*new_table));
     if (new_table == NULL) {
         ep_set_errno(ENOMEM);
         return -1;
     }
+
     for (size_t i = 0; i < port->fd_table_size; i++) {
-        ep_sock_t *s = port->fd_table[i];
-        if (s) {
-            size_t slot = (size_t)s->fd % new_size;
-            while (new_table[slot]) slot = (slot + 1) % new_size;
-            new_table[slot] = s;
+        ep_sock_t *sock = port->fd_table[i];
+        if (sock != NULL) {
+            size_t slot = (size_t)sock->fd % new_size;
+            while (new_table[slot] != NULL) {
+                slot = (slot + 1) % new_size;
+            }
+            new_table[slot] = sock;
         }
     }
+
     free(port->fd_table);
     port->fd_table = new_table;
     port->fd_table_size = new_size;
@@ -79,371 +71,684 @@ static int ep_fd_table_grow(ep_port_t *port, size_t new_size)
 
 static ep_sock_t *ep_fd_table_lookup(ep_port_t *port, SOCKET fd)
 {
-    if (port->fd_table_size == 0) return NULL;
+    if (port->fd_table_size == 0) {
+        return NULL;
+    }
+
     size_t slot = (size_t)fd % port->fd_table_size;
     for (size_t probes = 0; probes < port->fd_table_size; probes++) {
-        ep_sock_t *s = port->fd_table[slot];
-        if (s == NULL) return NULL;
-        if (s->fd == fd) return s;
+        ep_sock_t *sock = port->fd_table[slot];
+        if (sock == NULL) {
+            return NULL;
+        }
+        if (sock->fd == fd) {
+            return sock;
+        }
         slot = (slot + 1) % port->fd_table_size;
     }
     return NULL;
 }
 
-static int ep_fd_table_insert(ep_port_t *port, ep_sock_t *s)
+static int ep_fd_table_insert(ep_port_t *port, ep_sock_t *sock)
 {
-    if (port->fd_table_count * 4 >= port->fd_table_size * 3) {
-        size_t new_size = port->fd_table_size == 0
-                          ? WEPOLL_INITIAL_FDS
-                          : port->fd_table_size * 2;
-        if (ep_fd_table_grow(port, new_size) != 0) return -1;
+    if (port->fd_table_size == 0 ||
+        port->fd_table_count * 4 >= port->fd_table_size * 3) {
+        size_t new_size;
+
+        if (port->fd_table_size == 0) {
+            new_size = WEPOLL_INITIAL_FDS;
+        } else {
+            if (port->fd_table_size > SIZE_MAX / 2) {
+                ep_set_errno(ENOMEM);
+                return -1;
+            }
+            new_size = port->fd_table_size * 2;
+        }
+        if (ep_fd_table_grow(port, new_size) != 0) {
+            return -1;
+        }
     }
-    size_t slot = (size_t)s->fd % port->fd_table_size;
-    while (port->fd_table[slot]) slot = (slot + 1) % port->fd_table_size;
-    port->fd_table[slot] = s;
+
+    size_t slot = (size_t)sock->fd % port->fd_table_size;
+    while (port->fd_table[slot] != NULL) {
+        slot = (slot + 1) % port->fd_table_size;
+    }
+    port->fd_table[slot] = sock;
     port->fd_table_count++;
     return 0;
 }
 
-static void ep_fd_table_remove(ep_port_t *port, ep_sock_t *s)
+static void ep_fd_table_remove(ep_port_t *port, ep_sock_t *sock)
 {
-    size_t slot = (size_t)s->fd % port->fd_table_size;
-    while (port->fd_table[slot] != s) {
-        slot = (slot + 1) % port->fd_table_size;
-        if (port->fd_table[slot] == NULL) return;
+    if (port->fd_table_size == 0) {
+        return;
     }
+
+    size_t slot = (size_t)sock->fd % port->fd_table_size;
+    while (port->fd_table[slot] != sock) {
+        if (port->fd_table[slot] == NULL) {
+            return;
+        }
+        slot = (slot + 1) % port->fd_table_size;
+    }
+
     port->fd_table[slot] = NULL;
     port->fd_table_count--;
 
-    size_t j = slot;
     for (;;) {
-        j = (j + 1) % port->fd_table_size;
-        ep_sock_t *t = port->fd_table[j];
-        if (t == NULL) break;
-        port->fd_table[j] = NULL;
-        size_t k = (size_t)t->fd % port->fd_table_size;
-        while (port->fd_table[k]) k = (k + 1) % port->fd_table_size;
-        port->fd_table[k] = t;
+        size_t scan = (slot + 1) % port->fd_table_size;
+        ep_sock_t *moved = port->fd_table[scan];
+        if (moved == NULL) {
+            break;
+        }
+
+        port->fd_table[scan] = NULL;
+        size_t target = (size_t)moved->fd % port->fd_table_size;
+        while (port->fd_table[target] != NULL) {
+            target = (target + 1) % port->fd_table_size;
+        }
+        port->fd_table[target] = moved;
+        slot = scan;
     }
 }
 
-/* --------------------------------------------------------------------- */
-/* ep_sock_t allocation.                                              */
-/*                                                                     */
-/* Uses the per-port AFD buffer pool for the AFD_POLL_INFO buffer,    */
-/* eliminating malloc on the EPOLL_CTL_ADD hot path.                  */
-/* --------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
+/* Socket allocation and poll lifecycle.                                    */
+/* ------------------------------------------------------------------------- */
 
-static ep_sock_t *ep_sock_alloc(SOCKET fd, ep_port_t *port)
+static void ep_sock_list_add_locked(ep_port_t *port, ep_sock_t *sock)
 {
-    ep_sock_t *s = (ep_sock_t *)calloc(1, sizeof(*s));
-    if (s == NULL) {
+    sock->prev = NULL;
+    sock->next = port->sock_list_head;
+    if (port->sock_list_head != NULL) {
+        port->sock_list_head->prev = sock;
+    }
+    port->sock_list_head = sock;
+}
+
+static void ep_sock_list_remove_locked(ep_port_t *port, ep_sock_t *sock)
+{
+    if (sock->prev != NULL) {
+        sock->prev->next = sock->next;
+    } else {
+        port->sock_list_head = sock->next;
+    }
+    if (sock->next != NULL) {
+        sock->next->prev = sock->prev;
+    }
+    sock->next = NULL;
+    sock->prev = NULL;
+}
+
+static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
+{
+    ep_sock_t *sock = (ep_sock_t *)calloc(1, sizeof(*sock));
+    if (sock == NULL) {
         ep_set_errno(ENOMEM);
         return NULL;
     }
-    s->fd = fd;
-    s->port = port;
-    s->state = EP_SOCK_REGISTERED;
 
-    /* Pull the AFD_POLL_INFO buffer from the pool. */
-    s->afd_info = (AFD_POLL_INFO *)ep_afd_pool_take(&port->afd_info_pool);
-    if (s->afd_info == NULL) {
-        free(s);
+    sock->base_socket = ep_socket_get_base(fd);
+    if (sock->base_socket == INVALID_SOCKET) {
+        free(sock);
         return NULL;
     }
-    return s;
-}
 
-static void ep_sock_free(ep_port_t *port, ep_sock_t *s)
-{
-    if (s->afd_info) {
-        ep_afd_pool_give(&port->afd_info_pool, s->afd_info);
-        s->afd_info = NULL;
+    sock->afd_info = (AFD_POLL_INFO *)ep_afd_pool_take(&port->afd_info_pool);
+    if (sock->afd_info == NULL) {
+        free(sock);
+        return NULL;
     }
-    free(s);
+
+    sock->fd = fd;
+    sock->port = port;
+    sock->generation = ++port->next_sock_generation;
+    if (port->next_sock_generation == 0) {
+        port->next_sock_generation = 1;
+        sock->generation = 1;
+    }
+    atomic_init(&sock->state, EP_SOCK_REGISTERED);
+    atomic_init(&sock->poll_status, EP_POLL_IDLE);
+    atomic_init(&sock->delete_pending, 0);
+    atomic_init(&sock->ready_queued, 0);
+    return sock;
 }
 
-/* --------------------------------------------------------------------- */
-/* Re-arm AFD poll for a sock.                                        */
-/* --------------------------------------------------------------------- */
-
-static int ep_sock_rearm_afd(ep_sock_t *s)
+static void ep_sock_free_locked(ep_port_t *port, ep_sock_t *sock)
 {
-    if (s->user_events == 0) return 0;
-
-    uint32_t afd_events = ep_epoll_to_afd_events(s->user_events);
-    if (afd_events == 0) return 0;
-
-    s->poll_pending = 0;
-    return ep_afd_poll_submit(s, afd_events);
+    ep_sock_list_remove_locked(port, sock);
+    if (sock->afd_info != NULL) {
+        ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
+        sock->afd_info = NULL;
+    }
+    free(sock);
 }
 
-/* --------------------------------------------------------------------- */
-/* IOCP completion dispatch.                                         */
-/*                                                                     */
-/* Called when GetQueuedCompletionStatusEx returns a packet for a     */
-/* poll we submitted.  The lpOverlapped we get back is the            */
-/* OVERLAPPED embedded in ep_sock_t.                                */
-/* --------------------------------------------------------------------- */
-
-void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes,
-                               NTSTATUS status)
+/* A registered socket may be closed by the application without an explicit
+ * EPOLL_CTL_DEL.  Once AFD reports that the provider handle is gone, remove
+ * the public registration but keep any in-flight request alive until its
+ * completion has been consumed. */
+static void ep_sock_drop_closed_locked(ep_port_t *port, ep_sock_t *sock)
 {
+    if (ep_fd_table_lookup(port, sock->fd) == sock) {
+        ep_fd_table_remove(port, sock);
+    }
+    atomic_store_explicit(&sock->delete_pending, 1, memory_order_relaxed);
+    atomic_store_explicit(&sock->state, EP_SOCK_DELETED,
+                          memory_order_relaxed);
+    sock->needs_rearm = 0;
+    sock->generation = ++port->next_sock_generation;
+    if (port->next_sock_generation == 0) {
+        port->next_sock_generation = 1;
+        sock->generation = 1;
+    }
+    if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
+        EP_POLL_IDLE) {
+        ep_sock_free_locked(port, sock);
+    }
+}
+
+static int ep_sock_submit_locked(ep_sock_t *sock)
+{
+    ep_port_t *port = sock->port;
+    uint32_t poll_status =
+        atomic_load_explicit(&sock->poll_status, memory_order_relaxed);
+
+    if (atomic_load_explicit(&port->closing, memory_order_acquire) ||
+        atomic_load_explicit(&sock->delete_pending, memory_order_relaxed) ||
+        atomic_load_explicit(&sock->ready_queued, memory_order_relaxed) ||
+        poll_status != EP_POLL_IDLE) {
+        return 0;
+    }
+
+    if (sock->oneshot_fired) {
+        /* No AFD request remains after a oneshot delivery.  Probe the
+         * provider handle so a native closesocket() cannot leave a stale
+         * registration forever. */
+        SOCKET base = ep_socket_get_base(sock->fd);
+        if (base == INVALID_SOCKET) {
+            if (ep_last_err() == ENOTSOCK || ep_last_err() == EBADF) {
+                ep_sock_drop_closed_locked(port, sock);
+                ep_set_errno(ENOTSOCK);
+                return 1;
+            }
+            return -1;
+        }
+        sock->base_socket = base;
+        return 0;
+    }
+    if (!sock->needs_rearm) {
+        return 0;
+    }
+
+    uint32_t afd_events = ep_epoll_to_afd_events(sock->user_events);
+    if (ep_afd_poll_submit(sock, afd_events) != 0) {
+        if (ep_last_err() == ENOTSOCK || ep_last_err() == EBADF) {
+            ep_sock_drop_closed_locked(port, sock);
+            ep_set_errno(ENOTSOCK);
+            return 1;
+        }
+        return -1;
+    }
+
+    sock->needs_rearm = 0;
+    atomic_store_explicit(&sock->poll_status, EP_POLL_PENDING,
+                          memory_order_relaxed);
+    atomic_store_explicit(&sock->state, EP_SOCK_POLLING,
+                          memory_order_relaxed);
+    port->pending_poll_count++;
+    return 0;
+}
+
+static int ep_sock_cancel_locked(ep_sock_t *sock)
+{
+    if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) !=
+        EP_POLL_PENDING) {
+        return 0;
+    }
+    if (ep_afd_cancel(sock) != 0) {
+        return -1;
+    }
+
+    sock->pending_events = 0;
+    atomic_store_explicit(&sock->poll_status, EP_POLL_CANCELLED,
+                          memory_order_relaxed);
+    return 0;
+}
+
+static int ep_port_arm_pending_locked(ep_port_t *port)
+{
+    for (ep_sock_t *sock = port->sock_list_head;
+         sock != NULL;) {
+        ep_sock_t *next = sock->next;
+        int submit_result = ep_sock_submit_locked(sock);
+        if (submit_result < 0) {
+            return -1;
+        }
+        sock = next;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* IOCP completion handling.                                                */
+/* ------------------------------------------------------------------------- */
+
+void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
+{
+    ep_port_t *port = sock->port;
+    ep_ready_node_t *node = NULL;
+    uint32_t delivered = 0;
+    uint32_t old_poll_status;
+
     (void)bytes;
+    pthread_mutex_lock(&port->fd_table_lock);
 
-    sock->poll_pending = 0;
+    old_poll_status =
+        atomic_load_explicit(&sock->poll_status, memory_order_relaxed);
+    if (old_poll_status != EP_POLL_PENDING &&
+        old_poll_status != EP_POLL_CANCELLED) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return;
+    }
+    atomic_store_explicit(&sock->poll_status, EP_POLL_IDLE,
+                          memory_order_relaxed);
+    if (port->pending_poll_count > 0) {
+        port->pending_poll_count--;
+    }
 
-    if (atomic_load(&sock->state) == EP_SOCK_DELETED) {
+    if (atomic_load_explicit(&sock->delete_pending, memory_order_relaxed)) {
+        ep_sock_free_locked(port, sock);
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return;
+    }
+    if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
+        atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                              memory_order_relaxed);
+        pthread_mutex_unlock(&port->fd_table_lock);
         return;
     }
 
-    if (status == STATUS_CANCELLED) return;
-
-    uint32_t fired = 0;
-    if (status >= 0 && sock->afd_info) {
-        fired = ep_afd_to_epoll_events(sock->afd_info->Handles[0].Events);
-    } else if (status < 0) {
-        fired = EPOLLERR;
-    }
-
-    uint32_t delivered = fired & (sock->user_events | EPOLLERR | EPOLLHUP);
-
-    if (delivered == 0) {
-        ep_sock_rearm_afd(sock);
+    if (old_poll_status == EP_POLL_CANCELLED || status == STATUS_CANCELLED) {
+        if (ep_sock_submit_locked(sock) < 0) {
+            sock->needs_rearm = 1;
+        }
+        pthread_mutex_unlock(&port->fd_table_lock);
         return;
     }
 
-    /* Edge-triggered semantics: only deliver if there's something new. */
-    if (sock->user_flags & EPOLLET) {
-        if ((delivered & ~sock->pending_events) == 0) {
-            ep_sock_rearm_afd(sock);
+    if (status >= 0 && sock->afd_info != NULL &&
+        sock->afd_info->NumberOfHandles > 0) {
+        if ((sock->afd_info->Handles[0].Events & AFD_POLL_LOCAL_CLOSE) != 0) {
+            /* The application closed this socket without EPOLL_CTL_DEL.
+             * There is no usable registration left to report; retire it now
+             * rather than trying to re-arm a stale numeric SOCKET later. */
+            ep_sock_drop_closed_locked(port, sock);
+            pthread_mutex_unlock(&port->fd_table_lock);
             return;
         }
-        delivered = delivered & ~sock->pending_events;
+        delivered = ep_afd_to_epoll_events(
+            sock->afd_info->Handles[0].Events);
+    } else if (status < 0) {
+        delivered = EPOLLERR;
     }
+    delivered &= sock->user_events | EPOLLERR | EPOLLHUP;
 
-    sock->pending_events |= delivered;
-
-    if (sock->user_flags & EPOLLONESHOT) {
-        sock->oneshot_fired = 1;
-    } else {
-        ep_sock_rearm_afd(sock);
-    }
-
-    /* Allocate a ready node from the pool — no malloc on the hot
-     * path.  If the pool is exhausted (very rare), we malloc a
-     * fresh node that will be returned to the pool when drained. */
-    ep_ready_node_t *node = ep_ready_node_alloc(sock->port);
-    if (node == NULL) {
-        /* OOM on the ready path: drop the event. */
+    if (delivered == 0) {
+        sock->needs_rearm = 1;
+        if (ep_sock_submit_locked(sock) < 0) {
+            sock->needs_rearm = 1;
+        }
+        pthread_mutex_unlock(&port->fd_table_lock);
         return;
     }
-    node->sock      = sock;
-    node->events    = delivered;
-    node->flags     = (sock->user_flags & EPOLLET)       ? WEPOLL_FLAG_ET_DELIVERED : 0;
-    node->flags    |= (sock->user_flags & EPOLLET)       ? WEPOLL_FLAG_EDGE_ARMED   : 0;
-    node->flags    |= (sock->user_flags & EPOLLONESHOT)  ? WEPOLL_FLAG_ONESHOT_FIRED: 0;
+
+    node = ep_ready_node_alloc(port);
+    if (node == NULL) {
+        sock->needs_rearm = 1;
+        (void)ep_sock_submit_locked(sock);
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return;
+    }
+
+    node->data = sock->user_data;
+    node->user_ctx = sock->user_ctx;
+    node->fd = sock->fd;
+    node->sock_generation = sock->generation;
+    node->events = delivered;
+    node->flags = 0;
+    if ((sock->user_flags & EPOLLET) != 0) {
+        node->flags |= WEPOLL_FLAG_ET_DELIVERED | WEPOLL_FLAG_EDGE_ARMED;
+    }
+    if ((sock->user_flags & EPOLLONESHOT) != 0) {
+        node->flags |= WEPOLL_FLAG_ONESHOT_FIRED;
+        sock->oneshot_fired = 1;
+    }
     node->timestamp = ep_now_ns();
-    ep_ready_push(&sock->port->ready_queue, node);
+
+    sock->pending_events = delivered;
+    atomic_store_explicit(&sock->ready_queued, 1, memory_order_relaxed);
+    atomic_store_explicit(&sock->state, EP_SOCK_READY, memory_order_relaxed);
+    ep_ready_push(&port->ready_queue, node);
+    pthread_mutex_unlock(&port->fd_table_lock);
 }
 
-/* --------------------------------------------------------------------- */
-/* Public port lifecycle.                                            */
-/* --------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
+/* Port lifecycle.                                                          */
+/* ------------------------------------------------------------------------- */
 
 int ep_port_create(int size_hint, int flags, ep_port_t **out)
 {
-    if (ep_global_init() != 0) return -1;
+    ep_port_t *port;
+    size_t pool_capacity = WEPOLL_AFD_POOL_SIZE;
+    int fd_lock_initialized = 0;
+    int wait_lock_initialized = 0;
+    int ready_initialized = 0;
+    int afd_pool_initialized = 0;
+    int node_pool_initialized = 0;
 
-    ep_port_t *p = (ep_port_t *)calloc(1, sizeof(*p));
-    if (p == NULL) {
+    if (out == NULL) {
+        ep_set_errno(EFAULT);
+        return -1;
+    }
+    *out = NULL;
+    if (ep_global_init() != 0) {
+        return -1;
+    }
+
+    port = (ep_port_t *)calloc(1, sizeof(*port));
+    if (port == NULL) {
         ep_set_errno(ENOMEM);
         return -1;
     }
 
-#ifdef _WIN32
-    p->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
-    if (p->iocp == NULL) {
-        ep_set_errno(ep_winerr_to_errno(GetLastError()));
-        free(p);
-        return -1;
+    int mutex_error = pthread_mutex_init(&port->fd_table_lock, NULL);
+    if (mutex_error != 0) {
+        ep_set_errno(mutex_error);
+        goto fail;
     }
-
-    if (ep_afd_open(&p->afd) != 0) {
-        CloseHandle(p->iocp);
-        free(p);
-        return -1;
+    fd_lock_initialized = 1;
+    mutex_error = pthread_mutex_init(&port->wait_lock, NULL);
+    if (mutex_error != 0) {
+        ep_set_errno(mutex_error);
+        goto fail;
     }
+    wait_lock_initialized = 1;
 
-    if (CreateIoCompletionPort(p->afd, p->iocp, 0, 0) == NULL) {
-        ep_set_errno(ep_winerr_to_errno(GetLastError()));
-        CloseHandle(p->afd);
-        CloseHandle(p->iocp);
-        free(p);
-        return -1;
+    ep_ready_init(&port->ready_queue);
+    if (!port->ready_queue.initialized) {
+        goto fail;
     }
-#else
-    int fd = epoll_create(size_hint > 0 ? size_hint : 1);
-    if (fd < 0) { free(p); return -1; }
-    p->iocp = (HANDLE)(intptr_t)fd;
-    p->afd  = NULL;
-#endif
+    ready_initialized = 1;
 
-    pthread_mutex_init(&p->fd_table_lock, NULL);
-    pthread_mutex_init(&p->sock_list_lock, NULL);
-    ep_ready_init(&p->ready_queue);
-
-    p->fd_table_size = 0;
-    p->fd_table_count = 0;
-    p->fd_table = NULL;
-    p->sock_list_head = NULL;
-    p->close_on_exec = (flags & EPOLL_CLOEXEC) ? 1 : 0;
-    atomic_store(&p->generation, 0);
-
-    /* Pre-size the fd table if caller gave a hint. */
     if (size_hint > 0) {
-        size_t hint = (size_t)size_hint * 2;
-        if (hint < WEPOLL_INITIAL_FDS) hint = WEPOLL_INITIAL_FDS;
-        ep_fd_table_grow(p, hint);
+        size_t hint = (size_t)size_hint;
+        if (hint > SIZE_MAX / 2) {
+            ep_set_errno(ENOMEM);
+            goto fail;
+        }
+        hint *= 2;
+        if (hint < WEPOLL_INITIAL_FDS) {
+            hint = WEPOLL_INITIAL_FDS;
+        }
+        if (ep_fd_table_grow(port, hint) != 0) {
+            goto fail;
+        }
+
+        if ((size_t)size_hint > pool_capacity) {
+            pool_capacity = (size_t)size_hint;
+            if (pool_capacity > 4096) {
+                pool_capacity = 4096;
+            }
+        }
     }
 
-    /* Initialize the AFD buffer pools.  Capacity is sized to the
-     * expected steady-state fd count, with on-the-fly growth for
-     * bursts.  The default is conservative (256 buffers per pool);
-     * nginx-class workloads with 10k+ connections will hit the
-     * pool-exhaustion fallback regularly but the per-malloc cost
-     * is amortised over the fd's lifetime. */
-    size_t pool_cap = WEPOLL_AFD_POOL_SIZE;
-    if (size_hint > 0 && (size_t)size_hint > pool_cap) {
-        pool_cap = (size_t)size_hint;
+    if (ep_afd_pool_init(&port->afd_info_pool,
+                         sizeof(AFD_POLL_INFO), pool_capacity) != 0) {
+        goto fail;
     }
-    if (ep_afd_pool_init(&p->afd_info_pool,
-                         sizeof(AFD_POLL_INFO), pool_cap) != 0) {
-        ep_port_destroy(p);
-        return -1;
+    afd_pool_initialized = 1;
+    if (ep_afd_pool_init(&port->ready_node_pool,
+                         sizeof(ep_ready_node_t), pool_capacity) != 0) {
+        goto fail;
     }
-    if (ep_afd_pool_init(&p->ready_node_pool,
-                         sizeof(ep_ready_node_t), pool_cap) != 0) {
-        ep_port_destroy(p);
-        return -1;
-    }
+    node_pool_initialized = 1;
 
-    /* Allocate the IOCP batch buffer.  64 entries is a sensible
-     * default — most epoll_wait calls return far fewer events, and
-     * GetQueuedCompletionStatusEx's cost is amortised across the
-     * entries it returns. */
-    p->iocp_batch_size = 64;
-#ifdef _WIN32
-    p->iocp_entries = (OVERLAPPED_ENTRY *)
-        calloc(p->iocp_batch_size, sizeof(*p->iocp_entries));
-    if (p->iocp_entries == NULL) {
+    port->iocp_batch_size = 64;
+    port->iocp_entries = (OVERLAPPED_ENTRY *)calloc(
+        port->iocp_batch_size, sizeof(*port->iocp_entries));
+    if (port->iocp_entries == NULL) {
         ep_set_errno(ENOMEM);
-        ep_port_destroy(p);
+        goto fail;
+    }
+
+    port->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (port->iocp == NULL) {
+        ep_set_errno(ep_winerr_to_errno(GetLastError()));
+        goto fail;
+    }
+    if (ep_afd_open(port->iocp, &port->afd) != 0) {
+        goto fail;
+    }
+
+    port->close_on_exec = (flags & EPOLL_CLOEXEC) != 0;
+    atomic_init(&port->closing, 0);
+    atomic_init(&port->generation, 0);
+    port->next_sock_generation = 0;
+    *out = port;
+    return 0;
+
+fail:
+    {
+        int saved_errno = ep_last_err();
+        if (port->afd != NULL) {
+            CloseHandle(port->afd);
+        }
+        if (port->iocp != NULL) {
+            CloseHandle(port->iocp);
+        }
+        free(port->iocp_entries);
+        free(port->fd_table);
+        if (node_pool_initialized) {
+            ep_afd_pool_destroy(&port->ready_node_pool);
+        }
+        if (afd_pool_initialized) {
+            ep_afd_pool_destroy(&port->afd_info_pool);
+        }
+        if (ready_initialized) {
+            ep_ready_destroy(&port->ready_queue);
+        }
+        if (wait_lock_initialized) {
+            pthread_mutex_destroy(&port->wait_lock);
+        }
+        if (fd_lock_initialized) {
+            pthread_mutex_destroy(&port->fd_table_lock);
+        }
+        free(port);
+        ep_set_errno(saved_errno);
         return -1;
     }
-#else
-    p->iocp_entries = NULL;
-#endif
+}
 
-    *out = p;
-    return 0;
+void ep_port_begin_close(ep_port_t *port)
+{
+    if (port == NULL) {
+        return;
+    }
+    if (atomic_exchange_explicit(&port->closing, 1, memory_order_acq_rel) == 0 &&
+        port->iocp != NULL) {
+        (void)PostQueuedCompletionStatus(port->iocp, 0, 0, NULL);
+    }
 }
 
 void ep_port_destroy(ep_port_t *port)
 {
-    if (port == NULL) return;
-
-    /* Detach all live socks. */
-    pthread_mutex_lock(&port->sock_list_lock);
-    ep_sock_t *s = port->sock_list_head;
-    while (s) {
-        ep_sock_t *next = s->next;
-        ep_sock_free(port, s);
-        s = next;
+    if (port == NULL) {
+        return;
     }
-    port->sock_list_head = NULL;
-    pthread_mutex_unlock(&port->sock_list_lock);
 
-    /* Drain ready queue and free any nodes still on it. */
+    ep_port_begin_close(port);
+    pthread_mutex_lock(&port->wait_lock);
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    for (ep_sock_t *sock = port->sock_list_head;
+         sock != NULL;
+         sock = sock->next) {
+        atomic_store_explicit(&sock->delete_pending, 1, memory_order_relaxed);
+        atomic_store_explicit(&sock->state, EP_SOCK_DELETED,
+                              memory_order_relaxed);
+        sock->needs_rearm = 0;
+        (void)ep_sock_cancel_locked(sock);
+    }
+    if (port->fd_table != NULL) {
+        memset(port->fd_table, 0,
+               port->fd_table_size * sizeof(*port->fd_table));
+    }
+    port->fd_table_count = 0;
+
+    ep_sock_t *sock = port->sock_list_head;
+    while (sock != NULL) {
+        ep_sock_t *next = sock->next;
+        if (atomic_load_explicit(&sock->poll_status,
+                                 memory_order_relaxed) == EP_POLL_IDLE) {
+            ep_sock_free_locked(port, sock);
+        }
+        sock = next;
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+
     for (;;) {
-        ep_ready_node_t *n = ep_ready_drain(&port->ready_queue, INT_MAX);
-        if (n == NULL) break;
-        while (n) {
-            ep_ready_node_t *next = atomic_load(&n->next);
-            ep_ready_node_free(port, n);
-            n = next;
+        size_t pending;
+        pthread_mutex_lock(&port->fd_table_lock);
+        pending = port->pending_poll_count;
+        pthread_mutex_unlock(&port->fd_table_lock);
+        if (pending == 0) {
+            break;
+        }
+
+        ULONG removed = 0;
+        BOOL ok = GetQueuedCompletionStatusEx(
+            port->iocp, port->iocp_entries, port->iocp_batch_size,
+            &removed, INFINITE, FALSE);
+        if (!ok) {
+            continue;
+        }
+        for (ULONG i = 0; i < removed; i++) {
+            OVERLAPPED *overlapped = port->iocp_entries[i].lpOverlapped;
+            if (overlapped == NULL) {
+                continue;
+            }
+            IO_STATUS_BLOCK *iosb = (IO_STATUS_BLOCK *)overlapped;
+            ep_sock_t *completed = (ep_sock_t *)(
+                (unsigned char *)iosb - offsetof(ep_sock_t, io_status_block));
+            ep_sock_handle_completion(
+                completed,
+                port->iocp_entries[i].dwNumberOfBytesTransferred,
+                iosb->Status);
+        }
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    while (sock != NULL) {
+        ep_sock_t *next = sock->next;
+        ep_sock_free_locked(port, sock);
+        sock = next;
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+
+    for (;;) {
+        ep_ready_node_t *node = ep_ready_drain(&port->ready_queue, INT_MAX);
+        if (node == NULL) {
+            break;
+        }
+        while (node != NULL) {
+            ep_ready_node_t *next = atomic_load_explicit(
+                &node->next, memory_order_relaxed);
+            ep_ready_node_free(port, node);
+            node = next;
         }
     }
     ep_ready_destroy(&port->ready_queue);
 
+    if (port->afd != NULL) {
+        CloseHandle(port->afd);
+    }
+    if (port->iocp != NULL) {
+        CloseHandle(port->iocp);
+    }
     ep_afd_pool_destroy(&port->afd_info_pool);
     ep_afd_pool_destroy(&port->ready_node_pool);
-
     free(port->fd_table);
     free(port->iocp_entries);
 
-#ifdef _WIN32
-    if (port->afd)  CloseHandle(port->afd);
-    if (port->iocp) CloseHandle(port->iocp);
-#else
-    if (port->iocp) close((int)(intptr_t)port->iocp);
-#endif
-
+    pthread_mutex_unlock(&port->wait_lock);
+    pthread_mutex_destroy(&port->wait_lock);
     pthread_mutex_destroy(&port->fd_table_lock);
-    pthread_mutex_destroy(&port->sock_list_lock);
-
     free(port);
 }
 
-/* --------------------------------------------------------------------- */
-/* epoll_ctl implementation.                                         */
-/* --------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
+/* epoll_ctl operations.                                                    */
+/* ------------------------------------------------------------------------- */
 
 int ep_port_register(ep_port_t *port, SOCKET fd,
                      uint32_t events, uint32_t flags,
                      epoll_data_t data, void *ctx)
 {
+    ep_sock_t *sock;
+
+    if (fd == INVALID_SOCKET) {
+        ep_set_errno(EBADF);
+        return -1;
+    }
     pthread_mutex_lock(&port->fd_table_lock);
-
+    if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        ep_set_errno(EBADF);
+        return -1;
+    }
     if (ep_fd_table_lookup(port, fd) != NULL) {
+        pthread_mutex_unlock(&port->fd_table_lock);
         ep_set_errno(EEXIST);
-        pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
     }
 
-    ep_sock_t *s = ep_sock_alloc(fd, port);
-    if (s == NULL) {
+    sock = ep_sock_alloc_locked(port, fd);
+    if (sock == NULL) {
         pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
     }
-    s->user_events = events;
-    s->user_flags  = flags;
-    s->user_data   = data;
-    s->user_ctx    = ctx;
+    sock->user_events = events;
+    sock->user_flags = flags;
+    sock->user_data = data;
+    sock->user_ctx = ctx;
+    sock->needs_rearm = 1;
 
-    if (ep_fd_table_insert(port, s) != 0) {
-        ep_sock_free(port, s);
+    if (ep_fd_table_insert(port, sock) != 0) {
+        ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
+        free(sock);
         pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
     }
+    ep_sock_list_add_locked(port, sock);
 
-    pthread_mutex_lock(&port->sock_list_lock);
-    s->next = port->sock_list_head;
-    s->prev = NULL;
-    if (port->sock_list_head) port->sock_list_head->prev = s;
-    port->sock_list_head = s;
-    pthread_mutex_unlock(&port->sock_list_lock);
-
-    pthread_mutex_unlock(&port->fd_table_lock);
-
-    atomic_fetch_add(&port->generation, 1);
-
-    if (events != 0) {
-        if (ep_sock_rearm_afd(s) != 0) {
-            ep_port_unregister(port, fd);
+    {
+        int submit_result = ep_sock_submit_locked(sock);
+        if (submit_result < 0) {
+            ep_fd_table_remove(port, sock);
+            ep_sock_free_locked(port, sock);
+            pthread_mutex_unlock(&port->fd_table_lock);
+            return -1;
+        }
+        if (submit_result > 0) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            ep_set_errno(ENOTSOCK);
             return -1;
         }
     }
+    atomic_fetch_add_explicit(&port->generation, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&port->fd_table_lock);
     return 0;
 }
 
@@ -452,185 +757,259 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
                    epoll_data_t data, void *ctx)
 {
     pthread_mutex_lock(&port->fd_table_lock);
-    ep_sock_t *s = ep_fd_table_lookup(port, fd);
-    if (s == NULL) {
+    ep_sock_t *sock = ep_fd_table_lookup(port, fd);
+    if (sock == NULL) {
+        pthread_mutex_unlock(&port->fd_table_lock);
         ep_set_errno(ENOENT);
+        return -1;
+    }
+
+    if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
+            EP_POLL_PENDING &&
+        ep_sock_cancel_locked(sock) != 0) {
         pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
     }
 
-    s->user_events = events;
-    s->user_flags  = flags;
-    s->user_data   = data;
-    if (ctx != NULL) s->user_ctx = ctx;
-    s->oneshot_fired = 0;
-    s->pending_events = 0;
+    sock->user_events = events;
+    sock->user_flags = flags;
+    sock->user_data = data;
+    sock->user_ctx = ctx;
+    sock->pending_events = 0;
+    sock->oneshot_fired = 0;
+    sock->needs_rearm = 1;
+    atomic_store_explicit(&sock->ready_queued, 0, memory_order_relaxed);
+    sock->generation = ++port->next_sock_generation;
+    if (port->next_sock_generation == 0) {
+        port->next_sock_generation = 1;
+        sock->generation = 1;
+    }
 
+    if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
+            EP_POLL_IDLE) {
+        int submit_result = ep_sock_submit_locked(sock);
+        if (submit_result > 0) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            ep_set_errno(ENOTSOCK);
+            return -1;
+        }
+        if (submit_result < 0) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            return -1;
+        }
+    }
+    atomic_fetch_add_explicit(&port->generation, 1, memory_order_relaxed);
     pthread_mutex_unlock(&port->fd_table_lock);
-
-    return ep_sock_rearm_afd(s);
+    return 0;
 }
 
 int ep_port_unregister(ep_port_t *port, SOCKET fd)
 {
     pthread_mutex_lock(&port->fd_table_lock);
-    ep_sock_t *s = ep_fd_table_lookup(port, fd);
-    if (s == NULL) {
+    ep_sock_t *sock = ep_fd_table_lookup(port, fd);
+    if (sock == NULL) {
+        pthread_mutex_unlock(&port->fd_table_lock);
         ep_set_errno(ENOENT);
+        return -1;
+    }
+
+    if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
+            EP_POLL_PENDING &&
+        ep_sock_cancel_locked(sock) != 0) {
         pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
     }
 
-    atomic_store(&s->state, EP_SOCK_DELETED);
+    ep_fd_table_remove(port, sock);
+    atomic_store_explicit(&sock->delete_pending, 1, memory_order_relaxed);
+    atomic_store_explicit(&sock->state, EP_SOCK_DELETED, memory_order_relaxed);
+    sock->needs_rearm = 0;
+    sock->generation = ++port->next_sock_generation;
+    atomic_fetch_add_explicit(&port->generation, 1, memory_order_relaxed);
 
-    pthread_mutex_lock(&port->sock_list_lock);
-    if (s->prev) s->prev->next = s->next;
-    else         port->sock_list_head = s->next;
-    if (s->next) s->next->prev = s->prev;
-    pthread_mutex_unlock(&port->sock_list_lock);
-
-    ep_fd_table_remove(port, s);
+    if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
+        EP_POLL_IDLE) {
+        ep_sock_free_locked(port, sock);
+    }
     pthread_mutex_unlock(&port->fd_table_lock);
-
-    ep_sock_free(port, s);
     return 0;
 }
 
 int ep_port_rearm(ep_port_t *port, SOCKET fd)
 {
     pthread_mutex_lock(&port->fd_table_lock);
-    ep_sock_t *s = ep_fd_table_lookup(port, fd);
-    if (s == NULL) {
-        ep_set_errno(ENOENT);
+    ep_sock_t *sock = ep_fd_table_lookup(port, fd);
+    if (sock == NULL) {
         pthread_mutex_unlock(&port->fd_table_lock);
+        ep_set_errno(ENOENT);
         return -1;
     }
-    if (!s->oneshot_fired) {
+    if (!sock->oneshot_fired) {
         pthread_mutex_unlock(&port->fd_table_lock);
         return 0;
     }
-    s->oneshot_fired = 0;
-    s->pending_events = 0;
-    pthread_mutex_unlock(&port->fd_table_lock);
 
-    return ep_sock_rearm_afd(s);
+    sock->oneshot_fired = 0;
+    sock->pending_events = 0;
+    sock->needs_rearm = 1;
+    atomic_store_explicit(&sock->ready_queued, 0, memory_order_relaxed);
+    int result = ep_sock_submit_locked(sock);
+    if (result > 0) {
+        result = -1;
+        ep_set_errno(ENOTSOCK);
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+    return result;
 }
 
-/* --------------------------------------------------------------------- */
-/* Helper: drain ready queue into caller's epoll_event_ex buffer.     */
-/*                                                                   */
-/* Returns the number of events written.  Nodes are returned to the  */
-/* ready_node_pool as they're consumed.                             */
-/* --------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
+/* Ready queue drain and wait loop.                                         */
+/* ------------------------------------------------------------------------- */
 
 static int ep_drain_to_buffer(ep_port_t *port,
-                              epoll_event_ex *out, int maxevents)
+                              epoll_event_ex *out,
+                              int maxevents)
 {
     int delivered = 0;
-    ep_ready_node_t *node = ep_ready_drain(&port->ready_queue, maxevents);
-    while (node && delivered < maxevents) {
-        epoll_event_ex *dst = &out[delivered];
-        dst->events    = node->events;
-        dst->flags     = node->flags;
-        dst->timestamp = node->timestamp;
 
-        if (node->sock) {
-            dst->data     = node->sock->user_data;
-            dst->user_ctx = node->sock->user_ctx;
-        } else {
-            memset(&dst->data, 0, sizeof(dst->data));
-            dst->user_ctx = NULL;
+    while (delivered < maxevents) {
+        ep_ready_node_t *node = ep_ready_drain(&port->ready_queue, 1);
+        if (node == NULL) {
+            break;
         }
 
-        ep_ready_node_t *next = atomic_load(&node->next);
+        int valid = 0;
+        pthread_mutex_lock(&port->fd_table_lock);
+        ep_sock_t *sock = ep_fd_table_lookup(port, node->fd);
+        if (sock != NULL && sock->generation == node->sock_generation &&
+            !atomic_load_explicit(&sock->delete_pending,
+                                  memory_order_relaxed)) {
+            valid = 1;
+            sock->pending_events = 0;
+            atomic_store_explicit(&sock->ready_queued, 0,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                  memory_order_relaxed);
+            if (!sock->oneshot_fired) {
+                sock->needs_rearm = 1;
+            }
+        }
+        pthread_mutex_unlock(&port->fd_table_lock);
+
+        if (valid) {
+            out[delivered].events = node->events;
+            out[delivered].data = node->data;
+            out[delivered].flags = node->flags;
+            out[delivered].timestamp = node->timestamp;
+            out[delivered].user_ctx = node->user_ctx;
+            delivered++;
+        }
         ep_ready_node_free(port, node);
-        node = next;
-        delivered++;
-    }
-    /* If we stopped early (maxevents hit), push the remainder back. */
-    if (node) {
-        /* Re-attach by pushing each remaining node back onto the
-         * queue.  We can't just re-link the chain because the
-         * consumer cleared the head/tail; we have to push one at
-         * a time. */
-        while (node) {
-            ep_ready_node_t *next = atomic_load(&node->next);
-            atomic_store(&node->next, (ep_ready_node_t *)NULL);
-            ep_ready_push(&port->ready_queue, node);
-            node = next;
-        }
     }
     return delivered;
 }
 
-/* --------------------------------------------------------------------- */
-/* epoll_wait implementation.                                        */
-/*                                                                   */
-/* 1. Drain ready queue (no syscall).                              */
-/* 2. If still empty and timeout != 0, block on the IOCP.           */
-/* 3. GetQueuedCompletionStatusEx returns up to iocp_batch_size     */
-/*    completions in one call — process all of them, then drain     */
-/*    the ready queue again.                                       */
-/* --------------------------------------------------------------------- */
-
 int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
-                 int timeout_ms, const sigset_t *sigmask)
+                 int timeout_ms, const wepoll_sigset_t *sigmask)
 {
-    (void)sigmask;
+    uint64_t deadline = 0;
+    int result = -1;
 
+    if (out == NULL) {
+        ep_set_errno(EFAULT);
+        return -1;
+    }
     if (maxevents <= 0) {
         ep_set_errno(EINVAL);
         return -1;
     }
-
-    /* Step 1: drain the ready queue without blocking. */
-    int delivered = ep_drain_to_buffer(port, out, maxevents);
-    if (delivered > 0) return delivered;
-
-    if (timeout_ms == 0) return 0;
-
-#ifdef _WIN32
-    DWORD due = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
-    ULONG removed = 0;
-    BOOL ok;
-
-    /* GetQueuedCompletionStatusEx: batched IOCP delivery.  Returns
-     * up to iocp_batch_size completions in one syscall, amortising
-     * the kernel transition cost across multiple events. */
-    ok = GetQueuedCompletionStatusEx(
-        port->iocp,
-        port->iocp_entries,
-        port->iocp_batch_size,
-        &removed,
-        due,
-        FALSE);
-
-    if (!ok) {
-        DWORD err = GetLastError();
-        if (err == WAIT_TIMEOUT) return 0;
-        ep_set_errno(ep_winerr_to_errno(err));
+    if (sigmask != NULL) {
+        ep_set_errno(EOPNOTSUPP);
         return -1;
     }
 
-    /* Dispatch every completion that came back. */
-    for (ULONG i = 0; i < removed; i++) {
-        OVERLAPPED *ovlp = port->iocp_entries[i].lpOverlapped;
-        if (ovlp == NULL) continue;
-
-        /* Recover the sock from the OVERLAPPED pointer. */
-        ep_sock_t *sock = (ep_sock_t *)
-            ((char *)ovlp - offsetof(ep_sock_t, overlapped));
-        IO_STATUS_BLOCK *iosb = (IO_STATUS_BLOCK *)ovlp;
-
-        ep_sock_handle_completion(sock,
-                                  port->iocp_entries[i].dwNumberOfBytesTransferred,
-                                  iosb->Status);
+    pthread_mutex_lock(&port->wait_lock);
+    if (timeout_ms > 0) {
+        deadline = GetTickCount64() + (uint64_t)timeout_ms;
     }
 
-    /* Step 3: drain whatever the completions pushed onto the ready
-     * queue. */
-    delivered = ep_drain_to_buffer(port, out, maxevents);
-#endif
+    for (;;) {
+        if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
+            ep_set_errno(EBADF);
+            result = -1;
+            break;
+        }
 
-    return delivered;
+        pthread_mutex_lock(&port->fd_table_lock);
+        int arm_result = ep_port_arm_pending_locked(port);
+        pthread_mutex_unlock(&port->fd_table_lock);
+        if (arm_result != 0) {
+            result = -1;
+            break;
+        }
+
+        result = ep_drain_to_buffer(port, out, maxevents);
+        if (result > 0) {
+            break;
+        }
+
+        DWORD wait_ms;
+        if (timeout_ms < 0) {
+            wait_ms = INFINITE;
+        } else if (timeout_ms == 0) {
+            wait_ms = 0;
+        } else {
+            uint64_t now = GetTickCount64();
+            if (now >= deadline) {
+                result = 0;
+                break;
+            }
+            wait_ms = (DWORD)(deadline - now);
+        }
+
+        ULONG removed = 0;
+        BOOL ok = GetQueuedCompletionStatusEx(
+            port->iocp, port->iocp_entries, port->iocp_batch_size,
+            &removed, wait_ms, FALSE);
+        if (!ok) {
+            DWORD error = GetLastError();
+            if (error == WAIT_TIMEOUT) {
+                result = 0;
+            } else {
+                ep_set_errno(ep_winerr_to_errno(error));
+                result = -1;
+            }
+            break;
+        }
+
+        for (ULONG i = 0; i < removed; i++) {
+            OVERLAPPED *overlapped = port->iocp_entries[i].lpOverlapped;
+            if (overlapped == NULL) {
+                continue;
+            }
+            IO_STATUS_BLOCK *iosb = (IO_STATUS_BLOCK *)overlapped;
+            ep_sock_t *sock = (ep_sock_t *)(
+                (unsigned char *)iosb - offsetof(ep_sock_t, io_status_block));
+            ep_sock_handle_completion(
+                sock,
+                port->iocp_entries[i].dwNumberOfBytesTransferred,
+                iosb->Status);
+        }
+
+        result = ep_drain_to_buffer(port, out, maxevents);
+        if (result > 0) {
+            break;
+        }
+        if (timeout_ms == 0) {
+            result = 0;
+            break;
+        }
+        if (timeout_ms > 0 && GetTickCount64() >= deadline) {
+            result = 0;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&port->wait_lock);
+    return result;
 }

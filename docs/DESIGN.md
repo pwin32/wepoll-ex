@@ -2,12 +2,10 @@
 
 ## Status
 
-This is an architectural description of an experimental prototype. It records
-what the source currently attempts to do; it is not a compatibility promise or
-a performance specification. The Windows path depends on undocumented AFD
-structures and has not been validated on a Windows test matrix. The POSIX path
-is a wrapper around native `epoll`, so passing POSIX tests does not validate the
-Windows engine.
+This document describes an experimental prototype, not a compatibility or
+performance specification. The Windows path depends on undocumented AFD
+interfaces and is socket-only. The POSIX path wraps native `epoll`; passing its
+tests does not validate the IOCP/AFD engine.
 
 ## Build-time split
 
@@ -15,63 +13,70 @@ Windows engine.
 
 | Platform | Library sources | Purpose |
 | --- | --- | --- |
-| Windows | `wepoll_ex_global.c`, `wepoll_ex_errno.c`, `wepoll_ex_afd.c`, `wepoll_ex_pool.c`, `wepoll_ex_port.c`, `wepoll_ex_api.c` | IOCP/AFD prototype |
+| Windows | `wepoll_ex_global.c`, `wepoll_ex_errno.c`, `wepoll_ex_afd.c`, `wepoll_ex_pool.c`, `wepoll_ex_port.c`, `wepoll_ex_api.c` | IOCP/AFD implementation |
 | POSIX | `wepoll_ex_posix.c`, `wepoll_ex_pool.c` | Native-epoll wrapper and queue/pool tests |
 
-The `WEPOLL_EX_BUILD_NGINX` option is declared but does not currently wire the
-`nginx/` sources into a build target. The adapter therefore requires a separate
-integration experiment.
+`WEPOLL_EX_BUILD_NGINX` currently emits a warning and creates no target. The
+adapter requires the separate validation described in
+[`NGINX_INTEGRATION.md`](NGINX_INTEGRATION.md).
 
-## Windows data flow
+## Windows data flow and lifetime
 
-1. `epoll_create*` allocates an `ep_port_t`, creates an IOCP, opens AFD, and
-   installs the port in the process-global integer-`epfd` table.
-2. `epoll_ctl(ADD)` creates an `ep_sock_t`, stores the event mask/data/context,
-   inserts it into the open-addressed fd table, and submits an `AFD_POLL`.
-3. AFD reports readiness through an IOCP completion. The completion handler
-   translates AFD bits to `EPOLL*`, applies the stored mask and provisional
-   edge/oneshot bookkeeping, and pushes an `ep_ready_node_t`.
-4. `epoll_wait` first drains the ready queue, then waits for completions and
-   drains again. `epoll_wait_ex` copies the node's data, context, flags, and
-   monotonic timestamp to the caller's buffer.
-5. `EPOLL_CTL_DEL`, `wepoll_close`, and port teardown remove table entries and
-   return pooled buffers.
+1. `epoll_create*` creates an `ep_port_t`, IOCP, AFD control handle, pools, and
+   a virtual integer `epfd` table entry.
+2. `EPOLL_CTL_ADD` validates a Winsock socket, stores the requested data and
+   context, assigns a generation, and submits one asynchronous `AFD_POLL`.
+3. IOCP completions are translated to `EPOLL*` bits. Ready nodes snapshot the
+   data, context, socket number, and generation; they never retain a raw socket
+   pointer.
+4. `epoll_wait*` serializes consumers, drains ready snapshots, waits for more
+   IOCP packets, and skips stale generations. Level-triggered registrations
+   are armed again on a later wait; oneshot registrations require MOD or
+   `epoll_rearm()`.
+5. DEL and close remove public lookup immediately, cancel pending AFD work,
+   and retain `ep_sock_t` storage until its cancellation completion is
+   consumed. A later registration may safely reuse the same socket value.
+6. `wepoll_close()` marks the port closing, wakes waiters, waits for public API
+   references to drain, consumes all outstanding completions, and only then
+   destroys handles and pools.
 
-The queue is implemented as a Michael–Scott-style producer append with a
-single consumer; the pool is a lock-free LIFO freelist with malloc fallback.
-These are implementation details under test, not established concurrency
-guarantees. In-flight completion, deletion, and multi-consumer behavior still
-need dedicated regression coverage.
+The ready queue is single-consumer MPSC. Producers append without a mutex; the
+consumer uses a sentinel before reclaiming nodes. Both AFD-buffer pools use a
+mutex-protected LIFO and grow with tracked fallback allocations.
 
-## POSIX data flow
+## POSIX path
 
-The host libc owns the basic epoll descriptor and readiness semantics.
-`wepoll_ex_posix.c` lazily associates an epfd with a mutex-protected hash table
-of `{ fd, user_ctx, user_flags }`. Extension calls forward to native epoll and
-decorate returned events. `epoll_ctl_batch` applies operations sequentially and
-attempts rollback; it is not truly atomic. `epoll_pwait2_ex` converts a
-timespec to milliseconds, and the POSIX extension does not implement signal
-mask handling.
+The host owns the basic epoll descriptor and readiness behavior.
+`wepoll_ex_posix.c` maintains metadata for context, extension flags, fd counts,
+and safe close/reuse detection. `epoll_ctl_batch` is sequential and not
+transactional. `epoll_pwait2_ex` converts its timeout to milliseconds; a
+non-null signal mask is not implemented by the extension path.
 
-## Boundaries and known gaps
+## Supported semantics and boundaries
 
-- AFD is undocumented and socket-only; no support claim is made for arbitrary
-  Windows handles.
-- Windows `sigmask` arguments are accepted for API shape but have no signal
-  semantics.
-- Edge-triggered, oneshot, RDHUP, exclusive wakeups, timestamp meaning, and
-  deletion races are not yet proven equivalent to Linux.
-- The optional benchmark measures the POSIX wrapper only; its numbers must not
-  be extrapolated to IOCP/AFD.
-- The nginx adapter is source-only and unvalidated; see
-  [`NGINX_INTEGRATION.md`](NGINX_INTEGRATION.md).
+- Windows registrations accept Winsock sockets only, not files or arbitrary
+  HANDLEs.
+- `EPOLLONESHOT`, context delivery, RDHUP mapping, zero-timeout waits, native
+  socket close cleanup, and concurrent epoll close have regression coverage.
+- `EPOLLET` and `EPOLLEXCLUSIVE` are rejected with `EOPNOTSUPP`. Silently
+  treating AFD's one-shot level notification as an edge would duplicate unread
+  readiness.
+- Windows signal masks are opaque API placeholders; non-null masks are
+  rejected with `EOPNOTSUPP`.
+- `epoll_ctl_batch` best-effort rolls back successful ADDs after a later
+  failure. Earlier MOD and DEL operations remain applied.
+- Timestamps use `QueryPerformanceCounter` on Windows and have an unspecified
+  monotonic origin.
+- Cancelled registrations remain internally allocated until a wait or close
+  drains their IOCP completion, although they are absent from public lookup.
+- The benchmark exercises the POSIX wrapper only.
 
 ## Verification baseline
 
-The intended commands and executable paths are documented in `README.md`.
-Currently, a clean configure fails while exporting the static target because
-`wepoll_ex_compile_defs` is not in an export set. In an existing generated
-POSIX tree, `tests/test_wepoll_ex` builds and runs, while
-`tests/test_wepoll_ex_pool` fails to compile because its target does not include
-`src/`. Fix those build blockers before using test results as an architectural
-signal.
+Strict warnings-as-errors builds pass on GCC/POSIX and MinGW. POSIX CTest covers
+the API, MPSC/pool behavior, and installed-package consumer. Windows CTest
+covers loopback readiness, context changes, oneshot/rearm, invalid arguments,
+batch rollback and immediate reuse, descriptor-table collisions, native socket
+close, concurrent close/wait, and the installed-package consumer. Shared,
+static, and shared-only MinGW configurations are exercised; this is still not
+a supported Windows version/compiler matrix.

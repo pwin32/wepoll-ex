@@ -3,9 +3,8 @@
 `wepoll-ex` is an experimental C11/CMake prototype for an epoll-shaped API on
 Windows. Its Windows path uses IOCP and the undocumented AFD poll interface;
 its POSIX path wraps the host `epoll` implementation for development and API
-experiments. The project is not production-ready, and Linux compatibility,
-Windows behavior, performance, and nginx integration have not been fully
-validated.
+experiments. The project is not production-ready, and no Linux compatibility,
+Windows performance, or nginx integration guarantee is made.
 
 ## Scope and current status
 
@@ -26,12 +25,11 @@ validation checklist.
 
 `src/wepoll_ex_api.c` exposes the public integer `epfd` API and maps each id to
 an internal `ep_port_t`. `src/wepoll_ex_port.c` owns an IOCP handle, an AFD
-handle, a growable socket table, and a ready queue. `epoll_ctl` stores the
-requested mask and submits an `AFD_POLL`; completions are translated by
-`src/wepoll_ex_afd.c`, queued, and consumed by `epoll_wait`. The pool and queue
-code lives in `src/wepoll_ex_pool.c`. This is the intended flow, not a claim of
-Linux-equivalent behavior: AFD is undocumented and the Windows path has not
-been validated on a supported matrix.
+handle, a growable socket table, and a ready queue. `epoll_ctl` submits an
+`AFD_POLL`; completions are translated by `src/wepoll_ex_afd.c`, queued as
+immutable snapshots, and consumed by `epoll_wait`. The port retains socket
+storage until cancellation completions are drained. AFD is undocumented and
+the Windows path is validated only with the MinGW/MSYS2 checks below.
 
 ### POSIX development path
 
@@ -47,15 +45,20 @@ Windows engine.
 The header [`include/wepoll_ex.h`](include/wepoll_ex.h) declares
 `epoll_create_ex`, `epoll_ctl_ctx`, `epoll_wait_ex`, `epoll_pwait2_ex`,
 `epoll_ctl_batch`, `epoll_drain`, `epoll_rearm`, `epoll_fd_count`, version
-helpers, and `wepoll_close`. Their error handling and atomicity are still under
-test; in particular, `epoll_ctl_batch` currently uses best-effort rollback.
+helpers, and `wepoll_close`. `epoll_ctl_batch` applies operations in order and
+best-effort rolls back ADDs; it is not transactional.
+
+On Windows, registrations are socket-only. `EPOLLONESHOT` is supported;
+`EPOLLET` and `EPOLLEXCLUSIVE` are rejected with `EOPNOTSUPP` because the AFD
+backend does not provide their required semantics. `epoll_pwait*` accepts a
+null signal mask only. Call `wepoll_close()` for the virtual epoll descriptor.
 
 ## Repository layout
 
 ```
 include/   public headers
 src/       Windows engine and POSIX wrapper
-tests/     test_wepoll_ex and test_wepoll_ex_pool sources
+tests/     POSIX, Windows API, pool, and package-consumer tests
 bench/     POSIX-only bench_latency source
 nginx/     source-only, unvalidated nginx adapter
 docs/      design and integration status
@@ -80,15 +83,17 @@ For MinGW, use the toolchain shell explicitly:
 ```sh
 /path/to/msys64/usr/bin/bash.exe -lc \
   'export PATH=/mingw64/bin:/usr/bin:$PATH; cd /e/personal/wepoll-ex; \
-   cmake -S . -B build-mingw -G "MinGW Makefiles" -DWEPOLL_EX_BUILD_TESTS=OFF; \
-   cmake --build build-mingw --parallel'
+   cmake -S . -B build-mingw -G "MinGW Makefiles" \
+     -DCMAKE_BUILD_TYPE=Debug -DWEPOLL_EX_BUILD_BENCH=OFF \
+     -DCMAKE_C_FLAGS="-Wall -Wextra -Wpedantic -Werror"; \
+   cmake --build build-mingw --parallel; \
+   ctest --test-dir build-mingw --output-on-failure'
 ```
 
-At the current baseline, a fresh configure stops while exporting the static
-target because `wepoll_ex_compile_defs` is not exported. An already-generated
-POSIX tree can build `test_wepoll_ex`, but `test_wepoll_ex_pool` currently lacks
-the `src/` include path. These are known repository issues, not proof of
-Windows correctness; record the exact command and platform with every result.
+The POSIX baseline passes the API, pool, and package-consumer tests. The MinGW
+baseline passes the Windows API and package-consumer tests with shared and
+static libraries, including a shared-only configuration. Record the exact
+command, compiler, and OS for new results.
 
 ## Credits and license
 

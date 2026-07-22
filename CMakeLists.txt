@@ -152,11 +152,9 @@ endif()
 # Tests.
 # --------------------------------------------------------------------- #
 
-if(WEPOLL_EX_BUILD_TESTS AND WEPOLL_EX_PLATFORM_POSIX)
+if(WEPOLL_EX_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
-elseif(WEPOLL_EX_BUILD_TESTS)
-    message(STATUS "Skipping tests: the current test sources require POSIX APIs")
 endif()
 
 # --------------------------------------------------------------------- #

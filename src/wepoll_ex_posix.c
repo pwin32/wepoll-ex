@@ -709,7 +709,7 @@ WEPOLL_EX_API int epoll_fd_count(int epfd)
     return result;
 }
 
-WEPOLL_EX_API uint32_t wepoll_ex_version(void)        { return 0x01000000; }
+WEPOLL_EX_API uint32_t wepoll_ex_version(void)        { return 0x00010000; }
 WEPOLL_EX_API const char *wepoll_ex_version_string(void) {
     return "wepoll-ex 1.0.0 (POSIX wrapper)";
 }

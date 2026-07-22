@@ -1,17 +1,16 @@
 /*
- * wepoll-ex — Extended epoll layer for Windows
+ * wepoll-ex — Experimental epoll-shaped event layer for Windows
  *
- * Drop-in, source-compatible superset of Linux's <sys/epoll.h> built on top
- * of IOCP + AFD, with extensions specifically tuned for high-performance
- * server ports (nginx, envoy, haproxy, redis, …).
+ * The Windows implementation uses IOCP + AFD and exposes a deliberately
+ * small, epoll-shaped API.  It supports sockets and a documented subset of
+ * Linux semantics; it is not a drop-in implementation of every guarantee.
  *
  * Public API contract:
- *   - Every Linux epoll symbol (epoll_create, epoll_create1, epoll_ctl,
- *     epoll_wait, epoll_pwait, epoll_pwait2) is exposed with identical
- *     semantics, plus an `_ex` extension family for advanced users.
+ *   - Common Linux entry points are exposed on Windows, plus an `_ex`
+ *     extension family for diagnostics and per-registration context.
  *   - All EPOLL* event flag bits defined by Linux uapi are present.
- *   - errno is set on failure, matching Linux's errno values, so existing
- *     portable code paths that perror()/strerror() keep working.
+ *   - errno is set to the closest portable/Linux-style value on failure.
+ *     See docs/DESIGN.md for the current platform limitations.
  *
  * Originally derived from wepoll by Bert Belder <bertbelder@gmail.com>.
  * Extended for server workloads by the wepoll-ex authors.
@@ -21,7 +20,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <signal.h>   /* sigset_t for epoll_pwait */
+#include <signal.h>   /* sigset_t on POSIX */
 #include <time.h>     /* struct timespec for epoll_pwait2 */
 
 #include "wepoll_ex_export.h"
@@ -40,6 +39,15 @@
 #  include <sys/epoll.h>
    typedef int epoll_fd_t;
 #  define EPOLL_FD_INVALID  (-1)
+#endif
+
+/* Windows has no native sigset_t.  The wait-mask argument is intentionally
+ * opaque there (Windows waits do not manipulate a POSIX signal mask), while
+ * POSIX callers retain the ordinary sigset_t type. */
+#ifdef _WIN32
+typedef void wepoll_sigset_t;
+#else
+typedef sigset_t wepoll_sigset_t;
 #endif
 
 #ifdef __cplusplus
@@ -81,6 +89,7 @@ typedef union epoll_data {
     int      fd;
     uint32_t u32;
     uint64_t u64;
+    epoll_fd_t sock; /* Windows socket-sized descriptor (extension). */
 } epoll_data_t;
 
 typedef struct epoll_event {
@@ -94,22 +103,21 @@ typedef struct epoll_event {
  *
  * Carries the source epoll_event plus auxiliary information that high-
  * performance consumers want without a second syscall:
- *   - flags      : internal descriptor state (oneshot fired, et armed…)
- *   - timestamp  : monotonic nanosecond timestamp when the event was
- *                  delivered by IOCP.  Useful for SO_TXTIME-style
- *                  latency accounting in nginx's request timing.
+ *   - flags      : internal descriptor state (currently oneshot delivery).
+ *   - timestamp  : monotonic nanosecond timestamp sampled near IOCP
+ *                  delivery; its origin is intentionally unspecified.
  *   - user_ctx   : opaque pointer registered per-fd via epoll_ctl_ctx().
  *                  Lets nginx avoid a hash lookup from fd -> ngx_event_t.
  * ------------------------------------------------------------------------- */
 #define WEPOLL_FLAG_ONESHOT_FIRED  (1U << 0)
-#define WEPOLL_FLAG_ET_DELIVERED   (1U << 1)
-#define WEPOLL_FLAG_EDGE_ARMED     (1U << 2)
+#define WEPOLL_FLAG_ET_DELIVERED   (1U << 1) /* reserved; EPOLLET unsupported */
+#define WEPOLL_FLAG_EDGE_ARMED     (1U << 2) /* reserved; EPOLLET unsupported */
 
 typedef struct epoll_event_ex {
     uint32_t      events;
     epoll_data_t  data;
     uint32_t      flags;       /* WEPOLL_FLAG_* */
-    uint64_t      timestamp;   /* ns since epoch, monotonic-ish */
+    uint64_t      timestamp;   /* monotonic ns, unspecified origin */
     void         *user_ctx;    /* per-fd opaque pointer */
 } epoll_event_ex;
 
@@ -124,16 +132,17 @@ typedef struct epoll_event_ex {
 #ifdef _WIN32
 WEPOLL_EX_API int  epoll_create(int size);
 WEPOLL_EX_API int  epoll_create1(int flags);
-WEPOLL_EX_API int  epoll_ctl(int epfd, int op, int fd, struct epoll_event *ev);
+WEPOLL_EX_API int  epoll_ctl(int epfd, int op, epoll_fd_t fd,
+                             struct epoll_event *ev);
 WEPOLL_EX_API int  epoll_wait(int epfd, struct epoll_event *events,
                               int maxevents, int timeout);
 WEPOLL_EX_API int  epoll_pwait(int epfd, struct epoll_event *events,
                                int maxevents, int timeout,
-                               const sigset_t *sigmask);
+                               const wepoll_sigset_t *sigmask);
 WEPOLL_EX_API int  epoll_pwait2(int epfd, struct epoll_event *events,
                                 int maxevents,
                                 const struct timespec *timeout,
-                                const sigset_t *sigmask);
+                                const wepoll_sigset_t *sigmask);
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -152,7 +161,7 @@ WEPOLL_EX_API int  epoll_create_ex(int size, int flags);
 
 /* epoll_ctl with an extra user_ctx pointer that will be surfaced in
  * every epoll_event_ex delivered for this fd.  Pass NULL to clear. */
-WEPOLL_EX_API int  epoll_ctl_ctx(int epfd, int op, int fd,
+WEPOLL_EX_API int  epoll_ctl_ctx(int epfd, int op, epoll_fd_t fd,
                                  struct epoll_event *ev, void *user_ctx);
 
 /* epoll_wait that returns extended events. */
@@ -163,15 +172,14 @@ WEPOLL_EX_API int  epoll_wait_ex(int epfd, struct epoll_event_ex *events,
 WEPOLL_EX_API int  epoll_pwait2_ex(int epfd, struct epoll_event_ex *events,
                                    int maxevents,
                                    const struct timespec *timeout,
-                                   const sigset_t *sigmask);
+                                   const wepoll_sigset_t *sigmask);
 
-/* Batched epoll_ctl: apply `count` operations atomically.  Either all
- * succeed or all fail and errno is set.  This eliminates the per-call
- * syscall overhead that nginx's ngx_epoll_add_events() suffers from
- * during connection acceptance bursts. */
+/* Batched epoll_ctl: apply operations in order.  On failure, earlier
+ * operations remain applied; ADD operations are best-effort rolled back.
+ * The function is not transactional. */
 WEPOLL_EX_API int  epoll_ctl_batch(int epfd,
                                    const int *ops,
-                                   const int *fds,
+                                   const epoll_fd_t *fds,
                                    const struct epoll_event *events,
                                    int count);
 
@@ -185,13 +193,13 @@ WEPOLL_EX_API int  epoll_drain(int epfd, struct epoll_event *events,
  *     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &saved_event);
  * but cheaper because it skips user-mode validation and re-uses the
  * cached registration. */
-WEPOLL_EX_API int  epoll_rearm(int epfd, int fd);
+WEPOLL_EX_API int  epoll_rearm(int epfd, epoll_fd_t fd);
 
 /* Return the number of fds currently registered on the epoll
  * instance.  Useful for diagnostics and nginx's status module. */
 WEPOLL_EX_API int  epoll_fd_count(int epfd);
 
-/* Return library version: 0xMMmmpp (major, minor, patch). */
+/* Return library version: 0x00MMmmpp (major, minor, patch). */
 WEPOLL_EX_API uint32_t wepoll_ex_version(void);
 WEPOLL_EX_API const char *wepoll_ex_version_string(void);
 
