@@ -183,6 +183,7 @@ static void ep_sock_list_remove_locked(ep_port_t *port, ep_sock_t *sock)
     sock->prev = NULL;
 }
 
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 typedef enum ep_identity_check {
     EP_IDENTITY_ERROR = -1,
     EP_IDENTITY_MATCH = 0,
@@ -272,11 +273,14 @@ static ep_identity_check_t ep_sock_validate_identity_locked(
 
     return EP_IDENTITY_STALE;
 }
+#endif
 
 static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
 {
     ep_sock_t *sock = (ep_sock_t *)calloc(1, sizeof(*sock));
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     int identity_result;
+#endif
     if (sock == NULL) {
         ep_set_errno(ENOMEM);
         return NULL;
@@ -288,6 +292,7 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
         return NULL;
     }
 
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     identity_result = ep_socket_get_endpoint_id(fd, &sock->endpoint_id);
     if (identity_result < 0) {
         free(sock);
@@ -300,6 +305,7 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
     } else {
         sock->endpoint_id_state = EP_SOCKET_ID_TRANSITIONAL;
     }
+#endif
     sock->afd_info = (AFD_POLL_INFO *)ep_afd_pool_take(&port->afd_info_pool);
     if (sock->afd_info == NULL) {
         free(sock);
@@ -354,10 +360,20 @@ static void ep_sock_drop_closed_locked(ep_port_t *port, ep_sock_t *sock)
     }
 }
 
+#ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+#define EP_SOCK_SUBMIT_LOCKED(sock, identity_validated) \
+    ep_sock_submit_locked(sock)
+static int ep_sock_submit_locked(ep_sock_t *sock)
+#else
+#define EP_SOCK_SUBMIT_LOCKED(sock, identity_validated) \
+    ep_sock_submit_locked((sock), (identity_validated))
 static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
+#endif
 {
     ep_port_t *port = sock->port;
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     ep_identity_check_t identity_check;
+#endif
     uint32_t poll_status =
         atomic_load_explicit(&sock->poll_status, memory_order_relaxed);
 
@@ -368,6 +384,7 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
         return 0;
     }
 
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     if (!identity_validated) {
         identity_check = ep_sock_validate_identity_locked(sock, 0);
         if (identity_check == EP_IDENTITY_ERROR) {
@@ -382,6 +399,7 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
             return 1;
         }
     }
+#endif
 
     if (sock->oneshot_fired) {
         /* No AFD request remains after a oneshot delivery.  Probe the
@@ -438,6 +456,7 @@ static int ep_sock_cancel_locked(ep_sock_t *sock)
     return 0;
 }
 
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 static void ep_sock_retire_stale_locked(ep_port_t *port, ep_sock_t *sock)
 {
     int saved_errno = ep_last_err();
@@ -450,11 +469,17 @@ static void ep_sock_retire_stale_locked(ep_port_t *port, ep_sock_t *sock)
     ep_sock_drop_closed_locked(port, sock);
     ep_set_errno(saved_errno);
 }
+#endif
 
 /* Return 0 for the registered socket, 1 after retiring a stale/closed
  * numeric-handle entry, and -1 for an identity-query failure. */
 static int ep_sock_validate_control_locked(ep_port_t *port, ep_sock_t *sock)
 {
+#ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+    (void)port;
+    (void)sock;
+    return 0;
+#else
     ep_identity_check_t identity_check =
         ep_sock_validate_identity_locked(sock, 0);
 
@@ -472,6 +497,7 @@ static int ep_sock_validate_control_locked(ep_port_t *port, ep_sock_t *sock)
         ep_set_errno(error);
     }
     return 1;
+#endif
 }
 
 static int ep_port_arm_pending_locked(ep_port_t *port)
@@ -479,7 +505,7 @@ static int ep_port_arm_pending_locked(ep_port_t *port)
     for (ep_sock_t *sock = port->sock_list_head;
          sock != NULL;) {
         ep_sock_t *next = sock->next;
-        int submit_result = ep_sock_submit_locked(sock, 0);
+        int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 0);
         if (submit_result < 0) {
             return -1;
         }
@@ -528,7 +554,7 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     }
 
     if (old_poll_status == EP_POLL_CANCELLED || status == STATUS_CANCELLED) {
-        if (ep_sock_submit_locked(sock, 0) < 0) {
+        if (EP_SOCK_SUBMIT_LOCKED(sock, 0) < 0) {
             sock->needs_rearm = 1;
         }
         pthread_mutex_unlock(&port->fd_table_lock);
@@ -545,6 +571,7 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
             pthread_mutex_unlock(&port->fd_table_lock);
             return;
         }
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
         if (sock->endpoint_id_state == EP_SOCKET_ID_TRANSITIONAL) {
             ep_identity_check_t identity_check =
                 ep_sock_validate_identity_locked(sock, 1);
@@ -555,6 +582,7 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
                 return;
             }
         }
+#endif
         delivered = ep_afd_to_epoll_events(
             sock->afd_info->Handles[0].Events);
     } else if (status < 0) {
@@ -564,7 +592,7 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
 
     if (delivered == 0) {
         sock->needs_rearm = 1;
-        if (ep_sock_submit_locked(sock, 0) < 0) {
+        if (EP_SOCK_SUBMIT_LOCKED(sock, 0) < 0) {
             sock->needs_rearm = 1;
         }
         pthread_mutex_unlock(&port->fd_table_lock);
@@ -574,7 +602,7 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     node = ep_ready_node_alloc(port);
     if (node == NULL) {
         sock->needs_rearm = 1;
-        (void)ep_sock_submit_locked(sock, 0);
+        (void)EP_SOCK_SUBMIT_LOCKED(sock, 0);
         pthread_mutex_unlock(&port->fd_table_lock);
         return;
     }
@@ -978,7 +1006,7 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
     ep_sock_list_add_locked(port, sock);
 
     {
-        int submit_result = ep_sock_submit_locked(sock, 1);
+        int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
         if (submit_result < 0) {
             ep_fd_table_remove(port, sock);
             ep_sock_free_locked(port, sock);
@@ -1009,9 +1037,11 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     epoll_data_t old_user_data;
     void *old_user_ctx;
     SOCKET old_base_socket;
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     uint64_t old_endpoint_id;
-    uint64_t old_generation;
     uint8_t old_endpoint_id_state;
+#endif
+    uint64_t old_generation;
     uint8_t old_needs_rearm;
     uint8_t old_oneshot_fired;
 
@@ -1042,8 +1072,10 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     old_oneshot_fired = sock->oneshot_fired;
     old_needs_rearm = sock->needs_rearm;
     old_base_socket = sock->base_socket;
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     old_endpoint_id = sock->endpoint_id;
     old_endpoint_id_state = sock->endpoint_id_state;
+#endif
     old_generation = sock->generation;
     old_ready_queued = atomic_load_explicit(&sock->ready_queued,
                                              memory_order_relaxed);
@@ -1065,7 +1097,7 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
 
     if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
             EP_POLL_IDLE) {
-        int submit_result = ep_sock_submit_locked(sock, 1);
+        int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
         if (submit_result > 0) {
             int saved_errno = ep_last_err();
             pthread_mutex_unlock(&port->fd_table_lock);
@@ -1082,8 +1114,10 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
             sock->oneshot_fired = old_oneshot_fired;
             sock->needs_rearm = old_needs_rearm;
             sock->base_socket = old_base_socket;
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
             sock->endpoint_id = old_endpoint_id;
             sock->endpoint_id_state = old_endpoint_id_state;
+#endif
             sock->generation = old_generation;
             atomic_store_explicit(&sock->ready_queued, old_ready_queued,
                                   memory_order_relaxed);
@@ -1101,6 +1135,8 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
 
 int ep_port_unregister(ep_port_t *port, SOCKET fd)
 {
+    int saved_errno = ep_last_err();
+
     pthread_mutex_lock(&port->fd_table_lock);
     ep_sock_t *sock = ep_fd_table_lookup(port, fd);
     if (sock == NULL) {
@@ -1114,10 +1150,12 @@ int ep_port_unregister(ep_port_t *port, SOCKET fd)
     }
 
     if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
-            EP_POLL_PENDING &&
-        ep_sock_cancel_locked(sock) != 0) {
-        pthread_mutex_unlock(&port->fd_table_lock);
-        return -1;
+        EP_POLL_PENDING) {
+        /* DEL is a logical detach operation.  Even if kernel cancellation
+         * fails, remove the public registration now and retain sock storage
+         * until the outstanding completion arrives.  This also makes a
+         * DEL-before-closesocket() lifetime contract safe for embedders. */
+        (void)ep_sock_cancel_locked(sock);
     }
 
     ep_fd_table_remove(port, sock);
@@ -1132,6 +1170,7 @@ int ep_port_unregister(ep_port_t *port, SOCKET fd)
         ep_sock_free_locked(port, sock);
     }
     pthread_mutex_unlock(&port->fd_table_lock);
+    ep_set_errno(saved_errno);
     return 0;
 }
 
@@ -1141,9 +1180,11 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     uint32_t old_ready_queued;
     uint32_t old_state;
     SOCKET old_base_socket;
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     uint64_t old_endpoint_id;
-    uint64_t old_generation;
     uint8_t old_endpoint_id_state;
+#endif
+    uint64_t old_generation;
     uint8_t old_needs_rearm;
     uint8_t old_oneshot_fired;
 
@@ -1167,8 +1208,10 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     old_oneshot_fired = sock->oneshot_fired;
     old_needs_rearm = sock->needs_rearm;
     old_base_socket = sock->base_socket;
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     old_endpoint_id = sock->endpoint_id;
     old_endpoint_id_state = sock->endpoint_id_state;
+#endif
     old_generation = sock->generation;
     old_ready_queued = atomic_load_explicit(&sock->ready_queued,
                                              memory_order_relaxed);
@@ -1183,7 +1226,7 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
         port->next_sock_generation = 1;
         sock->generation = 1;
     }
-    int result = ep_sock_submit_locked(sock, 1);
+    int result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
     if (result > 0) {
         int saved_errno = ep_last_err();
         result = -1;
@@ -1194,8 +1237,10 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
         sock->oneshot_fired = old_oneshot_fired;
         sock->needs_rearm = old_needs_rearm;
         sock->base_socket = old_base_socket;
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
         sock->endpoint_id = old_endpoint_id;
         sock->endpoint_id_state = old_endpoint_id_state;
+#endif
         sock->generation = old_generation;
         atomic_store_explicit(&sock->ready_queued, old_ready_queued,
                               memory_order_relaxed);
@@ -1232,6 +1277,7 @@ static int ep_drain_to_buffer(ep_port_t *port,
         if (sock != NULL && sock->generation == node->sock_generation &&
             !atomic_load_explicit(&sock->delete_pending,
                                   memory_order_relaxed)) {
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
             ep_identity_check_t identity_check =
                 ep_sock_validate_identity_locked(sock, 0);
 
@@ -1241,7 +1287,9 @@ static int ep_drain_to_buffer(ep_port_t *port,
                  * Retire it before a queued snapshot can surface stale data
                  * for a replacement that reused the same numeric handle. */
                 ep_sock_retire_stale_locked(port, sock);
-            } else {
+            } else
+#endif
+            {
                 /* Endpoint identity is an optional hardening layer.  If its
                  * query fails transiently, retain legacy delivery semantics
                  * rather than losing a level-triggered or oneshot event. */

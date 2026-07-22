@@ -14,7 +14,10 @@ ngx_wepoll_addon=`cygpath -m "$ngx_addon_dir"`
 # The addon is intentionally self-contained: nginx compiles the static
 # wepoll-ex sources into its executable.  This avoids relying on a particular
 # out-of-tree CMake build directory while the integration remains experimental.
-CFLAGS="$CFLAGS -DWEPOLL_EX_STATIC"
+# nginx's DEL-before-closesocket contract permits the documented endpoint-
+# identity hot-path opt-out for this embedded build.
+CFLAGS="$CFLAGS -DWEPOLL_EX_STATIC \
+    -DWEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME"
 CORE_INCS="$CORE_INCS $ngx_wepoll_root/include $ngx_wepoll_root/src $ngx_wepoll_addon"
 
 ngx_module_type=EVENT

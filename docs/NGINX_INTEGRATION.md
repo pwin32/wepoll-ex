@@ -35,6 +35,15 @@ must remain level-triggered on Windows unless a separate, tested drain/rearm
 state machine is implemented; copying nginx's Linux `EPOLLET` mask is
 incorrect.
 
+The embedded build defines
+`WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME`: nginx's close path removes the
+registration before `closesocket()`, so the adapter can omit general-purpose
+WFP endpoint-identity probes from the readiness hot path. This optimization is
+valid only while every registered nginx socket teardown preserves that
+DEL-before-close ordering. Third-party modules must not directly close a
+registered socket; whole-port process teardown is safe when no later socket
+reuse is possible.
+
 `wepoll_close()` is required for the virtual epoll descriptor. The adapter must
 not call plain `close()` on it, and must coordinate teardown so no nginx event
 handler can use a context after the port has begun closing.
@@ -84,6 +93,26 @@ The `wepoll_events` directive is restricted to a positive value that fits the
    that handles hard stop only, so it is not suitable for quit/reload testing.
 8. Only after functional tests pass, collect latency or throughput data with a
    reproducible workload. The repository benchmark measures POSIX only.
+
+## Local throughput snapshot
+
+On July 22, 2026, a disposable nginx 1.31.3/MinGW GCC 15.2 loopback build was
+tested with one worker, `empty_gif`, 32 HTTP/1.1 keep-alive connections, two
+client threads, a two-second warm-up, and two order-reversed ten-second runs:
+
+```sh
+h2load --h1 -D 10s --warm-up-time=2s -c 32 -t 2 -m 1 \
+  http://127.0.0.1:PORT/bench
+```
+
+The general hardened build with WFP endpoint probes averaged 46.7k requests
+per second. The synchronized-lifetime nginx build averaged 86.3k requests per
+second, an approximately 85% recovery, with zero failed requests. Comparisons
+against the older pre-identity baseline varied substantially with local
+scheduling and thermals; one affinity-controlled pair was within 1%. Treat
+this snapshot as evidence that the nginx-specific opt-out removes probe
+overhead, not as proof that the hardened implementation is faster than the
+older baseline.
 
 ## Opt-in CMake compile check
 

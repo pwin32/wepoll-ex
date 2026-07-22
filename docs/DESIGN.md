@@ -77,6 +77,12 @@ by the extension path.
   caller synchronization. Normal pre-connect registrations adopt the new
   endpoint token only after an AFD completion proves continuity; stable
   connected/listening TCP and UDP sockets are covered directly.
+- Embedders that guarantee `EPOLL_CTL_DEL` before every native socket close may
+  define `WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME` to omit endpoint-token
+  probes. Windows DEL removes the public registration even when cancellation
+  of an in-flight AFD request fails; storage remains pinned for a later
+  completion or safe close-time quarantine. The nginx addon uses this
+  contract-specific optimization.
 - Windows builds set `_WIN32_WINNT=0x0602`; Windows 8 or later is the current
   compile/runtime assumption, not a validated compatibility floor for every
   AFD revision.

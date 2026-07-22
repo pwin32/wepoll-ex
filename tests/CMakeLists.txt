@@ -66,6 +66,7 @@ else()
 
         foreach(_lifecycle_mode IN ITEMS
                 cancel-failure
+                del-cancel-failure
                 iocp-failure
                 drain-timeout
                 wake-failure)

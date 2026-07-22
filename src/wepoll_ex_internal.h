@@ -216,6 +216,7 @@ typedef enum ep_poll_status {
     EP_POLL_CANCELLED
 } ep_poll_status_t;
 
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 /* SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE identifies the transport endpoint behind
  * a Winsock handle without retaining another reference to the socket.  TCP
  * clients legitimately receive a new endpoint token when connect is started,
@@ -225,6 +226,7 @@ typedef enum ep_socket_identity_state {
     EP_SOCKET_ID_TRANSITIONAL,
     EP_SOCKET_ID_STABLE
 } ep_socket_identity_state_t;
+#endif
 
 struct ep_sock {
     /* Pool linkage (all live sockets on this port). */
@@ -235,8 +237,10 @@ struct ep_sock {
      * socket used in AFD_POLL. */
     SOCKET fd;
     SOCKET base_socket;
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     uint64_t endpoint_id;
     uint8_t endpoint_id_state;
+#endif
 
     /* User-supplied event mask + data + per-fd context. */
     uint32_t      user_events;    /* EPOLLIN | EPOLLOUT | … */
@@ -436,7 +440,9 @@ int      ep_afd_cancel(ep_sock_t *sock);
 uint32_t ep_afd_to_epoll_events(ULONG afd_events);
 uint32_t ep_epoll_to_afd_events(uint32_t epoll_events);
 SOCKET   ep_socket_get_base(SOCKET socket);
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 int      ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id);
+#endif
 
 /* ----------------------------------------------------------------------- */
 /* AFD buffer pool — LIFO stack of pre-allocated buffers.                 */

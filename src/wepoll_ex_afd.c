@@ -106,7 +106,8 @@ int ep_afd_open(HANDLE iocp, HANDLE *out)
 #  ifndef SIO_BASE_HANDLE
 #    define SIO_BASE_HANDLE 0x48000022
 #  endif
-#  ifndef SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE
+#  if !defined(WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME) && \
+      !defined(SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE)
 #    define SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE 0x580000CD
 #  endif
 
@@ -167,6 +168,7 @@ SOCKET ep_socket_get_base(SOCKET socket)
 #endif
 }
 
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 int ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id)
 {
 #ifdef _WIN32
@@ -212,6 +214,7 @@ int ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id)
     return 0;
 #endif
 }
+#endif
 
 /* --------------------------------------------------------------------- */
 /* Submit an AFD poll request.                                          */
@@ -369,10 +372,11 @@ uint32_t ep_epoll_to_afd_events(uint32_t epoll_events)
     uint32_t afd = AFD_POLL_ABORT | AFD_POLL_CONNECT_FAIL |
                    AFD_POLL_LOCAL_CLOSE;
 
-    if (epoll_events & (EPOLLIN | EPOLLRDNORM))
-        afd |= AFD_POLL_RECEIVE | AFD_POLL_ACCEPT;
-    if (epoll_events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP))
+    if (epoll_events & (EPOLLIN | EPOLLRDNORM)) {
+        afd |= AFD_POLL_RECEIVE | AFD_POLL_ACCEPT | AFD_POLL_DISCONNECT;
+    } else if (epoll_events & EPOLLRDHUP) {
         afd |= AFD_POLL_DISCONNECT;
+    }
     if (epoll_events & (EPOLLPRI | EPOLLRDBAND))
         afd |= AFD_POLL_RECEIVE_EXPEDITED;
     if (epoll_events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND))
