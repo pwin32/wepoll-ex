@@ -5,6 +5,18 @@
 #ifndef WEPOLL_EX_INTERNAL_H_
 #define WEPOLL_EX_INTERNAL_H_
 
+#ifdef _WIN32
+/* The AFD implementation uses the Windows 8-era contract.  Keep the
+ * library translation units consistent even when an embedding build (such
+ * as nginx) supplies an older SDK target before including this header. */
+# ifndef _WIN32_WINNT
+#  define _WIN32_WINNT 0x0602
+# elif _WIN32_WINNT < 0x0602
+#  undef _WIN32_WINNT
+#  define _WIN32_WINNT 0x0602
+# endif
+#endif
+
 #include "wepoll_ex.h"
 
 #include <stdatomic.h>

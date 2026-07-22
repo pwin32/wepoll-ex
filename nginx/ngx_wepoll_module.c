@@ -1,206 +1,159 @@
 /*
- * ngx_wepoll_module.c — nginx event module implemented on wepoll-ex.
+ * ngx_wepoll_module.c — experimental nginx 1.31.3 event-module adapter.
  *
- * This file is a drop-in replacement for nginx's stock
- * src/event/modules/ngx_epoll_module.c.  It implements the same
- * ngx_event_actions_t interface, so nginx's event loop code is
- * unchanged.
+ * This adapter deliberately follows nginx's level-triggered poll module
+ * contract.  The Windows wepoll-ex backend rejects EPOLLET, so copying the
+ * Linux epoll module's edge-triggered mask would be incorrect.  One virtual
+ * epoll registration is maintained per connection; read/write actions merge
+ * their masks with ADD/MOD and use nginx's instance bit to reject stale
+ * queued events.
  *
- * Architectural differences from stock nginx epoll:
- *
- *   1. We use epoll_wait_ex() instead of epoll_wait().  The extended
- *      event carries a user_ctx pointer that we registered at ADD
- *      time, which points directly to the ngx_event_t.  No more
- *      ngx_event_actions[] hash lookup on the hot path.
- *
- *   2. We use epoll_ctl_batch() for the accept-burst path.  When
- *      nginx accepts N new connections in a tight loop, we batch the
- *      EPOLL_CTL_ADD calls into a single syscall.
- *
- *   3. Edge-triggered mode is the default for connections.  nginx
- *      already assumes ET semantics on Linux, so we match that.
- *
- *   4. EPOLLRDHUP is used to detect half-closed peers.  nginx's
- *      existing code path for handling RDHUP works unchanged.
- *
- *   5. EPOLLONESHOT is used for SSL connections.  nginx's SSL filter
- *      can call SSL_read multiple times per event; oneshot prevents
- *      the kernel from re-delivering while we're still in the
- *      handler.  We re-arm via epoll_rearm() after the handler
- *      returns NGX_OK.
- *
- * The module is configured into nginx via --add-module=path/to/this/dir
- * or by copying it into src/event/modules/ and patching auto/sources.
+ * The tracked nginx/config hook builds this file and the static wepoll-ex
+ * sources into a Win32 nginx tree.  The integration remains experimental.
  */
 
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_event.h>
+
+#include <errno.h>
+#include <limits.h>
+
 #include "ngx_wepoll_module.h"
 #include "wepoll_ex.h"
 
-/* --------------------------------------------------------------------- */
-/* Module configuration.                                              */
-/* --------------------------------------------------------------------- */
-
 typedef struct {
-    ngx_uint_t  events;          /* max events per epoll_wait call */
-    ngx_uint_t  afd_poll_batch;  /* obsolete — kept for ABI compat */
-    ngx_uint_t  worker_threads;  /* obsolete — kept for ABI compat */
+    ngx_uint_t  events;
 } ngx_wepoll_conf_t;
 
+static ngx_int_t ngx_wepoll_add_event(ngx_event_t *ev, ngx_int_t event,
+    ngx_uint_t flags);
+static ngx_int_t ngx_wepoll_del_event(ngx_event_t *ev, ngx_int_t event,
+    ngx_uint_t flags);
+static ngx_int_t ngx_wepoll_process_events(ngx_cycle_t *cycle,
+    ngx_msec_t timer, ngx_uint_t flags);
+static ngx_int_t ngx_wepoll_init(ngx_cycle_t *cycle, ngx_msec_t timer);
+static void ngx_wepoll_done(ngx_cycle_t *cycle);
+static void *ngx_wepoll_create_conf(ngx_cycle_t *cycle);
+static char *ngx_wepoll_init_conf(ngx_cycle_t *cycle, void *conf);
+
+static ngx_conf_num_bounds_t ngx_wepoll_events_bounds = {
+    ngx_conf_check_num_bounds,
+    1,
+    INT_MAX
+};
+
 static ngx_command_t ngx_wepoll_commands[] = {
+
     { ngx_string("wepoll_events"),
       NGX_EVENT_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_num_slot,
       0,
       offsetof(ngx_wepoll_conf_t, events),
-      NULL },
-
-    { ngx_string("wepoll_batch_accepts"),
-      NGX_EVENT_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_num_slot,
-      0,
-      offsetof(ngx_wepoll_conf_t, afd_poll_batch),
-      NULL },
+      &ngx_wepoll_events_bounds },
 
       ngx_null_command
 };
 
-/* --------------------------------------------------------------------- */
-/* Globals.                                                           */
-/* --------------------------------------------------------------------- */
+static ngx_str_t ngx_wepoll_name = ngx_string("wepoll");
 
-static int                   ngx_wepoll_epfd = -1;
-static epoll_event_ex_t     *ngx_wepoll_events;
-static epoll_event_ex_t     *ngx_wepoll_overflow_events;
-static ngx_uint_t            ngx_wepoll_nevents;
-static ngx_wepoll_conf_t     ngx_wepoll_conf;
+static int              ngx_wepoll_epfd = -1;
+static epoll_event_ex  *ngx_wepoll_events;
+static ngx_uint_t       ngx_wepoll_nevents;
 
-/* --------------------------------------------------------------------- */
-/* Module init/teardown.                                              */
-/* --------------------------------------------------------------------- */
+static ngx_event_module_t ngx_wepoll_module_ctx = {
+    &ngx_wepoll_name,
+    ngx_wepoll_create_conf,
+    ngx_wepoll_init_conf,
 
-static ngx_int_t
-ngx_wepoll_init(ngx_cycle_t *cycle, ngx_msec_t timer)
-{
-    ngx_wepoll_conf_t  *wcf;
-
-    wcf = ngx_event_get_conf(cycle->conf_ctx, ngx_wepoll_module);
-    if (wcf == NULL) {
-        return NGX_ERROR;
+    {
+        ngx_wepoll_add_event,
+        ngx_wepoll_del_event,
+        ngx_wepoll_add_event,
+        ngx_wepoll_del_event,
+        NULL,
+        NULL,
+        NULL,
+        ngx_wepoll_process_events,
+        ngx_wepoll_init,
+        ngx_wepoll_done
     }
+};
 
-    ngx_wepoll_conf = *wcf;
-    if (ngx_wepoll_conf.events == 0) {
-        ngx_wepoll_conf.events = 512;
-    }
-    ngx_wepoll_nevents = ngx_wepoll_conf.events;
-
-    /* Create the epoll instance.  Pass cycle->connection_n as the
-     * size hint so the IOCP and fd table are pre-sized. */
-    ngx_wepoll_epfd = epoll_create_ex(cycle->connection_n, EPOLL_CLOEXEC);
-    if (ngx_wepoll_epfd == -1) {
-        ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
-                      "wepoll_ex: epoll_create_ex() failed");
-        return NGX_ERROR;
-    }
-
-    ngx_wepoll_events =
-        ngx_alloc(sizeof(epoll_event_ex_t) * ngx_wepoll_nevents, cycle->log);
-    if (ngx_wepoll_events == NULL) {
-        return NGX_ERROR;
-    }
-
-    /* Overflow buffer for events that arrive past ngx_wepoll_nevents
-     * in a single epoll_wait call. */
-    ngx_wepoll_overflow_events =
-        ngx_alloc(sizeof(epoll_event_ex_t) * 16, cycle->log);
-    if (ngx_wepoll_overflow_events == NULL) {
-        return NGX_ERROR;
-    }
-
-    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
-                   "wepoll_ex: epoll fd %d created", ngx_wepoll_epfd);
-
-    return NGX_OK;
-}
+ngx_module_t ngx_wepoll_module = {
+    NGX_MODULE_V1,
+    &ngx_wepoll_module_ctx,
+    ngx_wepoll_commands,
+    NGX_EVENT_MODULE,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NGX_MODULE_V1_PADDING
+};
 
 static void
-ngx_wepoll_done(ngx_cycle_t *cycle)
+ngx_wepoll_log_errno(ngx_log_t *log, const char *operation, ngx_socket_t fd)
 {
-    if (ngx_wepoll_events) {
-        ngx_free(ngx_wepoll_events);
-        ngx_wepoll_events = NULL;
-    }
-    if (ngx_wepoll_overflow_events) {
-        ngx_free(ngx_wepoll_overflow_events);
-        ngx_wepoll_overflow_events = NULL;
-    }
-    if (ngx_wepoll_epfd != -1) {
-        wepoll_close(ngx_wepoll_epfd);
-        ngx_wepoll_epfd = -1;
-    }
+    /* wepoll-ex reports portable errno values while nginx/Win32's ngx_errno
+     * reads GetLastError().  Log the portable value explicitly instead of
+     * presenting a stale Win32 error code. */
+    ngx_log_error(NGX_LOG_ALERT, log, 0,
+                  "wepoll_ex: %s fd:%d failed (errno:%d)",
+                  operation, fd, errno);
 }
 
-/* --------------------------------------------------------------------- */
-/* Event registration.                                                */
-/* --------------------------------------------------------------------- */
+static ngx_uint_t
+ngx_wepoll_mask_for_event(ngx_int_t event)
+{
+    if (event == NGX_READ_EVENT) {
+        return EPOLLIN | EPOLLRDHUP;
+    }
+    return EPOLLOUT;
+}
+
+static void *
+ngx_wepoll_event_data(ngx_connection_t *c, ngx_event_t *ev)
+{
+    return (void *) ((uintptr_t) c | (uintptr_t) ev->instance);
+}
 
 static ngx_int_t
 ngx_wepoll_add_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
 {
-    ngx_event_t       *read = ev, *write;
-    ngx_connection_t  *c;
-    struct epoll_event  ee;
-    uint32_t            mask;
-    int                 op;
+    ngx_event_t      *other;
+    ngx_connection_t *c;
+    struct epoll_event ee;
+    ngx_uint_t         mask;
+    int                op;
 
     c = ev->data;
     if (c == NULL || c->fd == (ngx_socket_t) -1) {
         return NGX_ERROR;
     }
 
-    /* Default to EPOLLET for connection-style events.  This matches
-     * nginx's Linux epoll module behaviour. */
-    mask = EPOLLET;
-
-    if (event == NGX_READ_EVENT) {
-        mask |= EPOLLIN | EPOLLRDHUP;
-    } else if (event == NGX_WRITE_EVENT) {
-        mask |= EPOLLOUT;
-    }
-
-    if (flags & NGX_ONESHOT_EVENT) {
-        mask |= EPOLLONESHOT;
-    }
-    if (flags & NGX_CLEAR_EVENT) {
-        /* Already set EPOLLET above; this is a no-op flag for
-         * compatibility with nginx's Linux epoll module. */
-    }
-
-    /* If a previous event was registered for the same fd, we MOD
-     * instead of ADD to merge the masks. */
-    if (ev->active) {
+    other = (event == NGX_READ_EVENT) ? c->write : c->read;
+    mask = ngx_wepoll_mask_for_event(event);
+    if (other != NULL && other->active) {
+        mask |= ngx_wepoll_mask_for_event(
+            event == NGX_READ_EVENT ? NGX_WRITE_EVENT : NGX_READ_EVENT);
         op = EPOLL_CTL_MOD;
-        if (event == NGX_READ_EVENT) {
-            mask |= (c->write->active ? EPOLLOUT : 0);
-        } else {
-            mask |= (c->read->active ? (EPOLLIN | EPOLLRDHUP) : 0);
-        }
     } else {
         op = EPOLL_CTL_ADD;
     }
 
+    /* The current Windows backend is level-triggered.  Ignore
+     * NGX_CLEAR_EVENT/NGX_ONESHOT_EVENT rather than passing incompatible
+     * nginx-internal flag values to the public epoll API. */
+    (void) flags;
     ee.events = mask;
-    ee.data.ptr = c;  /* nginx reads this via ngx_cycle->connection_n */
+    ee.data.ptr = ngx_wepoll_event_data(c, ev);
 
-    /* Use epoll_ctl_ctx so the ngx_event_t is surfaced directly in
-     * epoll_wait_ex()'s output — no array lookup. */
-    if (epoll_ctl_ctx(ngx_wepoll_epfd, op, c->fd, &ee, ev) == -1) {
-        ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_errno,
-                      "wepoll_ex: epoll_ctl_ctx(%d, %d, %d) failed",
-                      ngx_wepoll_epfd, op, c->fd);
+    if (epoll_ctl(ngx_wepoll_epfd, op, c->fd, &ee) == -1) {
+        ngx_wepoll_log_errno(ev->log, "epoll_ctl(ADD/MOD)", c->fd);
         return NGX_ERROR;
     }
 
@@ -211,183 +164,245 @@ ngx_wepoll_add_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
 static ngx_int_t
 ngx_wepoll_del_event(ngx_event_t *ev, ngx_int_t event, ngx_uint_t flags)
 {
-    ngx_connection_t  *c;
-    struct epoll_event  ee;
-    int                 op;
+    ngx_event_t      *other;
+    ngx_connection_t *c;
+    struct epoll_event ee;
+    ngx_uint_t         mask;
+    int                op;
 
     c = ev->data;
-    if (c == NULL) return NGX_OK;
-
-    /* NGX_CLOSE_EVENT means the fd is being closed.  EPOLL_CTL_DEL. */
-    if (flags & NGX_CLOSE_EVENT) {
-        if (epoll_ctl(ngx_wepoll_epfd, EPOLL_CTL_DEL, c->fd, &ee) == -1) {
-            /* If the fd is already gone, ignore. */
-            if (ngx_errno != EBADF && ngx_errno != ENOENT) {
-                ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_errno,
-                              "wepoll_ex: EPOLL_CTL_DEL fd:%d failed", c->fd);
-                return NGX_ERROR;
-            }
-        }
+    if (c == NULL) {
         ev->active = 0;
         return NGX_OK;
     }
 
-    /* Otherwise we're disabling one direction.  MOD the event mask. */
-    op = EPOLL_CTL_MOD;
-    uint32_t mask = EPOLLET;
-    if (event == NGX_READ_EVENT) {
-        if (c->write->active) mask |= EPOLLOUT;
-        /* read disabled: don't add EPOLLIN */
-    } else {
-        if (c->read->active) mask |= (EPOLLIN | EPOLLRDHUP);
-    }
-    ee.events = mask;
-    ee.data.ptr = c;
+    /* DEL is safe and useful even before closesocket(); it also bounds the
+     * deferred AFD cancellation state during nginx connection teardown. */
+    other = (event == NGX_READ_EVENT) ? c->write : c->read;
+    if (flags & NGX_CLOSE_EVENT) {
+        ngx_int_t close_result = NGX_OK;
 
-    if (epoll_ctl_ctx(ngx_wepoll_epfd, op, c->fd, &ee, ev) == -1) {
-        ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_errno,
-                      "wepoll_ex: EPOLL_CTL_MOD fd:%d failed", c->fd);
+        if (ngx_wepoll_epfd != -1 && c->fd != (ngx_socket_t) -1) {
+            if (epoll_ctl(ngx_wepoll_epfd, EPOLL_CTL_DEL, c->fd, NULL) == -1 &&
+                errno != EBADF && errno != ENOENT && errno != ENOTSOCK) {
+                ngx_wepoll_log_errno(ev->log, "epoll_ctl(DEL close)", c->fd);
+                close_result = NGX_ERROR;
+            }
+        }
+        ev->active = 0;
+        if (other != NULL) {
+            other->active = 0;
+        }
+        return close_result;
+    }
+
+    if (other != NULL && other->active) {
+        op = EPOLL_CTL_MOD;
+        mask = ngx_wepoll_mask_for_event(
+            event == NGX_READ_EVENT ? NGX_WRITE_EVENT : NGX_READ_EVENT);
+        ee.events = mask;
+        ee.data.ptr = ngx_wepoll_event_data(c, other);
+    } else {
+        op = EPOLL_CTL_DEL;
+        ee.events = 0;
+        ee.data.ptr = NULL;
+    }
+
+    (void) flags;
+    if (epoll_ctl(ngx_wepoll_epfd, op, c->fd,
+                  op == EPOLL_CTL_DEL ? NULL : &ee) == -1) {
+        if (errno == EBADF || errno == ENOENT || errno == ENOTSOCK) {
+            /* The socket or its registration disappeared independently.
+             * Keep nginx's active flags consistent with the port state. */
+            ev->active = 0;
+            if (other != NULL) {
+                other->active = 0;
+            }
+            return NGX_OK;
+        }
+        ngx_wepoll_log_errno(ev->log, "epoll_ctl(MOD/DEL)", c->fd);
         return NGX_ERROR;
     }
+
     ev->active = 0;
     return NGX_OK;
 }
 
-/* --------------------------------------------------------------------- */
-/* Re-arm a one-shot fd after the handler completes.                  */
-/* --------------------------------------------------------------------- */
-
 static ngx_int_t
-ngx_wepoll_rearm(ngx_event_t *ev)
+ngx_wepoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer,
+    ngx_uint_t flags)
 {
-    ngx_connection_t *c = ev->data;
-    if (c == NULL) return NGX_ERROR;
-    if (epoll_rearm(ngx_wepoll_epfd, c->fd) == -1) {
-        ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_errno,
-                      "wepoll_ex: epoll_rearm fd:%d failed", c->fd);
-        return NGX_ERROR;
-    }
-    return NGX_OK;
-}
-
-/* --------------------------------------------------------------------- */
-/* Process events.                                                    */
-/* --------------------------------------------------------------------- */
-
-static ngx_int_t
-ngx_wepoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
-{
+    int                timeout;
     int                events;
-    ngx_uint_t         i, mask;
+    ngx_int_t          i;
+    ngx_err_t          err;
     ngx_event_t       *rev, *wev;
     ngx_connection_t  *c;
-    epoll_event_ex_t  *ee = ngx_wepoll_events;
+    ngx_queue_t        *queue;
+    uintptr_t           instance;
+    uint32_t            revents;
 
-    /* Convert nginx's timer semantics: NGX_TIMER_INFINITE => -1,
-     * NGX_TIMER_NO_WAIT => 0. */
-    int timeout_ms;
-    if (timer == NGX_TIMER_INFINITE) timeout_ms = -1;
-    else if (timer == 0)             timeout_ms = 0;
-    else                              timeout_ms = (int)timer;
+    if (timer == NGX_TIMER_INFINITE) {
+        timeout = -1;
+    } else if (timer > (ngx_msec_t) INT_MAX) {
+        timeout = INT_MAX;
+    } else {
+        timeout = (int) timer;
+    }
 
-    /* The flags argument carries NGX_POST_EVENTS / NGX_POST_THREAD_EVENTS.
-     * If set, we should defer the handler call by queueing the event
-     * on the post list.  wepoll-ex just calls the handler — nginx's
-     * upstream code handles posting via ev->ready semantics. */
+    events = epoll_wait_ex(ngx_wepoll_epfd, ngx_wepoll_events,
+                           (int) ngx_wepoll_nevents, timeout);
+    err = (events == -1) ? errno : 0;
 
-    events = epoll_wait_ex(ngx_wepoll_epfd, ee, ngx_wepoll_nevents, timeout_ms);
-    if (events == -1) {
-        if (ngx_errno == EINTR) return NGX_OK;
-        ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_errno,
-                      "wepoll_ex: epoll_wait_ex() failed");
+    if ((flags & NGX_UPDATE_TIME) || ngx_event_timer_alarm) {
+        ngx_time_update();
+    }
+
+    if (err != 0) {
+        if (err == EINTR) {
+            if (ngx_event_timer_alarm) {
+                ngx_event_timer_alarm = 0;
+            }
+            return NGX_OK;
+        }
+        ngx_log_error(NGX_LOG_ALERT, cycle->log, 0,
+                      "wepoll_ex: epoll_wait_ex() failed (errno:%d)", err);
         return NGX_ERROR;
     }
 
     if (events == 0) {
-        /* Timeout. */
         return NGX_OK;
     }
 
-    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
-                   "wepoll_ex: %d events ready", events);
+    for (i = 0; i < events; i++) {
+        revents = ngx_wepoll_events[i].events;
+        c = (ngx_connection_t *) ngx_wepoll_events[i].data.ptr;
+        instance = (uintptr_t) c & (uintptr_t) 1;
+        c = (ngx_connection_t *) ((uintptr_t) c & ~(uintptr_t) 1);
 
-    for (i = 0; i < (ngx_uint_t)events; i++) {
-        /* ee[i].user_ctx is the ngx_event_t* we registered at ADD time. */
-        ngx_event_t *ev = (ngx_event_t *) ee[i].user_ctx;
-
-        if (ev == NULL) {
-            /* Fall back to connection lookup via data.ptr. */
-            c = (ngx_connection_t *) ee[i].data.ptr;
-            if (c == NULL) continue;
-            /* Determine read/write from the event bits. */
-            if (ee[i].events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
-                ev = c->read;
-                mask = NGX_READ_EVENT;
-            } else {
-                ev = c->write;
-                mask = NGX_WRITE_EVENT;
-            }
-        } else {
-            /* Determine the direction from the event bits. */
-            if (ee[i].events & (EPOLLOUT | EPOLLHUP | EPOLLERR)) {
-                mask = NGX_WRITE_EVENT;
-                c = ev->data;
-                if (c) wev = c->write;
-            } else {
-                mask = NGX_READ_EVENT;
-            }
-            c = ev->data;
+        if (c == NULL || c->fd == (ngx_socket_t) -1 || c->read == NULL ||
+            c->read->instance != instance) {
+            continue;
         }
 
-        if (c == NULL) continue;
+        if (revents & (EPOLLERR | EPOLLHUP)) {
+            revents |= EPOLLIN | EPOLLOUT;
+        }
 
-        /* Stash the connection for handler access. */
-        c->ready = 1;
         rev = c->read;
-        wev = c->write;
-
-        /* Handle read events. */
-        if ((ee[i].events & (EPOLLIN | EPOLLRDHUP)) && rev && rev->handler) {
+        if ((revents & EPOLLIN) && rev->active) {
             rev->ready = 1;
-            if (ee[i].events & EPOLLRDHUP) {
+            rev->available = -1;
+            if (revents & EPOLLRDHUP) {
                 rev->pending_eof = 1;
-                rev->kq_errno = NGX_ECONNRESET;
             }
-            if (ee[i].events & EPOLLERR) {
-                rev->error = 1;
+
+            if (flags & NGX_POST_EVENTS) {
+                queue = rev->accept ? &ngx_posted_accept_events
+                                    : &ngx_posted_events;
+                ngx_post_event(rev, queue);
+            } else if (rev->handler != NULL) {
+                rev->handler(rev);
             }
-            rev->handler(rev);
         }
 
-        /* Handle write events. */
-        if ((ee[i].events & EPOLLOUT) && wev && wev->handler) {
+        wev = c->write;
+        if ((revents & EPOLLOUT) && wev != NULL && wev->active) {
+            if (c->fd == (ngx_socket_t) -1 || wev->instance != instance) {
+                continue;
+            }
             wev->ready = 1;
-            if (ee[i].events & EPOLLERR) {
-                wev->error = 1;
+#if (NGX_THREADS)
+            wev->complete = 1;
+#endif
+            if (flags & NGX_POST_EVENTS) {
+                ngx_post_event(wev, &ngx_posted_events);
+            } else if (wev->handler != NULL) {
+                wev->handler(wev);
             }
-            wev->handler(wev);
         }
-
-        /* If the fd was in oneshot mode, the user_ctx is still valid
-         * but the fd is no longer armed.  nginx's connection code
-         * will call ngx_add_event() again to re-arm, which translates
-         * to epoll_rearm() via the EPOLL_CTL_MOD path. */
     }
 
     return NGX_OK;
 }
 
-/* --------------------------------------------------------------------- */
-/* Module plumbing.                                                   */
-/* --------------------------------------------------------------------- */
+static ngx_int_t
+ngx_wepoll_init(ngx_cycle_t *cycle, ngx_msec_t timer)
+{
+    ngx_wepoll_conf_t *wcf;
+    int                size_hint;
+
+    (void) timer;
+    wcf = ngx_event_get_conf(cycle->conf_ctx, ngx_wepoll_module);
+    if (wcf == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (wcf->events == 0 ||
+        wcf->events > (ngx_uint_t) INT_MAX ||
+        wcf->events > (ngx_uint_t) ((size_t) -1 / sizeof(*ngx_wepoll_events))) {
+        ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
+                      "wepoll_events must fit an epoll_wait() event array");
+        return NGX_ERROR;
+    }
+
+    if (ngx_wepoll_epfd == -1) {
+        size_hint = cycle->connection_n > (ngx_uint_t) INT_MAX
+                    ? INT_MAX : (int) cycle->connection_n;
+        ngx_wepoll_epfd = epoll_create_ex(size_hint, EPOLL_CLOEXEC);
+        if (ngx_wepoll_epfd == -1) {
+            ngx_wepoll_log_errno(cycle->log, "epoll_create_ex", -1);
+            return NGX_ERROR;
+        }
+    }
+
+    if (ngx_wepoll_nevents < wcf->events) {
+        epoll_event_ex *events;
+
+        events = ngx_alloc(sizeof(*events) * wcf->events, cycle->log);
+        if (events == NULL) {
+            return NGX_ERROR;
+        }
+        if (ngx_wepoll_events != NULL) {
+            ngx_free(ngx_wepoll_events);
+        }
+        ngx_wepoll_events = events;
+    }
+    ngx_wepoll_nevents = wcf->events;
+
+    ngx_io = ngx_os_io;
+    ngx_event_actions = ngx_wepoll_module_ctx.actions;
+    ngx_event_flags = NGX_USE_LEVEL_EVENT;
+
+    return NGX_OK;
+}
+
+static void
+ngx_wepoll_done(ngx_cycle_t *cycle)
+{
+    if (ngx_wepoll_epfd != -1) {
+        if (wepoll_close(ngx_wepoll_epfd) == -1) {
+            ngx_wepoll_log_errno(cycle->log, "wepoll_close", -1);
+        }
+        ngx_wepoll_epfd = -1;
+    }
+    if (ngx_wepoll_events != NULL) {
+        ngx_free(ngx_wepoll_events);
+        ngx_wepoll_events = NULL;
+    }
+    ngx_wepoll_nevents = 0;
+}
 
 static void *
 ngx_wepoll_create_conf(ngx_cycle_t *cycle)
 {
-    ngx_wepoll_conf_t  *wcf;
-    wcf = ngx_palloc(cycle->pool, sizeof(ngx_wepoll_conf_t));
-    if (wcf == NULL) return NULL;
-    ngx_memzero(wcf, sizeof(*wcf));
+    ngx_wepoll_conf_t *wcf;
+
+    wcf = ngx_pcalloc(cycle->pool, sizeof(*wcf));
+    if (wcf == NULL) {
+        return NULL;
+    }
+    wcf->events = NGX_CONF_UNSET_UINT;
     return wcf;
 }
 
@@ -395,42 +410,8 @@ static char *
 ngx_wepoll_init_conf(ngx_cycle_t *cycle, void *conf)
 {
     ngx_wepoll_conf_t *wcf = conf;
-    if (wcf->events == 0) wcf->events = 512;
+
+    (void) cycle;
+    ngx_conf_init_uint_value(wcf->events, 512);
     return NGX_CONF_OK;
 }
-
-ngx_event_actions_t   ngx_wepoll_actions = {
-    ngx_wepoll_add_event,          /* add */
-    ngx_wepoll_del_event,          /* delete */
-    ngx_wepoll_add_event,          /* enable */
-    ngx_wepoll_del_event,          /* disable */
-    ngx_wepoll_add_event,          /* add_conn — same code path */
-    ngx_wepoll_del_event,          /* del_conn — same code path */
-    NULL,                          /* notify — wepoll has no native notify */
-    ngx_wepoll_process_events,     /* process_events */
-    ngx_wepoll_init,               /* init */
-    ngx_wepoll_done,               /* done */
-};
-
-ngx_event_module_t  ngx_wepoll_module_ctx = {
-    ngx_string("wepoll"),
-    ngx_wepoll_create_conf,        /* create configuration */
-    ngx_wepoll_init_conf,          /* init configuration */
-    { 0, 0, 0, 0, 0, 0, 0, 0, 0 }, /* module-specific config defaults */
-    &ngx_wepoll_actions
-};
-
-ngx_module_t  ngx_wepoll_module = {
-    NGX_MODULE_V1,
-    &ngx_wepoll_module_ctx,        /* module context */
-    ngx_wepoll_commands,           /* module directives */
-    NGX_EVENT_MODULE,              /* module type */
-    NULL,                          /* init master */
-    NULL,                          /* init module */
-    NULL,                          /* init process */
-    NULL,                          /* init thread */
-    NULL,                          /* exit thread */
-    NULL,                          /* exit process */
-    NULL,                          /* exit master */
-    NGX_MODULE_V1_PADDING
-};

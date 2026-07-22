@@ -16,9 +16,10 @@ tests does not validate the IOCP/AFD engine.
 | Windows | `wepoll_ex_global.c`, `wepoll_ex_errno.c`, `wepoll_ex_afd.c`, `wepoll_ex_pool.c`, `wepoll_ex_port.c`, `wepoll_ex_api.c` | IOCP/AFD implementation |
 | POSIX | `wepoll_ex_posix.c`, `wepoll_ex_pool.c` | Native-epoll wrapper and queue/pool tests |
 
-`WEPOLL_EX_BUILD_NGINX` currently emits a warning and creates no target. The
-adapter requires the separate validation described in
-[`NGINX_INTEGRATION.md`](NGINX_INTEGRATION.md).
+`WEPOLL_EX_BUILD_NGINX` adds an opt-in object compile check against a configured
+nginx source/build tree. The tracked `nginx/config` hook separately registers
+the adapter as an nginx EVENT addon and compiles the static wepoll-ex sources
+into that disposable nginx build.
 
 ## Windows data flow and lifetime
 
@@ -56,11 +57,17 @@ non-null signal mask is not implemented by the extension path.
 
 - Windows registrations accept Winsock sockets only, not files or arbitrary
   HANDLEs.
+- Windows builds set `_WIN32_WINNT=0x0602`; Windows 8 or later is the current
+  compile/runtime assumption, not a validated compatibility floor for every
+  AFD revision.
 - `EPOLLONESHOT`, context delivery, RDHUP mapping, zero-timeout waits, native
   socket close cleanup, and concurrent epoll close have regression coverage.
 - `EPOLLET` and `EPOLLEXCLUSIVE` are rejected with `EOPNOTSUPP`. Silently
   treating AFD's one-shot level notification as an edge would duplicate unread
   readiness.
+- The nginx adapter leaves `ngx_event_actions.notify` unset. nginx 1.31.3
+  rejects `--with-threads` on Win32 and its thread-pool sources are POSIX-only,
+  so thread-pool integration is outside this prototype's supported boundary.
 - Windows signal masks are opaque API placeholders; non-null masks are
   rejected with `EOPNOTSUPP`.
 - `epoll_ctl_batch` best-effort rolls back successful ADDs after a later
@@ -75,8 +82,12 @@ non-null signal mask is not implemented by the extension path.
 
 Strict warnings-as-errors builds pass on GCC/POSIX and MinGW. POSIX CTest covers
 the API, MPSC/pool behavior, and installed-package consumer. Windows CTest
-covers loopback readiness, context changes, oneshot/rearm, invalid arguments,
-batch rollback and immediate reuse, descriptor-table collisions, native socket
-close, concurrent close/wait, and the installed-package consumer. Shared,
-static, and shared-only MinGW configurations are exercised; this is still not
-a supported Windows version/compiler matrix.
+covers read/write readiness, FIN/RDHUP, reset and refused-connect mapping,
+context changes, oneshot/rearm, invalid arguments, batch rollback and immediate
+reuse, descriptor-table collisions, native socket close, concurrent close/wait,
+and the installed-package consumer. Shared, static, and combined MinGW
+configurations are exercised. The nginx 1.31.3 adapter also passes strict addon
+compilation, full minimal and HTTP Win32 links, configuration bounds checks,
+`nginx -t`, 100 loopback HTTP requests across a worker reload, and graceful
+quit using `use wepoll`. These results still do not constitute a supported
+Windows/compiler matrix.

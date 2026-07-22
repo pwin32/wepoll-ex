@@ -1,0 +1,35 @@
+# nginx auto/configure hook for the experimental Win32 event module.
+
+ngx_addon_name=ngx_wepoll_module
+
+if [ "$NGX_PLATFORM" != win32 ]; then
+    echo "$0: error: ngx_wepoll_module is supported only for win32 builds"
+    exit 1
+fi
+
+ngx_wepoll_root_posix=`cd "$ngx_addon_dir/.." && pwd`
+ngx_wepoll_root=`cygpath -m "$ngx_wepoll_root_posix"`
+ngx_wepoll_addon=`cygpath -m "$ngx_addon_dir"`
+
+# The addon is intentionally self-contained: nginx compiles the static
+# wepoll-ex sources into its executable.  This avoids relying on a particular
+# out-of-tree CMake build directory while the integration remains experimental.
+CFLAGS="$CFLAGS -DWEPOLL_EX_STATIC"
+CORE_INCS="$CORE_INCS $ngx_wepoll_root/include $ngx_wepoll_root/src $ngx_wepoll_addon"
+
+ngx_module_type=EVENT
+ngx_module_name=ngx_wepoll_module
+ngx_module_srcs="$ngx_wepoll_addon/ngx_wepoll_module.c \
+                 $ngx_wepoll_root/src/wepoll_ex_global.c \
+                 $ngx_wepoll_root/src/wepoll_ex_errno.c \
+                 $ngx_wepoll_root/src/wepoll_ex_afd.c \
+                 $ngx_wepoll_root/src/wepoll_ex_pool.c \
+                 $ngx_wepoll_root/src/wepoll_ex_port.c \
+                 $ngx_wepoll_root/src/wepoll_ex_api.c"
+ngx_module_deps="$ngx_wepoll_addon/ngx_wepoll_module.h \
+                 $ngx_wepoll_root/include/wepoll_ex.h \
+                 $ngx_wepoll_root/include/wepoll_ex_export.h \
+                 $ngx_wepoll_root/src/wepoll_ex_internal.h"
+ngx_module_libs="-lntdll -lws2_32"
+
+. auto/module

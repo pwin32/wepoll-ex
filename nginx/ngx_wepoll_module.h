@@ -1,22 +1,17 @@
 /*
  * ngx_wepoll_module.h — nginx event module driver header.
  *
- * Drop this file into nginx's src/event/modules/ directory and the
- * corresponding .c file alongside it.  Configure nginx with
+ * Add this directory with nginx's --add-module option.  The tracked
+ * `config` hook compiles the adapter and the static wepoll-ex sources.  For
+ * a Win32 build, configure nginx with
  *
- *     ./auto/configure --with-cc-opt=-DWEPOLL_EX_NGINX \
- *                      --add-module=path/to/wepoll-ex/nginx
+ *     ./configure --crossbuild=win32 --add-module=path/to/wepoll-ex/nginx
  *
- * to enable the wepoll-ex backend in place of the default select/poll
- * modules on Windows.  The module implements the ngx_event_module_t
- * interface so the rest of nginx sees it as just another event
- * backend.
+ * and select it explicitly with `events { use wepoll; }`.  The module uses
+ * nginx's level-triggered action contract; EPOLLET is intentionally not used.
  *
- * The module transparently uses epoll_ctl_ctx() to register the
- * ngx_event_t pointer as user_ctx on each fd, eliminating the
- * traditional ngx_event_t** lookup array that nginx has to maintain
- * on Linux.  When epoll_wait_ex returns, the user_ctx field already
- * points at the ngx_event_t — no hash, no array.
+ * Event data stores nginx's connection pointer plus its instance bit, matching
+ * the stale-event guard used by nginx's native event modules.
  */
 #ifndef NGX_WEPOLL_MODULE_H_
 #define NGX_WEPOLL_MODULE_H_
@@ -25,7 +20,6 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 
-ngx_module_t         ngx_wepoll_module;
-ngx_event_module_t   ngx_wepoll_module_ctx;
+extern ngx_module_t  ngx_wepoll_module;
 
 #endif

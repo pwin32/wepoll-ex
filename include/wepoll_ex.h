@@ -107,7 +107,8 @@ typedef struct epoll_event {
  *   - timestamp  : monotonic nanosecond timestamp sampled near IOCP
  *                  delivery; its origin is intentionally unspecified.
  *   - user_ctx   : opaque pointer registered per-fd via epoll_ctl_ctx().
- *                  Lets nginx avoid a hash lookup from fd -> ngx_event_t.
+ *                  Consumers can associate a stable application object with
+ *                  the registration without a separate metadata lookup.
  * ------------------------------------------------------------------------- */
 #define WEPOLL_FLAG_ONESHOT_FIRED  (1U << 0)
 #define WEPOLL_FLAG_ET_DELIVERED   (1U << 1) /* reserved; EPOLLET unsupported */

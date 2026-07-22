@@ -286,6 +286,216 @@ static void test_basic_io(void)
     PASS();
 }
 
+static void test_write_ready(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    struct epoll_event output;
+    int epfd;
+
+    TEST("loopback write readiness delivery");
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("make_tcp_pair");
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        tcp_pair_close(&pair);
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLOUT;
+    event.data.u64 = UINT64_C(0xfeedbeef);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.client, &event) != 0 ||
+        epoll_wait(epfd, &output, 1, 1000) != 1 ||
+        (output.events & EPOLLOUT) == 0 ||
+        output.data.u64 != event.data.u64 || send_byte(pair.client) != 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_DEL, pair.client, NULL) != 0) {
+        FAIL("write readiness");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    event.events = EPOLLIN;
+    event.data.u64 = UINT64_C(0xfacefeed);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
+        epoll_wait(epfd, &output, 1, 1000) != 1 ||
+        (output.events & EPOLLIN) == 0 ||
+        output.data.u64 != event.data.u64 || recv_byte(pair.server) != 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL) != 0) {
+        FAIL("write transfer");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    wepoll_close(epfd);
+    tcp_pair_close(&pair);
+    PASS();
+}
+
+static void test_remote_half_close(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    struct epoll_event output;
+    char byte;
+    int epfd;
+
+    TEST("remote half-close reports IN and RDHUP");
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("make_tcp_pair");
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        tcp_pair_close(&pair);
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLRDHUP;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
+        shutdown(pair.client, SD_SEND) == SOCKET_ERROR ||
+        epoll_wait(epfd, &output, 1, 1000) != 1 ||
+        (output.events & (EPOLLIN | EPOLLRDHUP)) !=
+            (EPOLLIN | EPOLLRDHUP) ||
+        recv(pair.server, &byte, 1, 0) != 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL) != 0) {
+        FAIL("remote half-close");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    wepoll_close(epfd);
+    tcp_pair_close(&pair);
+    PASS();
+}
+
+static void test_remote_reset(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    struct epoll_event output;
+    struct linger reset = { 1, 0 };
+    char byte;
+    int epfd;
+
+    TEST("remote reset reports unrequested HUP");
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("make_tcp_pair");
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        tcp_pair_close(&pair);
+        return;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
+        setsockopt(pair.client, SOL_SOCKET, SO_LINGER,
+                   (const char *)&reset, (int)sizeof(reset)) == SOCKET_ERROR) {
+        FAIL("reset setup");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    closesocket(pair.client);
+    pair.client = INVALID_SOCKET;
+    if (epoll_wait(epfd, &output, 1, 1000) != 1 ||
+        (output.events & EPOLLHUP) == 0 ||
+        recv(pair.server, &byte, 1, 0) != SOCKET_ERROR ||
+        WSAGetLastError() != WSAECONNRESET ||
+        epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL) != 0) {
+        FAIL("reset delivery");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    wepoll_close(epfd);
+    tcp_pair_close(&pair);
+    PASS();
+}
+
+static void test_connect_failure(void)
+{
+    struct sockaddr_in address;
+    int address_length = (int)sizeof(address);
+    struct epoll_event event;
+    struct epoll_event output;
+    SOCKET reserved = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    u_long nonblocking = 1;
+    int socket_error = 0;
+    int socket_error_length = (int)sizeof(socket_error);
+    int epfd = -1;
+
+    TEST("refused connect reports OUT and ERR");
+    reserved = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (reserved == INVALID_SOCKET) {
+        FAIL("reserved socket");
+        return;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(0);
+    if (bind(reserved, (const struct sockaddr *)&address,
+             (int)sizeof(address)) == SOCKET_ERROR ||
+        getsockname(reserved, (struct sockaddr *)&address,
+                    &address_length) == SOCKET_ERROR) {
+        FAIL("reserve port");
+        closesocket(reserved);
+        return;
+    }
+
+    client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (client == INVALID_SOCKET ||
+        ioctlsocket(client, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+        FAIL("client socket");
+        closesocket(reserved);
+        if (client != INVALID_SOCKET) closesocket(client);
+        return;
+    }
+    if (connect(client, (const struct sockaddr *)&address,
+                (int)sizeof(address)) == SOCKET_ERROR) {
+        int connect_error = WSAGetLastError();
+        if (connect_error != WSAEWOULDBLOCK &&
+            connect_error != WSAEINPROGRESS &&
+            connect_error != WSAEALREADY &&
+            connect_error != WSAECONNREFUSED) {
+            FAIL("connect");
+            closesocket(client);
+            closesocket(reserved);
+            return;
+        }
+    }
+
+    epfd = epoll_create1(0);
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLOUT;
+    if (epfd < 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_ADD, client, &event) != 0 ||
+        epoll_wait(epfd, &output, 1, 5000) != 1 ||
+        (output.events & (EPOLLOUT | EPOLLERR)) !=
+            (EPOLLOUT | EPOLLERR) ||
+        getsockopt(client, SOL_SOCKET, SO_ERROR, (char *)&socket_error,
+                   &socket_error_length) == SOCKET_ERROR ||
+        socket_error != WSAECONNREFUSED) {
+        FAIL("connect failure delivery");
+        if (epfd >= 0) wepoll_close(epfd);
+        closesocket(client);
+        closesocket(reserved);
+        return;
+    }
+    wepoll_close(epfd);
+    closesocket(client);
+    closesocket(reserved);
+    PASS();
+}
+
 static void test_zero_timeout(void)
 {
     tcp_pair_t pair;
@@ -413,13 +623,13 @@ static void test_oneshot_rearm(void)
     PASS();
 }
 
-static void test_unsupported_edge_trigger(void)
+static void test_unsupported_event_modes(void)
 {
     tcp_pair_t pair;
     struct epoll_event event;
     int epfd;
 
-    TEST("reject unsupported edge-triggered mode");
+    TEST("reject unsupported edge-triggered and exclusive modes");
     if (make_tcp_pair(&pair) != 0) {
         FAIL("make_tcp_pair");
         return;
@@ -436,6 +646,15 @@ static void test_unsupported_edge_trigger(void)
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != -1 ||
         errno != EOPNOTSUPP || epoll_fd_count(epfd) != 0) {
         FAIL("EPOLLET should be rejected");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != -1 ||
+        errno != EOPNOTSUPP || epoll_fd_count(epfd) != 0) {
+        FAIL("EPOLLEXCLUSIVE should be rejected");
         wepoll_close(epfd);
         tcp_pair_close(&pair);
         return;
@@ -748,10 +967,14 @@ int main(void)
     test_create_close();
     test_invalid_args();
     test_basic_io();
+    test_write_ready();
+    test_remote_half_close();
+    test_remote_reset();
+    test_connect_failure();
     test_zero_timeout();
     test_context_clear();
     test_oneshot_rearm();
-    test_unsupported_edge_trigger();
+    test_unsupported_event_modes();
     test_native_close_cleanup();
     test_oneshot_native_close_cleanup();
     test_batch_safety();

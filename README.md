@@ -29,7 +29,8 @@ handle, a growable socket table, and a ready queue. `epoll_ctl` submits an
 `AFD_POLL`; completions are translated by `src/wepoll_ex_afd.c`, queued as
 immutable snapshots, and consumed by `epoll_wait`. The port retains socket
 storage until cancellation completions are drained. AFD is undocumented and
-the Windows path is validated only with the MinGW/MSYS2 checks below.
+the build currently targets Windows 8 or later (`_WIN32_WINNT=0x0602`). The
+Windows path is validated only with the MinGW/MSYS2 checks below.
 
 ### POSIX development path
 
@@ -60,7 +61,7 @@ include/   public headers
 src/       Windows engine and POSIX wrapper
 tests/     POSIX, Windows API, pool, and package-consumer tests
 bench/     POSIX-only bench_latency source
-nginx/     source-only, unvalidated nginx adapter
+nginx/     opt-in nginx 1.31.3 adapter and configure hook
 docs/      design and integration status
 ```
 

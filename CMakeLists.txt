@@ -21,7 +21,12 @@ option(WEPOLL_EX_BUILD_SHARED   "Build shared library"      ON)
 option(WEPOLL_EX_BUILD_STATIC   "Build static library"      ON)
 option(WEPOLL_EX_BUILD_TESTS    "Build test suite"          ON)
 option(WEPOLL_EX_BUILD_BENCH    "Build microbenchmarks"     OFF)
-option(WEPOLL_EX_BUILD_NGINX    "Build nginx module shim"   OFF)
+option(WEPOLL_EX_BUILD_NGINX    "Compile-check nginx adapter" OFF)
+
+set(WEPOLL_EX_NGINX_SOURCE_DIR "" CACHE PATH
+    "Configured nginx source tree for the optional adapter compile check")
+set(WEPOLL_EX_NGINX_BUILD_DIR "" CACHE PATH
+    "nginx generated-header directory (for example, <tree>/objs-wepoll)")
 
 if(DEFINED WEPOLL_EX_USE_PTHREADS AND NOT WEPOLL_EX_USE_PTHREADS)
     message(FATAL_ERROR
@@ -31,11 +36,6 @@ endif()
 if(NOT WEPOLL_EX_BUILD_SHARED AND NOT WEPOLL_EX_BUILD_STATIC)
     message(FATAL_ERROR
         "At least one of WEPOLL_EX_BUILD_SHARED or WEPOLL_EX_BUILD_STATIC must be enabled")
-endif()
-
-if(WEPOLL_EX_BUILD_NGINX)
-    message(WARNING
-        "WEPOLL_EX_BUILD_NGINX is not implemented; no nginx target will be generated")
 endif()
 
 # --------------------------------------------------------------------- #
@@ -92,6 +92,48 @@ if(WEPOLL_EX_PLATFORM_WINDOWS)
         _WIN32_WINNT=0x0602  # Win8 — required for AFD poll bits
         WIN32_LEAN_AND_MEAN
         _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# --------------------------------------------------------------------- #
+# Optional nginx adapter compile check.
+# --------------------------------------------------------------------- #
+
+if(WEPOLL_EX_BUILD_NGINX)
+    if(NOT WEPOLL_EX_PLATFORM_WINDOWS)
+        message(FATAL_ERROR
+            "WEPOLL_EX_BUILD_NGINX requires a Windows/MinGW configure")
+    endif()
+    if(NOT IS_DIRECTORY "${WEPOLL_EX_NGINX_SOURCE_DIR}")
+        message(FATAL_ERROR
+            "Set WEPOLL_EX_NGINX_SOURCE_DIR to the configured nginx source tree")
+    endif()
+    if(NOT IS_DIRECTORY "${WEPOLL_EX_NGINX_BUILD_DIR}")
+        message(FATAL_ERROR
+            "Set WEPOLL_EX_NGINX_BUILD_DIR to nginx's generated-header directory")
+    endif()
+    foreach(_nginx_header
+            ngx_auto_config.h
+            ngx_auto_headers.h)
+        if(NOT EXISTS "${WEPOLL_EX_NGINX_BUILD_DIR}/${_nginx_header}")
+            message(FATAL_ERROR
+                "Missing ${_nginx_header} in WEPOLL_EX_NGINX_BUILD_DIR")
+        endif()
+    endforeach()
+
+    add_library(wepoll_ex_nginx_adapter OBJECT
+        nginx/ngx_wepoll_module.c
+        nginx/ngx_wepoll_module.h)
+    target_include_directories(wepoll_ex_nginx_adapter PRIVATE
+        ${WEPOLL_EX_NGINX_SOURCE_DIR}/src/core
+        ${WEPOLL_EX_NGINX_SOURCE_DIR}/src/event
+        ${WEPOLL_EX_NGINX_SOURCE_DIR}/src/event/modules
+        ${WEPOLL_EX_NGINX_SOURCE_DIR}/src/event/quic
+        ${WEPOLL_EX_NGINX_SOURCE_DIR}/src/os/win32
+        ${WEPOLL_EX_NGINX_BUILD_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/nginx)
+    target_compile_definitions(wepoll_ex_nginx_adapter PRIVATE
+        WEPOLL_EX_STATIC)
 endif()
 
 # --------------------------------------------------------------------- #
