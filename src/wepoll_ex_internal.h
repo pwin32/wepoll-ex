@@ -194,15 +194,12 @@ struct ep_sock {
 /* ----------------------------------------------------------------------- */
 
 /* ----------------------------------------------------------------------- */
-/* MPSC lock-free ready queue.                                            */
+/* MPSC ready queue.                                                     */
 /*                                                                       */
-/* Multiple producers (IOCP worker threads completing AFD polls) push    */
-/* nodes atomically via compare-and-swap on the tail.  Single consumer  */
-/* (the epoll_wait caller) drains the entire queue with an atomic        */
-/* exchange on the head pointer.                                        */
-/*                                                                       */
-/* This eliminates the pthread_mutex_t contention that previously        */
-/* dominated multi-worker configurations.                               */
+/* Producers exchange the head and publish through their predecessor's   */
+/* next link.  The sole consumer advances the non-atomic tail.  Queue     */
+/* destruction therefore requires all producers and the consumer to be   */
+/* quiescent.                                                            */
 /* ----------------------------------------------------------------------- */
 
 typedef struct ep_ready_node {
@@ -214,30 +211,41 @@ typedef struct ep_ready_node {
 } ep_ready_node_t;
 
 typedef struct ep_ready_queue {
-    /* MPSC invariant: producers append to tail via CAS; consumer
-     * swaps head with a sentinel and walks the chain. */
+    /* Producers exchange `head` and publish through the predecessor's
+     * `next` field.  The single consumer owns `tail` and advances it
+     * only after a producer has published a successor.  This is the
+     * standard intrusive MPSC queue hand-off; a producer never writes
+     * to a node after the consumer is allowed to reclaim it. */
     _Atomic(ep_ready_node_t *) head;
-    _Atomic(ep_ready_node_t *) tail;
+    ep_ready_node_t          *tail;
 
-    /* Sentinel node — always present.  head/tail always point to
-     * a node (initially the stub).  Pushes append after tail;
-     * drains snap head->next and reposition head. */
+    /* Sentinel node used by the consumer when it reaches the last
+     * published node.  It is never returned to the caller. */
     ep_ready_node_t *stub;
 
-    /* Pre-allocated node freelist — fed by the AFD buffer pool so
-     * the producer path never hits malloc. */
-    _Atomic(ep_ready_node_t *) free_list;
+    /* Number of real enqueue operations not yet consumed.  A producer
+     * increments before publishing its link, so this may temporarily
+     * include an in-flight node.  It is exact after producers quiesce. */
+    _Atomic(size_t) queued;
+    int             initialized;
 } ep_ready_queue_t;
 
 /* AFD buffer pool — pre-allocated AFD_POLL_INFO buffers and ready
  * queue nodes, recycled LIFO.  Eliminates the malloc/calloc on the
  * EPOLL_CTL_ADD hot path and on every IOCP completion. */
 typedef struct ep_afd_pool {
-    _Atomic(void *) stack;   /* LIFO stack of free buffers */
+    /* The freelist is protected by `lock`.  A mutex is deliberately
+     * used here: unlike the old lock-free stack, it has no ABA window
+     * and keeps ownership/accounting updates in one critical section. */
+    void            *stack;
+    void            *all_entries;
     size_t           buf_size;
-    size_t           capacity;
+    size_t           capacity;       /* initial reservation */
+    size_t           allocated;      /* total entries ever allocated */
     _Atomic(size_t)  in_use;
     _Atomic(size_t)  peak;
+    pthread_mutex_t  lock;
+    int              initialized;
 } ep_afd_pool_t;
 
 struct ep_port {
@@ -329,12 +337,14 @@ int  ep_winerr_to_errno(DWORD wsaerr);
 /* AFD buffer pool — LIFO stack of pre-allocated buffers.                 */
 /*                                                                       */
 /* ep_afd_pool_init   : allocate `capacity` buffers of `buf_size` bytes. */
-/* ep_afd_pool_destroy: free everything.                                 */
+/* ep_afd_pool_destroy: free all returned buffers.  Callers must first   */
+/*                      return every outstanding buffer and quiesce all */
+/*                      threads that can access the pool.               */
 /* ep_afd_pool_take   : pop a buffer, or malloc a fresh one if pool is   */
-/*                      exhausted (the fresh allocation will be          */
-/*                      returned via ep_afd_pool_give when the caller is */
-/*                      done, growing the pool on-the-fly).              */
-/* ep_afd_pool_give   : return a buffer to the pool.                     */
+/*                      exhausted.  Fresh entries are accounted exactly */
+/*                      like pre-allocated entries.                     */
+/* ep_afd_pool_give   : return a buffer to the pool; duplicate returns   */
+/*                      are ignored and do not underflow `in_use`.       */
 /* ----------------------------------------------------------------------- */
 int   ep_afd_pool_init(ep_afd_pool_t *p, size_t buf_size, size_t capacity);
 void  ep_afd_pool_destroy(ep_afd_pool_t *p);
@@ -345,6 +355,9 @@ void  ep_afd_pool_give(ep_afd_pool_t *p, void *buf);
 /* MPSC lock-free ready queue.                                           */
 /* ----------------------------------------------------------------------- */
 void  ep_ready_init(ep_ready_queue_t *q);
+/* The sole consumer must drain/reclaim every node, and all producers    */
+/* must be quiescent, before destroy.  A non-empty queue is left intact  */
+/* and reported through errno=EBUSY.                                    */
 void  ep_ready_destroy(ep_ready_queue_t *q);
 void  ep_ready_push(ep_ready_queue_t *q, ep_ready_node_t *node);
 /* Drain up to maxevents nodes.  Returns a singly-linked chain that

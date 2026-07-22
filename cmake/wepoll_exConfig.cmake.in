@@ -1,16 +1,41 @@
 @PACKAGE_INIT@
 
-include("${CMAKE_CURRENT_LIST_DIR}/wepoll_exTargets.cmake")
-
-set(WEPOLL_EX_VERSION "@PROJECT_VERSION@")
-
-if(TARGET wepoll_ex::wepoll_ex)
-    set(WEPOLL_EX_FOUND TRUE)
-endif()
-
 include(CMakeFindDependencyMacro)
 
-# On POSIX we depend on Threads.
-if(UNIX)
+if(@WEPOLL_EX_PACKAGE_NEEDS_THREADS@)
     find_dependency(Threads)
 endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/wepoll_exTargets.cmake")
+
+set(wepoll_ex_shared_FOUND FALSE)
+set(wepoll_ex_static_FOUND FALSE)
+if(TARGET wepoll_ex::wepoll_ex_shared)
+    set(wepoll_ex_shared_FOUND TRUE)
+endif()
+if(TARGET wepoll_ex::wepoll_ex_static)
+    set(wepoll_ex_static_FOUND TRUE)
+endif()
+
+if(NOT TARGET wepoll_ex::wepoll_ex)
+    add_library(wepoll_ex::wepoll_ex INTERFACE IMPORTED)
+    if(TARGET wepoll_ex::wepoll_ex_shared)
+        set_property(TARGET wepoll_ex::wepoll_ex PROPERTY
+            INTERFACE_LINK_LIBRARIES wepoll_ex::wepoll_ex_shared)
+    elseif(TARGET wepoll_ex::wepoll_ex_static)
+        set_property(TARGET wepoll_ex::wepoll_ex PROPERTY
+            INTERFACE_LINK_LIBRARIES wepoll_ex::wepoll_ex_static)
+    else()
+        set(wepoll_ex_FOUND FALSE)
+        set(WEPOLL_EX_FOUND FALSE)
+        return()
+    endif()
+endif()
+
+set(wepoll_ex_VERSION "@PROJECT_VERSION@")
+set(WEPOLL_EX_VERSION "@PROJECT_VERSION@")
+set(wepoll_ex_FOUND TRUE)
+set(WEPOLL_EX_FOUND TRUE)
+
+check_required_components(wepoll_ex)
+set(WEPOLL_EX_FOUND ${wepoll_ex_FOUND})

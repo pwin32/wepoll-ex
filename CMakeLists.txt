@@ -2,12 +2,15 @@ cmake_minimum_required(VERSION 3.16)
 
 project(wepoll-ex
     VERSION 1.0.0
-    DESCRIPTION "Extended epoll layer for Windows, IOCP+AFD backed, nginx-ready"
+    DESCRIPTION "Experimental extended epoll compatibility layer for Windows"
     LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 # Default to Release for non-config builds.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -19,7 +22,21 @@ option(WEPOLL_EX_BUILD_STATIC   "Build static library"      ON)
 option(WEPOLL_EX_BUILD_TESTS    "Build test suite"          ON)
 option(WEPOLL_EX_BUILD_BENCH    "Build microbenchmarks"     OFF)
 option(WEPOLL_EX_BUILD_NGINX    "Build nginx module shim"   OFF)
-option(WEPOLL_EX_USE_PTHREADS   "Use pthreads (POSIX only)" ON)
+
+if(DEFINED WEPOLL_EX_USE_PTHREADS AND NOT WEPOLL_EX_USE_PTHREADS)
+    message(FATAL_ERROR
+        "WEPOLL_EX_USE_PTHREADS=OFF is unsupported: the current implementation requires pthread-compatible threads")
+endif()
+
+if(NOT WEPOLL_EX_BUILD_SHARED AND NOT WEPOLL_EX_BUILD_STATIC)
+    message(FATAL_ERROR
+        "At least one of WEPOLL_EX_BUILD_SHARED or WEPOLL_EX_BUILD_STATIC must be enabled")
+endif()
+
+if(WEPOLL_EX_BUILD_NGINX)
+    message(WARNING
+        "WEPOLL_EX_BUILD_NGINX is not implemented; no nginx target will be generated")
+endif()
 
 # --------------------------------------------------------------------- #
 # Platform detection.
@@ -32,16 +49,14 @@ else()
 endif()
 
 # --------------------------------------------------------------------- #
-# Threading library.
+# Threading library.  Both the POSIX shim and the current Windows
+# implementation use the pthread-compatible API.
 # --------------------------------------------------------------------- #
 
-if(WEPOLL_EX_PLATFORM_POSIX AND WEPOLL_EX_USE_PTHREADS)
-    find_package(Threads REQUIRED)
-    set(WEPOLL_EX_THREAD_LIB Threads::Threads)
-endif()
-
-if(WEPOLL_EX_PLATFORM_WINDOWS)
-    set(WEPOLL_EX_THREAD_LIB)
+find_package(Threads REQUIRED)
+if(NOT CMAKE_USE_PTHREADS_INIT)
+    message(FATAL_ERROR
+        "The current implementation requires a pthread-compatible Threads package")
 endif()
 
 # --------------------------------------------------------------------- #
@@ -71,9 +86,9 @@ set(WEPOLL_EX_HEADERS
 # Compile definitions and flags.
 # --------------------------------------------------------------------- #
 
-add_library(wepoll_ex_compile_defs INTERFACE)
+set(WEPOLL_EX_PLATFORM_DEFINITIONS)
 if(WEPOLL_EX_PLATFORM_WINDOWS)
-    target_compile_definitions(wepoll_ex_compile_defs INTERFACE
+    list(APPEND WEPOLL_EX_PLATFORM_DEFINITIONS
         _WIN32_WINNT=0x0602  # Win8 — required for AFD poll bits
         WIN32_LEAN_AND_MEAN
         _CRT_SECURE_NO_WARNINGS)
@@ -93,11 +108,12 @@ if(WEPOLL_EX_BUILD_SHARED)
         C_VISIBILITY_PRESET hidden)
     target_include_directories(wepoll_ex_shared
         PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-                $<INSTALL_INTERFACE:include>
+                $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    target_compile_definitions(wepoll_ex_shared PRIVATE WEPOLL_EX_BUILDING)
-    target_link_libraries(wepoll_ex_shared
-        PRIVATE wepoll_ex_compile_defs ${WEPOLL_EX_THREAD_LIB})
+    target_compile_definitions(wepoll_ex_shared PRIVATE
+        WEPOLL_EX_BUILDING
+        ${WEPOLL_EX_PLATFORM_DEFINITIONS})
+    target_link_libraries(wepoll_ex_shared PRIVATE Threads::Threads)
     if(WEPOLL_EX_PLATFORM_WINDOWS)
         target_link_libraries(wepoll_ex_shared PRIVATE ws2_32 ntdll)
     endif()
@@ -114,15 +130,14 @@ if(WEPOLL_EX_BUILD_STATIC)
         POSITION_INDEPENDENT_CODE ON)
     target_include_directories(wepoll_ex_static
         PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-                $<INSTALL_INTERFACE:include>
+                $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(wepoll_ex_static
         PUBLIC  WEPOLL_EX_STATIC
-        PRIVATE wepoll_ex_compile_defs)
-    target_link_libraries(wepoll_ex_static
-        PRIVATE wepoll_ex_compile_defs ${WEPOLL_EX_THREAD_LIB})
+        PRIVATE ${WEPOLL_EX_PLATFORM_DEFINITIONS})
+    target_link_libraries(wepoll_ex_static PRIVATE Threads::Threads)
     if(WEPOLL_EX_PLATFORM_WINDOWS)
-        target_link_libraries(wepoll_ex_static PUBLIC ws2_32 ntdll)
+        target_link_libraries(wepoll_ex_static PRIVATE ws2_32 ntdll)
     endif()
 endif()
 
@@ -137,25 +152,26 @@ endif()
 # Tests.
 # --------------------------------------------------------------------- #
 
-if(WEPOLL_EX_BUILD_TESTS)
+if(WEPOLL_EX_BUILD_TESTS AND WEPOLL_EX_PLATFORM_POSIX)
     enable_testing()
     add_subdirectory(tests)
+elseif(WEPOLL_EX_BUILD_TESTS)
+    message(STATUS "Skipping tests: the current test sources require POSIX APIs")
 endif()
 
 # --------------------------------------------------------------------- #
 # Benchmarks.
 # --------------------------------------------------------------------- #
 
-if(WEPOLL_EX_BUILD_BENCH)
+if(WEPOLL_EX_BUILD_BENCH AND WEPOLL_EX_PLATFORM_POSIX)
     add_subdirectory(bench)
+elseif(WEPOLL_EX_BUILD_BENCH)
+    message(STATUS "Skipping benchmark: bench_latency requires POSIX APIs")
 endif()
 
 # --------------------------------------------------------------------- #
 # Install.
 # --------------------------------------------------------------------- #
-
-include(GNUInstallDirs)
-include(CMakePackageConfigHelpers)
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
@@ -178,6 +194,12 @@ install(EXPORT wepoll_exTargets
     FILE wepoll_exTargets.cmake
     NAMESPACE wepoll_ex::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/wepoll_ex)
+
+if(WEPOLL_EX_BUILD_STATIC)
+    set(WEPOLL_EX_PACKAGE_NEEDS_THREADS 1)
+else()
+    set(WEPOLL_EX_PACKAGE_NEEDS_THREADS 0)
+endif()
 
 configure_package_config_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/wepoll_exConfig.cmake.in

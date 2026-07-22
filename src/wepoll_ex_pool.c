@@ -1,20 +1,18 @@
 /*
  * wepoll_ex_pool.c — AFD buffer pool + MPSC lock-free ready queue.
  *
- * The AFD buffer pool is a LIFO stack of pre-allocated buffers.
- * Producers (epoll_ctl ADD path, IOCP completion handler) pop a
- * buffer in O(1) via an atomic exchange on the stack head;
- * consumers (cleanup paths) push back the same way.
+ * The AFD buffer pool is a mutex-protected LIFO stack of pre-allocated
+ * buffers.  The small critical section avoids the ABA/reclamation
+ * hazards of an untagged Treiber stack.
  *
- * The ready queue is a Michael-Scott-style MPSC queue.  Producers
- * append via exchange on the tail.  The single consumer (epoll_wait
- * caller) snaps head->next, walks the chain up to maxevents nodes,
- * and repositions the head to the last consumed node, which becomes
- * the new sentinel.
+ * The ready queue uses the intrusive single-consumer MPSC algorithm
+ * where producers exchange a head pointer and then publish through the
+ * predecessor's next link.  The consumer injects a sentinel when it
+ * reaches the last item, so a returned node is never still writable by
+ * a producer and can be reclaimed immediately.
  *
- * Both data structures are wait-free for the producer side and
- * O(n) for the consumer (n = number of events drained).  No
- * pthread_mutex anywhere in the hot path.
+ * Queue producers remain lock-free.  Draining is O(n), where n is the
+ * number of events returned.
  */
 #include "wepoll_ex_internal.h"
 
@@ -25,17 +23,62 @@
 /* AFD buffer pool — LIFO stack of pre-allocated buffers.              */
 /* --------------------------------------------------------------------- */
 
-typedef struct ep_pool_hdr {
-    ep_afd_pool_t *owner;
-} ep_pool_hdr_t;
-
-static inline void *hdr_to_buf(ep_pool_hdr_t *h) { return (char *)h + sizeof(*h); }
-static inline ep_pool_hdr_t *buf_to_hdr(void *b) { return (ep_pool_hdr_t *)((char *)b - sizeof(ep_pool_hdr_t)); }
-
 typedef struct ep_pool_entry {
-    ep_pool_hdr_t        hdr;
     struct ep_pool_entry *next;
+    struct ep_pool_entry *all_next;
+    ep_afd_pool_t        *owner;
+    uint64_t              magic;
+    int                   in_pool;
+    max_align_t           alignment;
+    unsigned char         data[];
 } ep_pool_entry_t;
+
+#define EP_POOL_ENTRY_MAGIC UINT64_C(0x4550504f4f4c4558)
+
+static void *ep_pool_entry_buf(ep_pool_entry_t *entry)
+{
+    return entry->data;
+}
+
+static ep_pool_entry_t *ep_pool_buf_entry(void *buf)
+{
+    return (ep_pool_entry_t *)((unsigned char *)buf -
+                               offsetof(ep_pool_entry_t, data));
+}
+
+static ep_pool_entry_t *ep_pool_entry_alloc(ep_afd_pool_t *p, int in_pool)
+{
+    const size_t header_size = offsetof(ep_pool_entry_t, data);
+    if (p->buf_size > SIZE_MAX - header_size) {
+        ep_set_errno(ENOMEM);
+        return NULL;
+    }
+
+    ep_pool_entry_t *entry =
+        (ep_pool_entry_t *)malloc(header_size + p->buf_size);
+    if (entry == NULL) {
+        ep_set_errno(ENOMEM);
+        return NULL;
+    }
+
+    entry->next = NULL;
+    entry->all_next = NULL;
+    entry->owner = p;
+    entry->magic = EP_POOL_ENTRY_MAGIC;
+    entry->in_pool = in_pool;
+    return entry;
+}
+
+static void ep_pool_entries_free(ep_pool_entry_t *entry)
+{
+    while (entry != NULL) {
+        ep_pool_entry_t *next = entry->all_next;
+        entry->magic = 0;
+        entry->owner = NULL;
+        free(entry);
+        entry = next;
+    }
+}
 
 int ep_afd_pool_init(ep_afd_pool_t *p, size_t buf_size, size_t capacity)
 {
@@ -43,244 +86,288 @@ int ep_afd_pool_init(ep_afd_pool_t *p, size_t buf_size, size_t capacity)
         ep_set_errno(EINVAL);
         return -1;
     }
-    atomic_store(&p->stack, (void *)NULL);
+
+    memset(p, 0, sizeof(*p));
+    int rc = pthread_mutex_init(&p->lock, NULL);
+    if (rc != 0) {
+        ep_set_errno(rc);
+        return -1;
+    }
+
     p->buf_size = buf_size;
     p->capacity = capacity;
-    atomic_store(&p->in_use, (size_t)0);
-    atomic_store(&p->peak, (size_t)0);
+    atomic_init(&p->in_use, 0);
+    atomic_init(&p->peak, 0);
+    p->initialized = 1;
 
     for (size_t i = 0; i < capacity; i++) {
-        ep_pool_entry_t *e = (ep_pool_entry_t *)
-            malloc(sizeof(*e) + buf_size);
-        if (e == NULL) {
-            ep_afd_pool_destroy(p);
-            ep_set_errno(ENOMEM);
+        ep_pool_entry_t *entry = ep_pool_entry_alloc(p, 1);
+        if (entry == NULL) {
+            ep_pool_entries_free((ep_pool_entry_t *)p->all_entries);
+            p->stack = NULL;
+            p->all_entries = NULL;
+            p->allocated = 0;
+            p->initialized = 0;
+            pthread_mutex_destroy(&p->lock);
             return -1;
         }
-        e->hdr.owner = p;
-        e->next = (ep_pool_entry_t *)atomic_load(&p->stack);
-        atomic_store(&p->stack, (void *)e);
+
+        entry->next = (ep_pool_entry_t *)p->stack;
+        p->stack = entry;
+        entry->all_next = (ep_pool_entry_t *)p->all_entries;
+        p->all_entries = entry;
+        p->allocated++;
     }
     return 0;
 }
 
 void ep_afd_pool_destroy(ep_afd_pool_t *p)
 {
-    if (p == NULL) return;
-    ep_pool_entry_t *e = (ep_pool_entry_t *)atomic_exchange(&p->stack, (void *)NULL);
-    while (e) {
-        ep_pool_entry_t *next = e->next;
-        free(e);
-        e = next;
+    if (p == NULL || !p->initialized) return;
+
+    int rc = pthread_mutex_lock(&p->lock);
+    if (rc != 0) {
+        ep_set_errno(rc);
+        return;
     }
+
+    if (atomic_load_explicit(&p->in_use, memory_order_relaxed) != 0) {
+        pthread_mutex_unlock(&p->lock);
+        ep_set_errno(EBUSY);
+        return;
+    }
+
+    ep_pool_entry_t *entries = (ep_pool_entry_t *)p->all_entries;
+    p->stack = NULL;
+    p->all_entries = NULL;
+    p->allocated = 0;
+    p->initialized = 0;
+    pthread_mutex_unlock(&p->lock);
+    pthread_mutex_destroy(&p->lock);
+
+    ep_pool_entries_free(entries);
 }
 
 void *ep_afd_pool_take(ep_afd_pool_t *p)
 {
-    if (p == NULL) {
+    if (p == NULL || !p->initialized) {
         ep_set_errno(EFAULT);
         return NULL;
     }
-    for (;;) {
-        ep_pool_entry_t *e = (ep_pool_entry_t *)atomic_load(&p->stack);
-        if (e == NULL) {
-            ep_pool_entry_t *fresh = (ep_pool_entry_t *)
-                malloc(sizeof(*fresh) + p->buf_size);
-            if (fresh == NULL) {
-                ep_set_errno(ENOMEM);
-                return NULL;
-            }
-            fresh->hdr.owner = p;
-            return hdr_to_buf(&fresh->hdr);
-        }
-        if (atomic_compare_exchange_weak(&p->stack,
-                (void **)&e, (void *)e->next)) {
-            size_t now = atomic_fetch_add(&p->in_use, 1) + 1;
-            size_t peak = atomic_load(&p->peak);
-            while (now > peak &&
-                   !atomic_compare_exchange_weak(&p->peak, &peak, now)) {
-            }
-            return hdr_to_buf(&e->hdr);
-        }
+
+    int rc = pthread_mutex_lock(&p->lock);
+    if (rc != 0) {
+        ep_set_errno(rc);
+        return NULL;
     }
+
+    if (!p->initialized) {
+        pthread_mutex_unlock(&p->lock);
+        ep_set_errno(EFAULT);
+        return NULL;
+    }
+
+    ep_pool_entry_t *entry = (ep_pool_entry_t *)p->stack;
+    if (entry != NULL) {
+        p->stack = entry->next;
+    } else {
+        entry = ep_pool_entry_alloc(p, 0);
+        if (entry == NULL) {
+            pthread_mutex_unlock(&p->lock);
+            return NULL;
+        }
+        entry->all_next = (ep_pool_entry_t *)p->all_entries;
+        p->all_entries = entry;
+        p->allocated++;
+    }
+
+    entry->next = NULL;
+    entry->in_pool = 0;
+
+    size_t now = atomic_load_explicit(&p->in_use, memory_order_relaxed) + 1;
+    atomic_store_explicit(&p->in_use, now, memory_order_relaxed);
+    size_t peak = atomic_load_explicit(&p->peak, memory_order_relaxed);
+    if (now > peak) {
+        atomic_store_explicit(&p->peak, now, memory_order_relaxed);
+    }
+
+    pthread_mutex_unlock(&p->lock);
+    return ep_pool_entry_buf(entry);
 }
 
 void ep_afd_pool_give(ep_afd_pool_t *p, void *buf)
 {
     if (p == NULL || buf == NULL) return;
-    ep_pool_hdr_t *h = buf_to_hdr(buf);
-    if (h->owner != p) {
-        if (h->owner != NULL) ep_afd_pool_give(h->owner, buf);
+
+    ep_pool_entry_t *entry = ep_pool_buf_entry(buf);
+    if (entry->magic != EP_POOL_ENTRY_MAGIC || entry->owner != p ||
+        !p->initialized) {
+        ep_set_errno(EINVAL);
         return;
     }
-    ep_pool_entry_t *e = (ep_pool_entry_t *)h;
-    for (;;) {
-        ep_pool_entry_t *top = (ep_pool_entry_t *)atomic_load(&p->stack);
-        e->next = top;
-        if (atomic_compare_exchange_weak(&p->stack,
-                (void **)&top, (void *)e)) {
-            break;
-        }
+
+    int rc = pthread_mutex_lock(&p->lock);
+    if (rc != 0) {
+        ep_set_errno(rc);
+        return;
     }
-    atomic_fetch_sub(&p->in_use, 1);
+
+    if (!p->initialized || entry->in_pool) {
+        pthread_mutex_unlock(&p->lock);
+        ep_set_errno(EINVAL);
+        return;
+    }
+
+    size_t in_use = atomic_load_explicit(&p->in_use, memory_order_relaxed);
+    entry->in_pool = 1;
+    entry->next = (ep_pool_entry_t *)p->stack;
+    p->stack = entry;
+    if (in_use > 0) {
+        atomic_store_explicit(&p->in_use, in_use - 1,
+                              memory_order_relaxed);
+    } else {
+        ep_set_errno(EINVAL);
+    }
+
+    pthread_mutex_unlock(&p->lock);
 }
 
 /* --------------------------------------------------------------------- */
-/* MPSC lock-free ready queue — Michael-Scott variant.                */
+/* Intrusive MPSC ready queue with a single consumer.                  */
 /*                                                                     */
-/* Invariant: head and tail always point to a node (never NULL).  The  */
-/* queue is born with a sentinel "stub" node.  Push appends after the  */
-/* tail.  Drain snaps head->next (the first real node), walks the      */
-/* chain up to maxevents nodes, and repositions the head to the last   */
-/* consumed node, which becomes the new sentinel.                     */
-/*                                                                     */
-/* Producer side: wait-free via atomic_exchange on tail + atomic_store */
-/* on prev->next.  Consumer side: single-threaded, no CAS needed.     */
-/*                                                                     */
-/* The classic Michael-Scott "pub-then-link" race (producer has done  */
-/* exchange(&tail, X) but hasn't yet done store(&prev->next, X)) is   */
-/* handled by a brief spin in the drain path.                         */
+/* Producers exchange `head`, then publish the new node through the   */
+/* previous head's `next` field.  When the consumer reaches the last  */
+/* visible node it appends the permanent stub.  That hand-off ensures */
+/* the returned node is no longer a possible producer predecessor, so */
+/* it can be returned to the pool immediately.                         */
 /* --------------------------------------------------------------------- */
+
+static void ep_ready_link(ep_ready_queue_t *q, ep_ready_node_t *node,
+                          int account)
+{
+    atomic_store_explicit(&node->next, (ep_ready_node_t *)NULL,
+                          memory_order_relaxed);
+    if (account) {
+        atomic_fetch_add_explicit(&q->queued, 1, memory_order_relaxed);
+    }
+
+    ep_ready_node_t *prev =
+        atomic_exchange_explicit(&q->head, node, memory_order_acq_rel);
+    atomic_store_explicit(&prev->next, node, memory_order_release);
+}
+
+static void ep_ready_account_pop(ep_ready_queue_t *q)
+{
+    size_t queued = atomic_load_explicit(&q->queued, memory_order_relaxed);
+    while (queued > 0 &&
+           !atomic_compare_exchange_weak_explicit(
+               &q->queued, &queued, queued - 1,
+               memory_order_relaxed, memory_order_relaxed)) {
+    }
+}
+
+static ep_ready_node_t *ep_ready_pop_one(ep_ready_queue_t *q)
+{
+    ep_ready_node_t *tail = q->tail;
+    ep_ready_node_t *next =
+        atomic_load_explicit(&tail->next, memory_order_acquire);
+
+    if (tail == q->stub) {
+        if (next == NULL) return NULL;
+        q->tail = next;
+        tail = next;
+        next = atomic_load_explicit(&tail->next, memory_order_acquire);
+    }
+
+    if (next != NULL) {
+        q->tail = next;
+        atomic_store_explicit(&tail->next, (ep_ready_node_t *)NULL,
+                              memory_order_relaxed);
+        ep_ready_account_pop(q);
+        return tail;
+    }
+
+    ep_ready_node_t *head =
+        atomic_load_explicit(&q->head, memory_order_acquire);
+    if (tail != head) {
+        /* A producer exchanged head but has not linked `tail->next` yet. */
+        return NULL;
+    }
+
+    ep_ready_link(q, q->stub, 0);
+    next = atomic_load_explicit(&tail->next, memory_order_acquire);
+    if (next == NULL) return NULL;
+
+    q->tail = next;
+    atomic_store_explicit(&tail->next, (ep_ready_node_t *)NULL,
+                          memory_order_relaxed);
+    ep_ready_account_pop(q);
+    return tail;
+}
 
 void ep_ready_init(ep_ready_queue_t *q)
 {
     if (q == NULL) return;
-    /* Allocate the stub.  Lives for the lifetime of the queue. */
+
+    memset(q, 0, sizeof(*q));
     q->stub = (ep_ready_node_t *)calloc(1, sizeof(*q->stub));
     if (q->stub == NULL) {
         ep_set_errno(ENOMEM);
         return;
     }
-    atomic_store(&q->stub->next, (ep_ready_node_t *)NULL);
-    /* head ALWAYS points to the stub — it's the permanent sentinel.
-     * Drain reads stub->next to find the first real node. */
-    atomic_store(&q->head, q->stub);
-    atomic_store(&q->tail, q->stub);
-    atomic_store(&q->free_list, (ep_ready_node_t *)NULL);
+
+    atomic_init(&q->stub->next, (ep_ready_node_t *)NULL);
+    atomic_init(&q->head, q->stub);
+    q->tail = q->stub;
+    atomic_init(&q->queued, 0);
+    q->initialized = 1;
 }
 
 void ep_ready_destroy(ep_ready_queue_t *q)
 {
-    if (q == NULL) return;
-    /* Drain everything (caller should have done this already). */
-    for (;;) {
-        ep_ready_node_t *n = ep_ready_drain(q, INT_MAX);
-        if (n == NULL) break;
-        while (n) {
-            ep_ready_node_t *next = atomic_load(&n->next);
-            /* Don't free here — caller owns the pool.  The stub
-             * is freed below. */
-            n = next;
-        }
+    if (q == NULL || !q->initialized) return;
+
+    /* Producers must be quiesced and the caller must reclaim every real
+     * node before destroy.  Silently detaching caller-owned nodes here
+     * would make it impossible to return them to their backing pool. */
+    if (atomic_load_explicit(&q->queued, memory_order_relaxed) != 0) {
+        ep_set_errno(EBUSY);
+        return;
     }
-    if (q->stub) {
-        free(q->stub);
-        q->stub = NULL;
-    }
-    /* Free any nodes on the free_list (legacy field — not used
-     * in this revision, but clean up just in case). */
-    ep_ready_node_t *fl = atomic_exchange(&q->free_list,
-                                          (ep_ready_node_t *)NULL);
-    while (fl) {
-        ep_ready_node_t *next = atomic_load(&fl->next);
-        free(fl);
-        fl = next;
-    }
+
+    q->initialized = 0;
+    atomic_store_explicit(&q->head, (ep_ready_node_t *)NULL,
+                          memory_order_relaxed);
+    q->tail = NULL;
+    atomic_store_explicit(&q->queued, 0, memory_order_relaxed);
+    free(q->stub);
+    q->stub = NULL;
 }
 
 void ep_ready_push(ep_ready_queue_t *q, ep_ready_node_t *node)
 {
-    if (q == NULL || node == NULL) return;
-    atomic_store(&node->next, (ep_ready_node_t *)NULL);
-
-    /* MPSC append: exchange tail, then link ourselves after the
-     * previous tail.  This is the classic Michael-Scott dance. */
-    ep_ready_node_t *prev = atomic_exchange(&q->tail, node);
-    atomic_store(&prev->next, node);
+    if (q == NULL || node == NULL || !q->initialized) return;
+    ep_ready_link(q, node, 1);
 }
 
 ep_ready_node_t *ep_ready_drain(ep_ready_queue_t *q, int maxevents)
 {
-    if (q == NULL || maxevents <= 0) return NULL;
+    if (q == NULL || maxevents <= 0 || !q->initialized) return NULL;
 
-    /* Standard Michael-Scott dequeue, repeated up to maxevents
-     * times.  Each iteration:
-     *   1. Read stub->next.
-     *   2. If NULL, queue is empty (or producer mid-publish —
-     *      spin briefly).
-     *   3. Read first->next.  If NULL and first == tail, a
-     *      producer may be mid-publish to first->next — spin
-     *      until either first->next becomes non-NULL or we
-     *      confirm first == tail.
-     *   4. CAS stub->next from `first` to `first->next`.
-     *   5. The dequeued node is `first`.  Link it into our
-     *      output chain.
-     *
-     * This is the standard MS-queue dequeue, just batched.  Each
-     * dequeue is atomic, so we never orphan a producer's pending
-     * push. */
-    ep_ready_node_t *stub = q->stub;
     ep_ready_node_t *out_head = NULL;
     ep_ready_node_t *out_tail = NULL;
-    int count = 0;
+    for (int count = 0; count < maxevents; count++) {
+        ep_ready_node_t *node = ep_ready_pop_one(q);
+        if (node == NULL) break;
 
-    while (count < maxevents) {
-        ep_ready_node_t *first = atomic_load(&stub->next);
-        if (first == NULL) {
-            /* Queue empty. */
-            break;
-        }
-
-        /* Read first->next, spinning if a producer is mid-publish.
-         * A producer that did exchange(&tail, X) getting back
-         * `first` will store(first->next, X).  We must wait for
-         * that store before we can dequeue `first` — otherwise
-         * the producer's store goes to freed memory. */
-        ep_ready_node_t *next = atomic_load(&first->next);
-        while (next == NULL) {
-            if (first == atomic_load(&q->tail)) {
-                /* first == tail AND first->next == NULL: queue
-                 * really ends here.  No producer is mid-publish.
-                 * We can dequeue `first` — but there's nothing
-                 * after it, so the queue becomes empty. */
-                break;
-            }
-            /* Producer is mid-publish to first->next.  Spin. */
-#ifdef _WIN32
-            YieldProcessor();
-#else
-            __asm__ __volatile__("pause" ::: "memory");
-#endif
-            next = atomic_load(&first->next);
-        }
-
-        /* CAS stub->next from `first` to `next`. */
-        if (!atomic_compare_exchange_strong(&stub->next, &first, next)) {
-            /* CAS failed — a producer appended between our read
-             * and our CAS.  Retry this iteration. */
-            continue;
-        }
-
-        /* If `next` is NULL (queue became empty), advance tail
-         * from `first` to `stub` so future producers append
-         * after the stub. */
-        if (next == NULL) {
-            ep_ready_node_t *expected_tail = first;
-            atomic_compare_exchange_strong(&q->tail, &expected_tail, stub);
-        }
-
-        /* Detach `first` from the queue. */
-        atomic_store(&first->next, (ep_ready_node_t *)NULL);
-
-        /* Append `first` to our output chain. */
         if (out_tail == NULL) {
-            out_head = first;
-            out_tail = first;
+            out_head = node;
+            out_tail = node;
         } else {
-            atomic_store(&out_tail->next, first);
-            out_tail = first;
+            atomic_store_explicit(&out_tail->next, node,
+                                  memory_order_relaxed);
+            out_tail = node;
         }
-        count++;
     }
 
     return out_head;
@@ -299,7 +386,7 @@ ep_ready_node_t *ep_ready_node_alloc(ep_port_t *port)
     void *buf = ep_afd_pool_take(&port->ready_node_pool);
     if (buf == NULL) return NULL;
     ep_ready_node_t *n = (ep_ready_node_t *)buf;
-    atomic_store(&n->next, (ep_ready_node_t *)NULL);
+    atomic_init(&n->next, (ep_ready_node_t *)NULL);
     n->sock      = NULL;
     n->events    = 0;
     n->flags     = 0;
