@@ -105,3 +105,6 @@ supported; it verifies the adapter against the exact generated ABI.
 
 Use `/path/to/msys64/usr/bin/bash.exe` with `/mingw64/bin:/usr/bin` first in
 `PATH`, and keep temporary nginx extraction/build state outside the repository.
+The addon link explicitly selects static winpthreads; verify the resulting
+`nginx.exe` does not import `libwinpthread-1.dll` before testing with a clean
+Windows `PATH`.

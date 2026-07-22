@@ -104,6 +104,17 @@ if(NOT WEPOLL_EX_CONSUMER_EXECUTABLES)
     message(FATAL_ERROR "Package consumer target manifest is empty")
 endif()
 
+if(WEPOLL_EX_CHECK_WINPTHREAD)
+    if(NOT DEFINED WEPOLL_EX_OBJDUMP OR
+       "${WEPOLL_EX_OBJDUMP}" STREQUAL "")
+        message(FATAL_ERROR
+            "WEPOLL_EX_OBJDUMP is required for the MinGW dependency check")
+    endif()
+    foreach(WEPOLL_EX_BINARY IN LISTS WEPOLL_EX_CONSUMER_EXECUTABLES)
+        include("${WEPOLL_EX_SOURCE_DIR}/tests/check_no_winpthread.cmake")
+    endforeach()
+endif()
+
 if(WIN32)
     set(_runtime_path
         "PATH=${WEPOLL_EX_INSTALL_PREFIX}/bin;$ENV{PATH}")

@@ -89,5 +89,7 @@ and the installed-package consumer. Shared, static, and combined MinGW
 configurations are exercised. The nginx 1.31.3 adapter also passes strict addon
 compilation, full minimal and HTTP Win32 links, configuration bounds checks,
 `nginx -t`, 100 loopback HTTP requests across a worker reload, and graceful
-quit using `use wepoll`. These results still do not constitute a supported
-Windows/compiler matrix.
+quit using `use wepoll`. MinGW final links explicitly select static
+winpthreads, and dependency checks reject `libwinpthread-1.dll` in the library
+test executable, and installed-package consumers. These results still do not
+constitute a supported Windows/compiler matrix.

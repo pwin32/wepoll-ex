@@ -93,8 +93,10 @@ For MinGW, use the toolchain shell explicitly:
 
 The POSIX baseline passes the API, pool, and package-consumer tests. The MinGW
 baseline passes the Windows API and package-consumer tests with shared and
-static libraries, including a shared-only configuration. Record the exact
-command, compiler, and OS for new results.
+static libraries, including a shared-only configuration. MinGW final binaries
+select the static winpthreads archive and CTest rejects an accidental
+`libwinpthread-1.dll` dependency. Record the exact command, compiler, and OS
+for new results.
 
 ## Credits and license
 

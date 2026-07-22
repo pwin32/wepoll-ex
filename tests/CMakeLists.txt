@@ -32,6 +32,26 @@ else()
 
     add_test(NAME wepoll_ex_windows_api COMMAND test_wepoll_ex_windows)
     set_tests_properties(wepoll_ex_windows_api PROPERTIES TIMEOUT 120)
+
+    if(MINGW)
+        add_test(NAME wepoll_ex_windows_no_winpthread
+            COMMAND ${CMAKE_COMMAND}
+                "-DWEPOLL_EX_OBJDUMP=${CMAKE_OBJDUMP}"
+                "-DWEPOLL_EX_BINARY=$<TARGET_FILE:test_wepoll_ex_windows>"
+                -P ${PROJECT_SOURCE_DIR}/tests/check_no_winpthread.cmake)
+        set_tests_properties(wepoll_ex_windows_no_winpthread
+            PROPERTIES TIMEOUT 30)
+        if(WEPOLL_EX_BUILD_SHARED)
+            add_test(NAME wepoll_ex_shared_no_winpthread
+                COMMAND ${CMAKE_COMMAND}
+                    "-DWEPOLL_EX_OBJDUMP=${CMAKE_OBJDUMP}"
+                    "-DWEPOLL_EX_BINARY=$<TARGET_FILE:wepoll_ex_shared>"
+                    -P ${PROJECT_SOURCE_DIR}/tests/check_no_winpthread.cmake)
+            set_tests_properties(wepoll_ex_shared_no_winpthread
+                PROPERTIES TIMEOUT 30)
+        endif()
+    endif()
+
     if(WEPOLL_EX_BUILD_SHARED AND NOT WEPOLL_EX_BUILD_STATIC)
         set_tests_properties(wepoll_ex_windows_api PROPERTIES
             ENVIRONMENT
@@ -54,6 +74,8 @@ add_test(NAME wepoll_ex_package_consumer
         -DWEPOLL_EX_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
         -DWEPOLL_EX_GENERATOR_INSTANCE=${CMAKE_GENERATOR_INSTANCE}
         -DWEPOLL_EX_C_COMPILER=${CMAKE_C_COMPILER}
+        -DWEPOLL_EX_OBJDUMP=${CMAKE_OBJDUMP}
+        -DWEPOLL_EX_CHECK_WINPTHREAD=${MINGW}
         -DWEPOLL_EX_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
         -DWEPOLL_EX_EXPECT_SHARED=${WEPOLL_EX_BUILD_SHARED}
         -DWEPOLL_EX_EXPECT_STATIC=${WEPOLL_EX_BUILD_STATIC}

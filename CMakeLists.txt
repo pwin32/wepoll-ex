@@ -59,6 +59,28 @@ if(NOT CMAKE_USE_PTHREADS_INIT)
         "The current implementation requires a pthread-compatible Threads package")
 endif()
 
+# MinGW's POSIX thread model adds -lpthread to every final link command.  That
+# normally selects libwinpthread-1.dll, which is not present on a clean Windows
+# installation.  Keep the runtime self-contained by selecting the static
+# archive explicitly.  The link items are deliberately expressed as
+# toolchain-relative linker flags instead of an absolute archive path so
+# installed static targets remain usable with another MinGW installation.
+set(WEPOLL_EX_WINPTHREAD_LINK_LIBS)
+if(MINGW)
+    execute_process(
+        COMMAND "${CMAKE_C_COMPILER}" -print-file-name=libwinpthread.a
+        OUTPUT_VARIABLE _wepoll_ex_winpthread_archive
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _wepoll_ex_winpthread_result)
+    if(NOT _wepoll_ex_winpthread_result EQUAL 0 OR
+       NOT EXISTS "${_wepoll_ex_winpthread_archive}")
+        message(FATAL_ERROR
+            "MinGW static pthread runtime not found; expected libwinpthread.a")
+    endif()
+    set(WEPOLL_EX_WINPTHREAD_LINK_LIBS
+        "-Wl,-Bstatic" "-lwinpthread" "-Wl,-Bdynamic")
+endif()
+
 # --------------------------------------------------------------------- #
 # Library sources.
 # --------------------------------------------------------------------- #
@@ -157,7 +179,8 @@ if(WEPOLL_EX_BUILD_SHARED)
         ${WEPOLL_EX_PLATFORM_DEFINITIONS})
     target_link_libraries(wepoll_ex_shared PRIVATE Threads::Threads)
     if(WEPOLL_EX_PLATFORM_WINDOWS)
-        target_link_libraries(wepoll_ex_shared PRIVATE ws2_32 ntdll)
+        target_link_libraries(wepoll_ex_shared PRIVATE
+            ws2_32 ntdll ${WEPOLL_EX_WINPTHREAD_LINK_LIBS})
     endif()
 endif()
 
@@ -180,6 +203,13 @@ if(WEPOLL_EX_BUILD_STATIC)
     target_link_libraries(wepoll_ex_static PRIVATE Threads::Threads)
     if(WEPOLL_EX_PLATFORM_WINDOWS)
         target_link_libraries(wepoll_ex_static PRIVATE ws2_32 ntdll)
+    endif()
+    if(WEPOLL_EX_WINPTHREAD_LINK_LIBS)
+        # A static archive has no link step of its own.  Propagate the
+        # explicit archive selection to every final executable that consumes
+        # the exported static target.
+        target_link_libraries(wepoll_ex_static INTERFACE
+            ${WEPOLL_EX_WINPTHREAD_LINK_LIBS})
     endif()
 endif()
 

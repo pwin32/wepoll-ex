@@ -30,6 +30,9 @@ ngx_module_deps="$ngx_wepoll_addon/ngx_wepoll_module.h \
                  $ngx_wepoll_root/include/wepoll_ex.h \
                  $ngx_wepoll_root/include/wepoll_ex_export.h \
                  $ngx_wepoll_root/src/wepoll_ex_internal.h"
-ngx_module_libs="-lntdll -lws2_32"
+# MinGW's POSIX thread model injects -lpthread into the final link.  Force the
+# static archive here so a deployed nginx.exe does not require
+# libwinpthread-1.dll on PATH.
+ngx_module_libs="-lntdll -lws2_32 -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic"
 
 . auto/module
