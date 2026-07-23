@@ -31,6 +31,7 @@ static int make_pending_port(ep_port_t **port_out, SOCKET *socket_out)
     SOCKET socket_fd = INVALID_SOCKET;
     struct sockaddr_in address;
     epoll_data_t data;
+    epoll_event_ex ignored;
 
     *port_out = NULL;
     *socket_out = INVALID_SOCKET;
@@ -49,6 +50,10 @@ static int make_pending_port(ep_port_t **port_out, SOCKET *socket_out)
 
     memset(&data, 0, sizeof(data));
     if (ep_port_register(port, socket_fd, EPOLLIN, 0, data, NULL) != 0) {
+        goto fail;
+    }
+    memset(&ignored, 0, sizeof(ignored));
+    if (ep_port_wait(port, &ignored, 1, 0, NULL) < 0) {
         goto fail;
     }
 

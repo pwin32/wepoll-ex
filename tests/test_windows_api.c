@@ -505,6 +505,9 @@ static void test_zero_timeout(void)
     tcp_pair_t pair;
     struct epoll_event event;
     struct epoll_event_ex extended;
+    /* Exercise both sides of the basic-wait stack-buffer threshold. */
+    struct epoll_event stack_output[64];
+    struct epoll_event heap_output[65];
     struct timespec zero = { 0, 0 };
     int epfd;
 
@@ -520,12 +523,29 @@ static void test_zero_timeout(void)
         return;
     }
     memset(&event, 0, sizeof(event));
+    memset(stack_output, 0, sizeof(stack_output));
+    memset(heap_output, 0, sizeof(heap_output));
     event.events = EPOLLIN;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
         epoll_wait(epfd, &event, 1, 0) != 0 ||
+        epoll_pwait(epfd, stack_output, 64, 0, NULL) != 0 ||
+        epoll_pwait(epfd, heap_output, 65, 0, NULL) != 0 ||
         epoll_wait_ex(epfd, &extended, 1, 0) != 0 ||
         epoll_pwait2(epfd, &event, 1, &zero, NULL) != 0) {
         FAIL("zero timeout");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    if (send_byte(pair.client) != 0 ||
+        epoll_pwait(epfd, stack_output, 64, 1000, NULL) != 1 ||
+        (stack_output[0].events & EPOLLIN) == 0 ||
+        recv_byte(pair.server) != 0 ||
+        send_byte(pair.client) != 0 ||
+        epoll_pwait(epfd, heap_output, 65, 1000, NULL) != 1 ||
+        (heap_output[0].events & EPOLLIN) == 0 ||
+        recv_byte(pair.server) != 0) {
+        FAIL("wait stack/heap scratch buffers");
         wepoll_close(epfd);
         tcp_pair_close(&pair);
         return;

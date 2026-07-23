@@ -158,6 +158,11 @@ typedef struct _AFD_POLL_INFO {
 #define AFD_POLL_LOCAL_CLOSE       0x0020UL
 #define AFD_POLL_ACCEPT            0x0080UL
 #define AFD_POLL_CONNECT_FAIL      0x0100UL
+#define AFD_POLL_ALL_EVENTS        (AFD_POLL_RECEIVE | \
+                                    AFD_POLL_RECEIVE_EXPEDITED | \
+                                    AFD_POLL_SEND | AFD_POLL_DISCONNECT | \
+                                    AFD_POLL_ABORT | AFD_POLL_LOCAL_CLOSE | \
+                                    AFD_POLL_ACCEPT | AFD_POLL_CONNECT_FAIL)
 
 /* IoControlCode for AFD_POLL.  Reverse-engineered; matches Win8+. */
 #define IOCTL_AFD_POLL  0x00012024
@@ -192,6 +197,19 @@ typedef NTSTATUS (NTAPI *PNtCancelIoFileEx)(
     HANDLE FileHandle,
     PIO_STATUS_BLOCK IoRequestToCancel,
     PIO_STATUS_BLOCK IoStatusBlock);
+
+#ifdef _WIN32
+/* Indirect the completion dequeue primitive so fault-injection tests can
+ * model a timer-granularity WAIT_TIMEOUT without intercepting kernel32.  The
+ * field is internal and initialized to the native API for every port. */
+typedef BOOL (WINAPI *PGetQueuedCompletionStatusEx)(
+    HANDLE CompletionPort,
+    OVERLAPPED_ENTRY *CompletionPortEntries,
+    ULONG Count,
+    PULONG NumEntriesRemoved,
+    DWORD Milliseconds,
+    BOOL Alertable);
+#endif
 
 /* ----------------------------------------------------------------------- */
 /* ep_sock_t — per-fd state.                                               */
@@ -254,6 +272,10 @@ struct ep_sock {
     /* Pending AFD events (events the kernel reported but we have not yet
      * delivered to user via epoll_wait). */
     uint32_t pending_events;
+    /* Exact AFD interest mask used by the in-flight/last submission.  MOD
+     * uses it to avoid cancelling a request whose mask already covers the
+     * new interests. */
+    uint32_t submitted_afd_events;
 
     /* Poll lifecycle.  The IO_STATUS_BLOCK is also used as the ApcContext
      * returned in the IOCP packet, so it must remain embedded until the
@@ -367,6 +389,9 @@ struct ep_port {
      * the syscall cost across multiple events. */
     OVERLAPPED_ENTRY *iocp_entries;
     ULONG              iocp_batch_size;
+#ifdef _WIN32
+    PGetQueuedCompletionStatusEx get_queued_completion_status_ex;
+#endif
 
     /* Configuration snapshot. */
     int close_on_exec;
@@ -374,9 +399,12 @@ struct ep_port {
     /* Close/wait coordination.  A closing port cancels all outstanding AFD
      * polls and waits for their IOCP completions before storage is freed. */
     pthread_mutex_t wait_lock;
+    _Atomic int waiter_active;
     _Atomic int closing;
     _Atomic int iocp_closed;
     size_t pending_poll_count;
+    size_t needs_rearm_count;
+    size_t oneshot_fired_count;
     uint64_t next_sock_generation;
 
     /* Atomic generation counter bumped on every ADD/DEL/MOD.  Used by
@@ -439,6 +467,15 @@ int      ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events);
 int      ep_afd_cancel(ep_sock_t *sock);
 uint32_t ep_afd_to_epoll_events(ULONG afd_events);
 uint32_t ep_epoll_to_afd_events(uint32_t epoll_events);
+#ifdef _WIN32
+/* Internal callback form used to test provider-chain resolution without
+ * installing a process- or system-wide Winsock layered service provider. */
+typedef SOCKET (*ep_socket_ioctl_fn)(SOCKET socket, DWORD ioctl,
+                                     int *error_out, void *context);
+SOCKET   ep_socket_get_base_with_ioctl(SOCKET socket,
+                                       ep_socket_ioctl_fn ioctl_fn,
+                                       void *context);
+#endif
 SOCKET   ep_socket_get_base(SOCKET socket);
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 int      ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id);

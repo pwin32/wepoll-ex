@@ -100,6 +100,12 @@ int ep_afd_open(HANDLE iocp, HANDLE *out)
 /* --------------------------------------------------------------------- */
 
 #ifdef _WIN32
+#  ifndef SIO_BSP_HANDLE
+#    define SIO_BSP_HANDLE 0x4800001B
+#  endif
+#  ifndef SIO_BSP_HANDLE_SELECT
+#    define SIO_BSP_HANDLE_SELECT 0x4800001C
+#  endif
 #  ifndef SIO_BSP_HANDLE_POLL
 #    define SIO_BSP_HANDLE_POLL 0x4800001D
 #  endif
@@ -111,10 +117,13 @@ int ep_afd_open(HANDLE iocp, HANDLE *out)
 #    define SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE 0x580000CD
 #  endif
 
-static SOCKET ep_socket_ioctl_handle(SOCKET socket, DWORD ioctl)
+static SOCKET ep_socket_ioctl_handle(SOCKET socket, DWORD ioctl,
+                                     int *error_out, void *context)
 {
     SOCKET result = INVALID_SOCKET;
     DWORD bytes = 0;
+
+    (void)context;
 
     if (WSAIoctl(socket,
                  ioctl,
@@ -124,45 +133,127 @@ static SOCKET ep_socket_ioctl_handle(SOCKET socket, DWORD ioctl)
                  (DWORD)sizeof(result),
                  &bytes,
                  NULL,
-                 NULL) == SOCKET_ERROR)
+                 NULL) == SOCKET_ERROR) {
+        if (error_out != NULL)
+            *error_out = WSAGetLastError();
         return INVALID_SOCKET;
+    }
+
+    /* The BSP-handle ioctls return exactly one SOCKET.  Treat a malformed
+     * provider response as a failed lookup instead of passing an arbitrary
+     * value to AFD. */
+    if (bytes != sizeof(result) || result == INVALID_SOCKET) {
+        if (error_out != NULL)
+            *error_out = WSAEINVAL;
+        return INVALID_SOCKET;
+    }
+
+    if (error_out != NULL)
+        *error_out = 0;
 
     return result;
+}
+#endif
+
+#ifdef _WIN32
+SOCKET ep_socket_get_base_with_ioctl(SOCKET socket,
+                                     ep_socket_ioctl_fn ioctl_fn,
+                                     void *context)
+{
+    SOCKET current = socket;
+    SOCKET visited[32];
+    unsigned int visited_count = 1;
+
+    if (current == INVALID_SOCKET || ioctl_fn == NULL) {
+        ep_set_errno(current == INVALID_SOCKET ? ENOTSOCK : EFAULT);
+        return INVALID_SOCKET;
+    }
+    visited[0] = current;
+
+    /* A finite bound protects against a broken provider returning a cycle.
+     * The visited set catches short cycles immediately and also documents
+     * that each fallback result must be a distinct provider-layer handle. */
+    for (unsigned int depth = 0; depth < 32; depth++) {
+        int base_error = WSAEINVAL;
+        SOCKET base = ioctl_fn(current, SIO_BASE_HANDLE, &base_error,
+                               context);
+        if (base != INVALID_SOCKET)
+            return base;
+
+        if (base_error == WSAENOTSOCK) {
+            ep_set_errno(ENOTSOCK);
+            return INVALID_SOCKET;
+        }
+
+        /* SIO_BASE_HANDLE is documented as bypassing layered service
+         * providers, but a few LSPs intercept or reject it.  Try the
+         * provider-chain handles in order of specificity and accept only a
+         * distinct result.  Once a layer is unwrapped, loop back to
+         * SIO_BASE_HANDLE so multi-layer chains are handled as well. */
+        static const DWORD fallback_ioctls[] = {
+            SIO_BSP_HANDLE_SELECT,
+            SIO_BSP_HANDLE_POLL,
+            SIO_BSP_HANDLE
+        };
+        int advanced = 0;
+        int saw_cycle = 0;
+
+        for (size_t i = 0;
+             i < sizeof(fallback_ioctls) / sizeof(fallback_ioctls[0]); i++) {
+            SOCKET candidate = ioctl_fn(current, fallback_ioctls[i], NULL,
+                                        context);
+            if (candidate == INVALID_SOCKET || candidate == current)
+                continue;
+
+            for (unsigned int j = 0; j < visited_count; j++) {
+                if (visited[j] == candidate) {
+                    /* A provider can return a cyclic SELECT handle while a
+                     * later POLL or generic handle still unwraps the layer.
+                     * Remember the cycle, but exhaust the remaining
+                     * fallbacks before rejecting the chain. */
+                    saw_cycle = 1;
+                    candidate = INVALID_SOCKET;
+                    break;
+                }
+            }
+            if (candidate == INVALID_SOCKET)
+                continue;
+            if (visited_count >= sizeof(visited) / sizeof(visited[0])) {
+                ep_set_errno(ELOOP);
+                return INVALID_SOCKET;
+            }
+
+            visited[visited_count++] = candidate;
+            current = candidate;
+            advanced = 1;
+            break;
+        }
+
+        if (advanced)
+            continue;
+
+        if (saw_cycle) {
+            ep_set_errno(ELOOP);
+            return INVALID_SOCKET;
+        }
+
+        /* Preserve the SIO_BASE_HANDLE error.  The fallback probes are
+         * best-effort and would otherwise overwrite the useful provider
+         * error in the caller's errno. */
+        ep_set_errno(ep_winerr_to_errno((DWORD)base_error));
+        return INVALID_SOCKET;
+    }
+
+    ep_set_errno(ELOOP);
+    return INVALID_SOCKET;
 }
 #endif
 
 SOCKET ep_socket_get_base(SOCKET socket)
 {
 #ifdef _WIN32
-    SOCKET current = socket;
-
-    if (current == INVALID_SOCKET) {
-        ep_set_errno(ENOTSOCK);
-        return INVALID_SOCKET;
-    }
-
-    /* A finite bound protects against a broken provider returning a cycle. */
-    for (unsigned int depth = 0; depth < 32; depth++) {
-        SOCKET base = ep_socket_ioctl_handle(current, SIO_BASE_HANDLE);
-        if (base != INVALID_SOCKET)
-            return base;
-
-        int error = WSAGetLastError();
-        if (error == WSAENOTSOCK) {
-            ep_set_errno(ENOTSOCK);
-            return INVALID_SOCKET;
-        }
-
-        base = ep_socket_ioctl_handle(current, SIO_BSP_HANDLE_POLL);
-        if (base == INVALID_SOCKET || base == current) {
-            ep_set_errno(ep_winerr_to_errno((DWORD)error));
-            return INVALID_SOCKET;
-        }
-        current = base;
-    }
-
-    ep_set_errno(ELOOP);
-    return INVALID_SOCKET;
+    return ep_socket_get_base_with_ioctl(socket, ep_socket_ioctl_handle,
+                                         NULL);
 #else
     return socket;
 #endif
@@ -227,6 +318,7 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
 {
 #ifdef _WIN32
     NTSTATUS status;
+    uint32_t old_submitted_afd_events;
 
     if (sock == NULL || sock->port == NULL || sock->port->afd == NULL ||
         g_ntdll.NtDeviceIoControlFile == NULL) {
@@ -247,9 +339,21 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
         }
     }
 
+#ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+    /* The registration captured the provider base handle under the caller's
+     * DEL-before-closesocket lifetime contract.  Reusing it avoids another
+     * SIO_BASE_HANDLE/LSP traversal on every re-arm. */
+    if (sock->base_socket == INVALID_SOCKET) {
+        ep_set_errno(ENOTSOCK);
+        return -1;
+    }
+#else
+    /* Hardened builds revalidate the provider chain before every request so
+     * native close/reuse cannot attach an old base handle to a new socket. */
     sock->base_socket = ep_socket_get_base(sock->fd);
     if (sock->base_socket == INVALID_SOCKET)
         return -1;
+#endif
 
     AFD_POLL_INFO *info = sock->afd_info;
     memset(info, 0, sizeof(*info));
@@ -265,6 +369,8 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
     /* Publish PENDING before entering the kernel: an immediately satisfied
      * poll can enqueue its completion on another thread before this call
      * returns. */
+    old_submitted_afd_events = sock->submitted_afd_events;
+    sock->submitted_afd_events = afd_events;
     atomic_store(&sock->poll_status, EP_POLL_PENDING);
 
     status = g_ntdll.NtDeviceIoControlFile(
@@ -284,6 +390,7 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
      * which we treat as a normal completion via the IOCP path. */
     if (status != STATUS_SUCCESS && status != STATUS_PENDING) {
         atomic_store(&sock->poll_status, EP_POLL_IDLE);
+        sock->submitted_afd_events = old_submitted_afd_events;
         ep_set_errno(ep_status_to_errno(status));
         return -1;
     }

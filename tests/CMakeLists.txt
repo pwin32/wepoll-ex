@@ -90,6 +90,16 @@ else()
         target_link_libraries(test_wepoll_ex_windows_events PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
+        add_executable(test_wepoll_ex_windows_compat
+            test_windows_compat.c)
+        target_include_directories(test_wepoll_ex_windows_compat PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(test_wepoll_ex_windows_compat PRIVATE
+            _WIN32_WINNT=0x0602
+            WIN32_LEAN_AND_MEAN)
+        target_link_libraries(test_wepoll_ex_windows_compat PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+
         foreach(_lifecycle_mode IN ITEMS
                 cancel-failure
                 del-cancel-failure
@@ -107,9 +117,13 @@ else()
         foreach(_state_mode IN ITEMS
                 queued-rearm
                 queued-mod
+                deferred-add-failure
                 failed-mod
                 failed-rearm
-                rapid-pending-mod)
+                pending-metadata-mod
+                pending-narrowing-mod
+                pending-expansion-mod
+                transitional-idle)
             string(REPLACE "-" "_" _state_name "${_state_mode}")
             add_test(NAME wepoll_ex_windows_state_${_state_name}
                 COMMAND test_wepoll_ex_windows_state ${_state_mode})
@@ -150,6 +164,29 @@ else()
         add_test(NAME wepoll_ex_windows_iocp_batch
             COMMAND test_wepoll_ex_windows_iocp_batch)
         set_tests_properties(wepoll_ex_windows_iocp_batch PROPERTIES TIMEOUT 20)
+
+        foreach(_compat_mode IN ITEMS
+                provider
+                udp-v4
+                udp-v6
+                udp-error
+                del-add
+                mod-before-wait
+                oneshot-rearm-before-wait
+                two-epfds
+                idle-two-epfds
+                concurrent-ctl)
+            string(REPLACE "-" "_" _compat_name "${_compat_mode}")
+            add_test(NAME wepoll_ex_windows_compat_${_compat_name}
+                COMMAND test_wepoll_ex_windows_compat ${_compat_mode})
+            set_tests_properties(wepoll_ex_windows_compat_${_compat_name}
+                PROPERTIES TIMEOUT 30)
+            if(_compat_mode STREQUAL "udp-v6" OR
+               _compat_mode STREQUAL "udp-error")
+                set_tests_properties(wepoll_ex_windows_compat_${_compat_name}
+                    PROPERTIES SKIP_RETURN_CODE 77)
+            endif()
+        endforeach()
     endif()
 
     foreach(_identity_mode IN ITEMS
@@ -157,6 +194,7 @@ else()
             oneshot-rearm
             queued-ready
             transitional-connect
+            transitional-mod-before-connect
             transitional-reuse)
         string(REPLACE "-" "_" _identity_name "${_identity_mode}")
         add_test(NAME wepoll_ex_windows_identity_${_identity_name}
@@ -193,6 +231,7 @@ else()
             wepoll_ex_windows_identity_oneshot_rearm
             wepoll_ex_windows_identity_queued_ready
             wepoll_ex_windows_identity_transitional_connect
+            wepoll_ex_windows_identity_transitional_mod_before_connect
             wepoll_ex_windows_identity_transitional_reuse
             PROPERTIES
             ENVIRONMENT

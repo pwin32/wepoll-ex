@@ -6,9 +6,11 @@
  * (epoll_wait_ex, epoll_ctl_ctx, epoll_ctl_batch, epoll_rearm,
  * epoll_fd_count, wepoll_close) on top.
  *
- * To support per-fd metadata we maintain a per-epfd hash table keyed on
- * the registered fd.  Wait-time context resolution scans for a unique
- * epoll_data value because the union does not identify its active member.
+ * To support per-registration metadata we maintain per-epfd fd and data
+ * indexes.  A reused numeric fd can own multiple nodes when Linux keeps
+ * registrations for distinct open file descriptions.  Wait-time context
+ * resolution accepts only a unique opaque epoll_data value because the union
+ * does not identify its active member.
  */
 #define _POSIX_C_SOURCE 200809L
 #define _GNU_SOURCE
@@ -23,14 +25,25 @@
 #include <limits.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <pthread.h>
 
+typedef struct posix_fd_identity {
+    uint64_t device;
+    uint64_t inode;
+    uint64_t mode;
+    uint64_t rdevice;
+} posix_fd_identity_t;
+
 typedef struct posix_sock_node {
     int                       fd;
+    posix_fd_identity_t       identity;
     void                     *user_ctx;
     struct epoll_event        event;
     struct posix_sock_node   *next;
+    struct posix_sock_node   *data_next;
+    uint64_t                  data_key;
 } posix_sock_node_t;
 
 typedef struct posix_sock_snapshot {
@@ -43,10 +56,14 @@ typedef struct posix_port {
     pthread_mutex_t      lock;
     pthread_cond_t       idle;
     posix_sock_node_t  **buckets;
+    posix_sock_node_t  **data_buckets;
     size_t               n_buckets;
     size_t               count;
     size_t               refs;
-    uint64_t             generation;
+    /* Incremented after every extension metadata mutation.  A wait that
+     * overlaps a mutation must not guess which registration version produced
+     * the native event, because epoll_event carries no generation tag. */
+    uint64_t             metadata_generation;
     int                  closing;
     /* Stable duplicate used by metadata-owned epoll_ctl calls. */
     int                  control_epfd;
@@ -55,9 +72,10 @@ typedef struct posix_port {
 } posix_port_t;
 
 #define POSIX_PORT_MAP_SIZE  1024
+#define POSIX_WAKE_TOKEN     UINT64_C(0x5745504f4c4c4558)
+#define POSIX_WAIT_STACK_EVENTS  32
 static pthread_mutex_t g_posix_lock = PTHREAD_MUTEX_INITIALIZER;
 static posix_port_t   *g_posix_map[POSIX_PORT_MAP_SIZE];
-static uint64_t        g_posix_generation = 1;
 
 static posix_port_t *port_lookup_locked(int epfd)
 {
@@ -82,11 +100,36 @@ static void port_remove_locked(posix_port_t *p)
     }
 }
 
+/* Wake every extension wait which is using this metadata port.  The eventfd
+ * is deliberately left readable: unlike a pipe, an eventfd in level-triggered
+ * mode keeps waking other waiters until the port is retired.  EAGAIN means a
+ * previous wake is already pending and is therefore success for our purpose. */
+static void port_wake_waiters_locked(posix_port_t *p)
+{
+    uint64_t one = 1;
+    int saved_errno = errno;
+
+    for (;;) {
+        ssize_t result = write(p->identity_fd, &one, sizeof(one));
+        if (result == (ssize_t)sizeof(one) ||
+            (result < 0 && errno == EAGAIN)) {
+            break;
+        }
+        if (result < 0 && errno == EINTR) continue;
+        /* The descriptor is an internal nonblocking eventfd.  There is no
+         * useful recovery path for another error; preserve the caller's
+         * errno and let the normal close/refcount path finish teardown. */
+        break;
+    }
+    errno = saved_errno;
+}
+
 /* Stop new users, wait for existing metadata users, and unlink the port.
  * The caller holds g_posix_lock and must free p after releasing it. */
 static void port_retire_locked(posix_port_t *p)
 {
     p->closing = 1;
+    port_wake_waiters_locked(p);
     while (p->refs != 0) pthread_cond_wait(&p->idle, &g_posix_lock);
     port_remove_locked(p);
 }
@@ -149,6 +192,7 @@ static void port_free(posix_port_t *p)
         }
     }
     free(p->buckets);
+    free(p->data_buckets);
     if (p->control_epfd >= 0) (void)close(p->control_epfd);
     if (p->identity_fd >= 0) (void)close(p->identity_fd);
     pthread_cond_destroy(&p->idle);
@@ -236,6 +280,17 @@ static posix_port_t *port_acquire_or_create(int epfd)
             errno = ENOMEM;
             return NULL;
         }
+        p->data_buckets = calloc(p->n_buckets,
+                                 sizeof(posix_sock_node_t *));
+        if (!p->data_buckets) {
+            free(p->buckets);
+            pthread_cond_destroy(&p->idle);
+            pthread_mutex_destroy(&p->lock);
+            free(p);
+            pthread_mutex_unlock(&g_posix_lock);
+            errno = ENOMEM;
+            return NULL;
+        }
 
         p->control_epfd = fcntl(epfd, F_DUPFD_CLOEXEC, 0);
         if (p->control_epfd < 0) {
@@ -255,7 +310,7 @@ static posix_port_t *port_acquire_or_create(int epfd)
             return NULL;
         }
         p->identity_event.events = EPOLLIN;
-        p->identity_event.data.u64 = UINT64_C(0x5745504f4c4c4558);
+        p->identity_event.data.u64 = POSIX_WAKE_TOKEN;
         if (epoll_ctl(p->control_epfd, EPOLL_CTL_ADD, p->identity_fd,
                       &p->identity_event) != 0) {
             int saved_errno = errno;
@@ -266,8 +321,7 @@ static posix_port_t *port_acquire_or_create(int epfd)
         }
 
         p->refs = 1;
-        p->generation = g_posix_generation++;
-        if (g_posix_generation == 0) g_posix_generation = 1;
+        p->metadata_generation = 1;
 
         for (int i = 0; i < POSIX_PORT_MAP_SIZE; i++) {
             if (g_posix_map[i] == NULL) {
@@ -292,76 +346,157 @@ static void port_release(posix_port_t *p)
     pthread_mutex_unlock(&g_posix_lock);
 }
 
-static uint64_t port_generation(int epfd)
+static int fd_identity_capture(int fd, posix_fd_identity_t *identity)
 {
-    pthread_mutex_lock(&g_posix_lock);
-    posix_port_t *p = port_lookup_locked(epfd);
-    uint64_t generation = 0;
-    if (p && !p->closing && port_identity_check(p, epfd) == 0) {
-        generation = p->generation;
-    }
-    pthread_mutex_unlock(&g_posix_lock);
-    return generation;
+    struct stat statbuf;
+
+    if (fstat(fd, &statbuf) != 0) return -1;
+    identity->device = (uint64_t)statbuf.st_dev;
+    identity->inode = (uint64_t)statbuf.st_ino;
+    identity->mode = (uint64_t)(statbuf.st_mode & S_IFMT);
+    identity->rdevice = (uint64_t)statbuf.st_rdev;
+    return 0;
 }
 
-static posix_port_t *port_acquire_generation(int epfd, uint64_t generation)
+static int fd_identity_equal(const posix_fd_identity_t *left,
+                             const posix_fd_identity_t *right)
 {
-    if (generation == 0) return NULL;
-
-    pthread_mutex_lock(&g_posix_lock);
-    posix_port_t *p = port_lookup_locked(epfd);
-    if (!p || p->closing || p->generation != generation ||
-        port_identity_check(p, epfd) != 0) {
-        pthread_mutex_unlock(&g_posix_lock);
-        return NULL;
-    }
-    p->refs++;
-    pthread_mutex_unlock(&g_posix_lock);
-    return p;
+    return left->device == right->device &&
+           left->inode == right->inode &&
+           left->mode == right->mode &&
+           left->rdevice == right->rdevice;
 }
 
-static posix_sock_node_t *node_find_locked(posix_port_t *p, int fd,
-                                           size_t *slot_out)
+/* Find the metadata node for the current open file description.  POSIX does
+ * not expose a portable open-file-description handle, so the wrapper keeps a
+ * lightweight fstat fingerprint.  Socket and pipe identities are stable on
+ * Linux; if a filesystem/device presents the same fingerprint for multiple
+ * live registrations, the caller receives EOPNOTSUPP instead of mutating an
+ * arbitrary node. */
+static posix_sock_node_t *node_find_identity_locked(
+    posix_port_t *p, int fd, const posix_fd_identity_t *identity,
+    int *match_count, size_t *slot_out)
 {
     size_t slot = (size_t)fd % p->n_buckets;
+    int matches = 0;
+    posix_sock_node_t *match = NULL;
+
     if (slot_out) *slot_out = slot;
-    posix_sock_node_t *n = p->buckets[slot];
-    while (n) { if (n->fd == fd) break; n = n->next; }
-    return n;
+    for (posix_sock_node_t *n = p->buckets[slot]; n != NULL;
+         n = n->next) {
+        if (n->fd != fd) continue;
+        if (fd_identity_equal(&n->identity, identity)) {
+            match = n;
+            matches++;
+        }
+    }
+    if (match_count) *match_count = matches;
+    return matches == 1 ? match : NULL;
 }
 
-static void node_remove_locked(posix_port_t *p, int fd)
+static size_t node_data_slot(const posix_port_t *p, uint64_t data_key)
 {
-    size_t slot = (size_t)fd % p->n_buckets;
+    uint64_t mixed = data_key ^ (data_key >> 32);
+    return (size_t)(mixed % p->n_buckets);
+}
+
+static void node_data_insert_locked(posix_port_t *p,
+                                    posix_sock_node_t *node)
+{
+    node->data_key = node->event.data.u64;
+    size_t slot = node_data_slot(p, node->data_key);
+    node->data_next = p->data_buckets[slot];
+    p->data_buckets[slot] = node;
+}
+
+static void node_data_remove_locked(posix_port_t *p,
+                                    posix_sock_node_t *node)
+{
+    size_t slot = node_data_slot(p, node->data_key);
+    posix_sock_node_t **link = &p->data_buckets[slot];
+    while (*link != NULL) {
+        if (*link == node) {
+            *link = node->data_next;
+            node->data_next = NULL;
+            return;
+        }
+        link = &(*link)->data_next;
+    }
+}
+
+static int node_remove_ptr_locked(posix_port_t *p, posix_sock_node_t *node)
+{
+    size_t slot = (size_t)node->fd % p->n_buckets;
     posix_sock_node_t **pp = &p->buckets[slot];
     while (*pp) {
-        if ((*pp)->fd == fd) {
-            posix_sock_node_t *dead = *pp;
+        if (*pp == node) {
+            posix_sock_node_t *dead = node;
             *pp = dead->next;
+            node_data_remove_locked(p, dead);
             free(dead);
             p->count--;
-            break;
+            return 1;
         }
         pp = &(*pp)->next;
     }
+    return 0;
 }
 
 /* Keep the native interest list and the extension metadata synchronized.
  * The metadata lock also serializes control operations on the same port, so
- * ADD/DEL races cannot leave a stale node behind. */
+ * ADD/DEL races cannot leave a stale node behind.  Linux epoll keys a native
+ * registration by both the numeric fd and its open file description.  A
+ * close/reuse sequence can therefore leave multiple live registrations with
+ * one integer fd; successful ADDs retain one metadata node per registration.
+ * MOD/DEL select by the current descriptor's fstat fingerprint and reject a
+ * fingerprint collision rather than mutating an arbitrary node. */
 static int port_ctl_ctx(posix_port_t *p, int op, int fd,
                         struct epoll_event *event, void *user_ctx)
 {
     posix_sock_node_t *reserved = NULL;
+    posix_fd_identity_t identity;
+    int identity_matches = 0;
 
     pthread_mutex_lock(&p->lock);
+    if (op != EPOLL_CTL_ADD && op != EPOLL_CTL_MOD &&
+        op != EPOLL_CTL_DEL) {
+        pthread_mutex_unlock(&p->lock);
+        errno = EINVAL;
+        return -1;
+    }
+    if (op != EPOLL_CTL_DEL && event == NULL) {
+        pthread_mutex_unlock(&p->lock);
+        errno = EFAULT;
+        return -1;
+    }
+
+    if (fd_identity_capture(fd, &identity) != 0) {
+        int saved_errno = errno;
+        pthread_mutex_unlock(&p->lock);
+        errno = saved_errno;
+        return -1;
+    }
+
     size_t slot = 0;
     posix_sock_node_t *n = NULL;
-    if (fd >= 0) n = node_find_locked(p, fd, &slot);
+    if (op != EPOLL_CTL_ADD) {
+        n = node_find_identity_locked(p, fd, &identity,
+                                      &identity_matches, &slot);
+        if (identity_matches > 1) {
+            pthread_mutex_unlock(&p->lock);
+            errno = EOPNOTSUPP;
+            return -1;
+        }
+    } else {
+        slot = (size_t)fd % p->n_buckets;
+    }
 
     /* A successful MOD of a registration made through native epoll_ctl still
      * needs a metadata node.  Reserve it before changing native state so an
-     * allocation failure cannot leave the two views inconsistent. */
+     * allocation failure cannot leave the two views inconsistent.  A stale
+     * node for a prior open file description is intentionally retained; a
+     * successful MOD then adopts the current native registration as a new
+     * metadata node. */
     if (op == EPOLL_CTL_MOD && event && fd >= 0 && !n) {
         reserved = calloc(1, sizeof(*reserved));
         if (!reserved) {
@@ -370,6 +505,7 @@ static int port_ctl_ctx(posix_port_t *p, int op, int fd,
             return -1;
         }
         reserved->fd = fd;
+        reserved->identity = identity;
     }
 
     if (epoll_ctl(p->control_epfd, op, fd,
@@ -382,29 +518,39 @@ static int port_ctl_ctx(posix_port_t *p, int op, int fd,
     }
 
     if (op == EPOLL_CTL_DEL) {
-        node_remove_locked(p, fd);
+        /* If the current fd has no matching metadata (for example, a native
+         * registration after fd reuse), leave stale nodes untouched. */
+        if (n != NULL && node_remove_ptr_locked(p, n)) {
+            p->metadata_generation++;
+            if (p->metadata_generation == 0) p->metadata_generation = 1;
+        }
     } else {
-        if (!n) {
+        /* ADD always represents a new native registration, even when the
+         * integer fd is already present for a different open description. */
+        if (op == EPOLL_CTL_ADD || !n) {
             n = reserved;
             reserved = NULL;
+            if (!n) n = calloc(1, sizeof(*n));
             if (!n) {
-                n = calloc(1, sizeof(*n));
-                if (!n) {
-                    int saved_errno = ENOMEM;
-                    (void)epoll_ctl(p->control_epfd, EPOLL_CTL_DEL,
-                                    fd, NULL);
-                    pthread_mutex_unlock(&p->lock);
-                    errno = saved_errno;
-                    return -1;
-                }
-                n->fd = fd;
+                int saved_errno = ENOMEM;
+                (void)epoll_ctl(p->control_epfd, EPOLL_CTL_DEL,
+                                fd, NULL);
+                pthread_mutex_unlock(&p->lock);
+                errno = saved_errno;
+                return -1;
             }
+            n->fd = fd;
+            n->identity = identity;
             n->next = p->buckets[slot];
             p->buckets[slot] = n;
             p->count++;
         }
+        node_data_remove_locked(p, n);
         n->event = *event;
         n->user_ctx = user_ctx;
+        node_data_insert_locked(p, n);
+        p->metadata_generation++;
+        if (p->metadata_generation == 0) p->metadata_generation = 1;
     }
 
     free(reserved);
@@ -412,31 +558,41 @@ static int port_ctl_ctx(posix_port_t *p, int op, int fd,
     return 0;
 }
 
-static int node_snapshot_by_data(posix_port_t *p, epoll_data_t data,
-                                 posix_sock_snapshot_t *snapshot)
+static int node_snapshot_by_data_locked(posix_port_t *p, epoll_data_t data,
+                                        posix_sock_snapshot_t *snapshot)
 {
     int matches = 0;
 
     /* epoll_data_t has no tag telling us which union member the caller used.
-     * Compare the opaque 64-bit value and only accept a unique match.  This
-     * supports fd, ptr, and u64 payloads without dereferencing ptr values. */
-    pthread_mutex_lock(&p->lock);
-    for (size_t slot = 0; slot < p->n_buckets && matches < 2; slot++) {
-        for (posix_sock_node_t *n = p->buckets[slot]; n; n = n->next) {
-            if (n->event.data.u64 == data.u64) {
-                snapshot->user_ctx = n->user_ctx;
-                snapshot->event = n->event;
-                matches++;
-                if (matches == 2) break;
-            }
+     * Compare the opaque 64-bit value and only accept a unique match.  The
+     * reverse index limits this search to nodes carrying that value while
+     * still preserving the duplicate-data ambiguity rule. */
+    size_t slot = node_data_slot(p, data.u64);
+    for (posix_sock_node_t *n = p->data_buckets[slot];
+         n != NULL && matches < 2; n = n->data_next) {
+        if (n->data_key == data.u64) {
+            snapshot->user_ctx = n->user_ctx;
+            snapshot->event = n->event;
+            matches++;
         }
     }
-    pthread_mutex_unlock(&p->lock);
     return matches == 1;
+}
+
+static int port_is_closing(posix_port_t *p)
+{
+    pthread_mutex_lock(&g_posix_lock);
+    int closing = p->closing;
+    pthread_mutex_unlock(&g_posix_lock);
+    return closing;
 }
 
 static int port_count(posix_port_t *p)
 {
+    /* POSIX exposes no non-destructive API to enumerate an epoll set.  The
+     * extension layer therefore counts registrations it owns (ADD/MOD via
+     * epoll_ctl_ctx); native epoll_ctl callers are outside this metadata
+     * view until an extension MOD adopts the registration. */
     pthread_mutex_lock(&p->lock);
     size_t count = p->count;
     pthread_mutex_unlock(&p->lock);
@@ -450,17 +606,23 @@ static int port_count(posix_port_t *p)
 
 static int port_rearm(posix_port_t *p, int fd)
 {
+    posix_fd_identity_t identity;
+    int identity_matches = 0;
+
     if (fd < 0) {
         errno = EBADF;
         return -1;
     }
-    if (fcntl(fd, F_GETFD) == -1) {
-        return -1;
-    }
+    if (fd_identity_capture(fd, &identity) != 0) return -1;
 
     pthread_mutex_lock(&p->lock);
-    posix_sock_node_t *n = NULL;
-    n = node_find_locked(p, fd, NULL);
+    posix_sock_node_t *n = node_find_identity_locked(
+        p, fd, &identity, &identity_matches, NULL);
+    if (identity_matches > 1) {
+        pthread_mutex_unlock(&p->lock);
+        errno = EOPNOTSUPP;
+        return -1;
+    }
     if (!n) {
         pthread_mutex_unlock(&p->lock);
         errno = ENOENT;
@@ -507,36 +669,69 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
                          int maxevents, int timeout,
                          const sigset_t *sigmask)
 {
-    if (!events || maxevents <= 0) {
+    if (!events) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (maxevents <= 0) {
         errno = EINVAL;
         return -1;
     }
 
-    /* Remember which metadata generation belongs to the descriptor before
-     * entering the wait.  If another thread closes and reuses this fd number,
-     * events from the old wait must never acquire context from the new port. */
-    uint64_t generation = port_generation(epfd);
+    /* Hold a metadata-port reference across the native wait.  The wait uses
+     * the stable duplicate, not the caller's integer descriptor, so
+     * wepoll_close() can close the public fd and wake the waiter without
+     * freeing its bookkeeping prematurely. */
+    posix_port_t *p = port_acquire_or_create(epfd);
+    if (!p) return -1;
 
-    struct epoll_event *kevs = calloc((size_t)maxevents, sizeof(*kevs));
-    if (!kevs) {
-        errno = ENOMEM;
-        return -1;
+    pthread_mutex_lock(&p->lock);
+    uint64_t metadata_generation = p->metadata_generation;
+    int wait_epfd = p->control_epfd;
+    pthread_mutex_unlock(&p->lock);
+
+    struct epoll_event stack_events[POSIX_WAIT_STACK_EVENTS];
+    struct epoll_event *kevs = stack_events;
+    int heap_events = 0;
+    if ((size_t)maxevents > POSIX_WAIT_STACK_EVENTS) {
+        if ((size_t)maxevents > SIZE_MAX / sizeof(*kevs)) {
+            port_release(p);
+            errno = EOVERFLOW;
+            return -1;
+        }
+        kevs = malloc((size_t)maxevents * sizeof(*kevs));
+        if (!kevs) {
+            port_release(p);
+            errno = ENOMEM;
+            return -1;
+        }
+        heap_events = 1;
     }
 
     int n;
     if (sigmask) {
-        n = epoll_pwait(epfd, kevs, maxevents, timeout, sigmask);
+        n = epoll_pwait(wait_epfd, kevs, maxevents, timeout, sigmask);
     } else {
-        n = epoll_wait(epfd, kevs, maxevents, timeout);
+        n = epoll_wait(wait_epfd, kevs, maxevents, timeout);
     }
     if (n < 0) {
         int saved_errno = errno;
-        free(kevs);
+        if (port_is_closing(p)) saved_errno = EBADF;
+        if (heap_events) free(kevs);
+        port_release(p);
         errno = saved_errno;
         return -1;
     }
 
-    posix_port_t *p = port_acquire_generation(epfd, generation);
+    /* A close wake is an internal event and must never be exposed as a user
+     * readiness event.  Return EBADF consistently with the Windows backend. */
+    if (port_is_closing(p)) {
+        if (heap_events) free(kevs);
+        port_release(p);
+        errno = EBADF;
+        return -1;
+    }
+
     struct timespec ts = {0};
     uint64_t now_ns = 0;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
@@ -544,6 +739,8 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
                  (uint64_t)ts.tv_nsec;
     }
 
+    pthread_mutex_lock(&p->lock);
+    int metadata_stable = p->metadata_generation == metadata_generation;
     for (int i = 0; i < n; i++) {
         events[i].events = kevs[i].events;
         events[i].data = kevs[i].data;
@@ -551,9 +748,9 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
         events[i].timestamp = now_ns;
         events[i].user_ctx = NULL;
 
-        if (p) {
+        if (metadata_stable) {
             posix_sock_snapshot_t snapshot = {0};
-            if (node_snapshot_by_data(p, kevs[i].data, &snapshot)) {
+            if (node_snapshot_by_data_locked(p, kevs[i].data, &snapshot)) {
                 events[i].user_ctx = snapshot.user_ctx;
                 if (snapshot.event.events & EPOLLET) {
                     events[i].flags |= WEPOLL_FLAG_ET_DELIVERED |
@@ -565,9 +762,18 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
             }
         }
     }
+    pthread_mutex_unlock(&p->lock);
 
-    if (p) port_release(p);
-    free(kevs);
+    /* If close raced with metadata decoration, suppress the batch rather than
+     * returning an event after the close linearization point. */
+    if (port_is_closing(p)) {
+        if (heap_events) free(kevs);
+        port_release(p);
+        errno = EBADF;
+        return -1;
+    }
+    if (heap_events) free(kevs);
+    port_release(p);
     return n;
 }
 
@@ -620,6 +826,14 @@ WEPOLL_EX_API int epoll_pwait2_ex(int epfd, struct epoll_event_ex *events,
                                   const struct timespec *timeout,
                                   const sigset_t *sigmask)
 {
+    if (!events) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (maxevents <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
     int ms;
     if (timeout_to_milliseconds(timeout, &ms) != 0) return -1;
     return posix_wait_ex(epfd, events, maxevents, ms, sigmask);
@@ -759,6 +973,7 @@ WEPOLL_EX_API int wepoll_close(int epfd)
         }
 
         p->closing = 1;
+        port_wake_waiters_locked(p);
     }
 
     /* Keep the registry lock across close so no extension call can validate

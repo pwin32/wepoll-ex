@@ -177,6 +177,17 @@ static int add_socket(int epfd, SOCKET socket_fd, uint32_t events,
     return epoll_ctl(epfd, EPOLL_CTL_ADD, socket_fd, &event);
 }
 
+static int modify_socket(int epfd, SOCKET socket_fd, uint32_t events,
+                         uint64_t data)
+{
+    struct epoll_event event;
+
+    memset(&event, 0, sizeof(event));
+    event.events = events;
+    event.data.u64 = data;
+    return epoll_ctl(epfd, EPOLL_CTL_MOD, socket_fd, &event);
+}
+
 static int send_and_expect(reuse_fixture_t *fixture, uint64_t expected_data)
 {
     static const char byte = 'x';
@@ -399,6 +410,60 @@ cleanup:
     return result;
 }
 
+static int test_transitional_mod_before_connect(void)
+{
+    static const char byte = 'm';
+    static const uint64_t old_data = UINT64_C(0x2468ace013579bdf);
+    static const uint64_t new_data = UINT64_C(0xf0e1d2c3b4a59687);
+    struct sockaddr_in address;
+    struct epoll_event event;
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET server = INVALID_SOCKET;
+    u_long nonblocking = 1;
+    char received;
+    int epfd = -1;
+    int result = -1;
+
+    if (open_listener(&listener, &address) != 0) goto cleanup;
+    client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    epfd = epoll_create1(0);
+    if (client == INVALID_SOCKET || epfd < 0 ||
+        ioctlsocket(client, FIONBIO, &nonblocking) == SOCKET_ERROR ||
+        add_socket(epfd, client, EPOLLRDHUP, old_data) != 0 ||
+        /* This is an expansion from RDHUP to IN.  Before connect the
+         * submitted transitional mask must already cover both interests. */
+        modify_socket(epfd, client, EPOLLIN, new_data) != 0 ||
+        epoll_fd_count(epfd) != 1) {
+        goto cleanup;
+    }
+
+    if (connect(client, (const struct sockaddr *)&address,
+                (int)sizeof(address)) == SOCKET_ERROR) {
+        int connect_error = WSAGetLastError();
+        if (connect_error != WSAEWOULDBLOCK &&
+            connect_error != WSAEINPROGRESS &&
+            connect_error != WSAEALREADY) {
+            goto cleanup;
+        }
+    }
+    server = accept(listener, NULL, NULL);
+    if (server == INVALID_SOCKET || send(server, &byte, 1, 0) != 1 ||
+        epoll_wait(epfd, &event, 1, 2000) != 1 ||
+        event.data.u64 != new_data || (event.events & EPOLLIN) == 0 ||
+        recv(client, &received, 1, 0) != 1 || epoll_fd_count(epfd) != 1) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (server != INVALID_SOCKET) (void)closesocket(server);
+    if (client != INVALID_SOCKET) (void)closesocket(client);
+    if (listener != INVALID_SOCKET) (void)closesocket(listener);
+    return result;
+}
+
 static int test_transitional_reuse(void)
 {
     static const uint64_t old_data = UINT64_C(0x0badf00d0badf00d);
@@ -456,6 +521,8 @@ int main(int argc, char **argv)
         result = test_queued_ready_reuse();
     } else if (strcmp(argv[1], "transitional-connect") == 0) {
         result = test_transitional_connect();
+    } else if (strcmp(argv[1], "transitional-mod-before-connect") == 0) {
+        result = test_transitional_mod_before_connect();
     } else if (strcmp(argv[1], "transitional-reuse") == 0) {
         result = test_transitional_reuse();
     } else {

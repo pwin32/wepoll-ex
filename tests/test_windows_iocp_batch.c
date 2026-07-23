@@ -1,8 +1,7 @@
 /*
- * Focused regression for zero-timeout waits that consume an IOCP batch made
- * up only of ignored/internal packets.  The real AFD readiness completion is
- * deliberately queued after one more wake packet than the configured batch
- * can hold.
+ * Focused regressions for Windows IOCP waits.  They cover a zero-timeout wait
+ * draining a large ignored/internal packet burst before real readiness and a
+ * finite wait retrying an early WAIT_TIMEOUT against its absolute deadline.
  */
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0602
@@ -124,6 +123,29 @@ static NTSTATUS NTAPI submit_pending_stub(
     return STATUS_PENDING;
 }
 
+static int early_timeout_calls;
+
+static BOOL WINAPI early_timeout_stub(
+    HANDLE completion_port,
+    OVERLAPPED_ENTRY *entries,
+    ULONG count,
+    PULONG removed,
+    DWORD milliseconds,
+    BOOL alertable)
+{
+    (void)completion_port;
+    (void)entries;
+    (void)count;
+    (void)milliseconds;
+    (void)alertable;
+    if (removed != NULL) {
+        *removed = 0;
+    }
+    early_timeout_calls++;
+    SetLastError(WAIT_TIMEOUT);
+    return FALSE;
+}
+
 static int test_internal_batch_then_readiness(void)
 {
     static const uint64_t expected_data =
@@ -133,6 +155,7 @@ static int test_internal_batch_then_readiness(void)
     tcp_pair_t pair;
     epoll_data_t data;
     epoll_event_ex output;
+    epoll_event_ex ignored;
     PNtDeviceIoControlFile original_submit = NULL;
     int submit_stub_installed = 0;
     int completion_posted = 0;
@@ -161,6 +184,11 @@ static int test_internal_batch_then_readiness(void)
                 errno, WSAGetLastError());
         goto cleanup;
     }
+    memset(&ignored, 0, sizeof(ignored));
+    if (ep_port_wait(port, &ignored, 1, 0, NULL) < 0) {
+        fprintf(stderr, "batch: deferred registration arm failed\n");
+        goto cleanup;
+    }
     g_ntdll.NtDeviceIoControlFile = original_submit;
     submit_stub_installed = 0;
 
@@ -172,9 +200,10 @@ static int test_internal_batch_then_readiness(void)
 
     /* NULL OVERLAPPED packets are the stable internal/wakeup completion form
      * ignored by epoll_wait.  They stand in for cancellation/stale packets
-     * without fabricating an unsafe pointer into ep_sock_t storage.  One more
-     * packet than the configured batch guarantees a second dequeue attempt. */
-    internal_packet_count = (size_t)port->iocp_batch_size + 1;
+     * without fabricating an unsafe pointer into ep_sock_t storage.  Queue
+     * more than eight complete batches so the regression exceeds the former
+     * four-batch (256 packet) drain limit. */
+    internal_packet_count = (size_t)port->iocp_batch_size * 8U + 1U;
     for (size_t i = 0; i < internal_packet_count; i++) {
         if (!PostQueuedCompletionStatus(port->iocp, 0, 0, NULL)) {
             fprintf(stderr, "batch: PostQueuedCompletionStatus failed\n");
@@ -237,18 +266,62 @@ cleanup:
     return result;
 }
 
+static int test_finite_wait_retries_early_timeout(void)
+{
+    static const int timeout_ms = 25;
+    ep_port_t *port = NULL;
+    epoll_event_ex output;
+    PGetQueuedCompletionStatusEx original_dequeue;
+    uint64_t started;
+    uint64_t elapsed;
+    int wait_result;
+    int result = -1;
+
+    if (ep_port_create(0, 0, &port) != 0) {
+        fprintf(stderr, "timeout: setup failed (errno=%d)\n", errno);
+        return -1;
+    }
+
+    original_dequeue = port->get_queued_completion_status_ex;
+    port->get_queued_completion_status_ex = early_timeout_stub;
+    early_timeout_calls = 0;
+    memset(&output, 0, sizeof(output));
+    started = GetTickCount64();
+    wait_result = ep_port_wait(port, &output, 1, timeout_ms, NULL);
+    elapsed = GetTickCount64() - started;
+    port->get_queued_completion_status_ex = original_dequeue;
+
+    if (wait_result != 0 || elapsed < (uint64_t)timeout_ms ||
+        early_timeout_calls < 2) {
+        fprintf(stderr,
+                "timeout: finite wait returned %d after %llu ms and %d calls (errno=%d)\n",
+                wait_result, (unsigned long long)elapsed,
+                early_timeout_calls, errno);
+        goto cleanup;
+    }
+
+    result = 0;
+    puts("timeout: OK");
+
+cleanup:
+    (void)ep_port_destroy(port);
+    return result;
+}
+
 int main(void)
 {
     WSADATA wsa_data;
-    int result;
+    int batch_result;
+    int timeout_result;
 
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
         fprintf(stderr, "WSAStartup failed\n");
         return 2;
     }
-    result = test_internal_batch_then_readiness();
+    batch_result = test_internal_batch_then_readiness();
+    timeout_result = test_finite_wait_retries_early_timeout();
     (void)WSACleanup();
-    return result == 0 ? 0 : 1;
+    return batch_result == 0 && timeout_result == 0 ? 0 : 1;
 }
 
 #else

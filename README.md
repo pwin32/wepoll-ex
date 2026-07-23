@@ -24,22 +24,34 @@ validation checklist.
 ### Windows implementation
 
 `src/wepoll_ex_api.c` exposes the public integer `epfd` API and maps each id to
-an internal `ep_port_t`. `src/wepoll_ex_port.c` owns an IOCP handle, an AFD
-handle, a growable socket table, and a ready queue. `epoll_ctl` submits an
-`AFD_POLL`; completions are translated by `src/wepoll_ex_afd.c`, queued as
-immutable snapshots, and consumed by `epoll_wait`. The port retains socket
-storage until cancellation completions are drained. AFD is undocumented and
-the build currently targets Windows 8 or later (`_WIN32_WINNT=0x0602`). The
-Windows path is validated only with the MinGW/MSYS2 checks below.
+an internal `ep_port_t`. `src/wepoll_ex_port.c` owns an IOCP handle, AFD poll
+state, a growable socket table, and a ready queue. Stable registrations defer
+their `AFD_POLL` until a waiter arms the port; an already-active waiter and an
+unconnected transitional stream arm immediately. Completions are translated
+by `src/wepoll_ex_afd.c`, queued as immutable snapshots, and consumed by
+`epoll_wait`. A pending MOD whose mask is already covered keeps the request;
+an expansion cancels once and rearms with the latest metadata. Independent
+epoll instances can watch the same socket, and the port retains socket storage
+until cancellation completions are drained. Because stable ADD is lazy, an AFD
+submission error can be reported by the first wait rather than the ADD call;
+an ADD made while a waiter is active remains synchronous. AFD is undocumented
+and the build currently targets Windows 8 or later (`_WIN32_WINNT=0x0602`).
+The Windows path is validated only with the MinGW/MSYS2 checks below.
 
 ### POSIX development path
 
 `src/wepoll_ex_posix.c` leaves the basic `epoll_create*`, `epoll_ctl`, and
-`epoll_wait` symbols to the host libc. It keeps a small per-epfd table for
-`user_ctx`, flags, counts, and extension helpers, then decorates native events
-for `epoll_wait_ex`. The shared pool/queue code is also compiled here for its
-unit tests; it does not make the POSIX wrapper an implementation of the
-Windows engine.
+`epoll_wait` symbols to the host libc. It keeps per-epfd metadata plus a stable
+duplicate used by extended waits. Metadata tracks each successful ADD, even
+when Linux keeps two open-file-description registrations under one reused fd
+number; MOD/DEL use an `fstat` identity and reject ambiguous fingerprints
+instead of changing an arbitrary entry. `wepoll_close()` wakes blocked
+extended waiters, which return `EBADF`, before releasing that metadata.
+Context lookup uses a reverse index; duplicate opaque data values, or metadata
+changes that overlap a wait, deliberately produce `user_ctx == NULL` instead
+of a stale association. The shared pool/queue code is also compiled here for
+its unit tests; it does not make the POSIX wrapper a Windows-engine
+implementation.
 
 ### Public extensions
 
@@ -51,8 +63,16 @@ best-effort rolls back ADDs; it is not transactional.
 
 On Windows, registrations are socket-only. `EPOLLONESHOT` is supported;
 `EPOLLET` and `EPOLLEXCLUSIVE` are rejected with `EOPNOTSUPP` because the AFD
-backend does not provide their required semantics. `epoll_pwait*` accepts a
-null signal mask only. Call `wepoll_close()` for the virtual epoll descriptor.
+backend does not provide their required semantics. Windows `epoll_pwait*`
+accepts a null signal mask only; POSIX `epoll_pwait2_ex` applies a supplied
+mask atomically through native `epoll_pwait`. Call `wepoll_close()` for the
+virtual Windows epoll descriptor and for prompt POSIX extended-wait wakeup.
+
+On POSIX, `epoll_fd_count()` reports registrations owned by the extension
+metadata, including successful `epoll_ctl_batch` operations. Native
+`epoll_ctl()` additions are not counted until a successful
+`epoll_ctl_ctx(..., EPOLL_CTL_MOD, ...)` adopts them; later native MOD/DEL
+operations do not update the extension metadata view.
 
 ## Repository layout
 
@@ -60,7 +80,7 @@ null signal mask only. Call `wepoll_close()` for the virtual epoll descriptor.
 include/   public headers
 src/       Windows engine and POSIX wrapper
 tests/     POSIX, Windows API, pool, and package-consumer tests
-bench/     POSIX-only bench_latency source
+bench/     POSIX latency and extension-wait scaling benchmarks
 nginx/     opt-in nginx 1.31.3 adapter and configure hook
 docs/      design and integration status
 ```
@@ -72,11 +92,13 @@ The CMake target names and executable paths are:
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DWEPOLL_EX_BUILD_BENCH=ON
 cmake --build build --target wepoll_ex_shared wepoll_ex_static \
-    test_wepoll_ex test_wepoll_ex_pool bench_latency
+    test_wepoll_ex test_wepoll_ex_pool bench_latency bench_wait_scaling
 ctest --test-dir build --output-on-failure
 ./build/tests/test_wepoll_ex
 ./build/tests/test_wepoll_ex_pool
 ./build/bench/bench_latency 50000
+ulimit -n 65536  # raise the soft limit for large registration counts
+./build/bench/bench_wait_scaling 1024 20000
 ```
 
 For MinGW, use the toolchain shell explicitly:
@@ -91,12 +113,14 @@ For MinGW, use the toolchain shell explicitly:
    ctest --test-dir build-mingw --output-on-failure'
 ```
 
-The POSIX baseline passes the API, pool, and package-consumer tests. The MinGW
-baseline passes the Windows API and package-consumer tests with shared and
-static libraries, including a shared-only configuration. MinGW final binaries
-select the static winpthreads archive and CTest rejects an accidental
-`libwinpthread-1.dll` dependency. Record the exact command, compiler, and OS
-for new results.
+The POSIX suite covers API contracts, close/wait races, signal-mask waits,
+metadata changes, reused-fd identity, the pool, and package consumption. The
+MinGW suite covers TCP and UDP readiness, IPv6, provider-handle fallback,
+multi-epfd waits, deferred ADD failure, pending MOD transitions, IOCP batch
+draining, timeout deadlines, lifecycle faults, and package consumers. MinGW
+final binaries select the static winpthreads archive, and CTest rejects an
+accidental `libwinpthread-1.dll` dependency. Record the exact command,
+compiler, Windows version, and build flags for new results.
 
 ## Install and consume
 

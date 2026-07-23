@@ -17,6 +17,9 @@
 /* Separate chaining keeps descriptor entries at stable addresses while
  * operations hold references and avoids open-addressing deletion holes. */
 #define EPFD_BUCKET_COUNT 64U
+/* Keep the common wait scratch to a few KiB while retaining a heap fallback
+ * for larger caller-requested batches. */
+#define EP_WAIT_STACK_EVENTS 64U
 
 typedef struct epfd_entry {
     int fd;
@@ -335,7 +338,9 @@ WEPOLL_EX_API int epoll_pwait(int epfd,
                               const wepoll_sigset_t *sigmask)
 {
     epfd_entry_t *entry;
-    epoll_event_ex *extended;
+    epoll_event_ex stack_events[EP_WAIT_STACK_EVENTS];
+    epoll_event_ex *extended = stack_events;
+    epoll_event_ex *heap_events = NULL;
     int result;
 
     if (events == NULL) {
@@ -356,12 +361,16 @@ WEPOLL_EX_API int epoll_pwait(int epfd,
         return -1;
     }
 
-    extended = (epoll_event_ex *)calloc((size_t)maxevents,
-                                        sizeof(*extended));
-    if (extended == NULL) {
-        epfd_put(entry);
-        ep_set_errno(ENOMEM);
-        return -1;
+    if ((size_t)maxevents > EP_WAIT_STACK_EVENTS) {
+        /* calloc retains overflow checking for 32-bit size_t builds. */
+        heap_events = (epoll_event_ex *)calloc(
+            (size_t)maxevents, sizeof(*heap_events));
+        if (heap_events == NULL) {
+            epfd_put(entry);
+            ep_set_errno(ENOMEM);
+            return -1;
+        }
+        extended = heap_events;
     }
 
     result = epoll_wait_port(entry, extended, maxevents, timeout, sigmask);
@@ -372,7 +381,7 @@ WEPOLL_EX_API int epoll_pwait(int epfd,
         }
     }
 
-    free(extended);
+    free(heap_events);
     epfd_put(entry);
     return result;
 }

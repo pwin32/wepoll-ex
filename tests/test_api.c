@@ -25,6 +25,7 @@
 #include <stdatomic.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <signal.h>
 #include <assert.h>
 
@@ -272,12 +273,23 @@ static void test_extension_api(void)
     if (epoll_fd_count(epfd) != 0) { FAIL("expected 0"); wepoll_close(epfd); return; }
     PASS();
 
-    TEST("epoll_fd_count reflects registered fds");
+    TEST("epoll_fd_count tracks extension-owned registrations");
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) { FAIL("socketpair"); wepoll_close(epfd); return; }
     struct epoll_event ev = { .events = EPOLLIN, .data.fd = pair[0] };
-    /* Use the extension API so the per-port tracking table is updated. */
-    if (epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, pair[0], &ev, NULL) != 0) { FAIL("ADD"); goto cleanup; }
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair[0], &ev) != 0) {
+        FAIL("native ADD");
+        goto cleanup;
+    }
+    if (epoll_fd_count(epfd) != 0) {
+        FAIL("native-only registration should be outside metadata count");
+        goto cleanup;
+    }
+    /* An extension MOD adopts a native registration into the metadata view. */
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_MOD, pair[0], &ev, NULL) != 0) {
+        FAIL("extension MOD");
+        goto cleanup;
+    }
     if (epoll_fd_count(epfd) != 1) { FAIL("expected 1"); goto cleanup; }
     PASS();
 cleanup:
@@ -309,8 +321,10 @@ static void test_user_ctx(void)
 
     if (write(pair[1], "x", 1) != 1) { FAIL("write"); goto cleanup; }
 
-    epoll_event_ex out[1];
-    int n = epoll_wait_ex(epfd, out, 1, 100);
+    /* A larger batch exercises the native-event heap fallback while other
+     * API tests cover the small stack-buffer path. */
+    epoll_event_ex out[64];
+    int n = epoll_wait_ex(epfd, out, 64, 100);
     if (n != 1) { FAIL("expected 1 event"); goto cleanup; }
     if (out[0].user_ctx != expected_ctx) {
         FAIL("user_ctx mismatch"); goto cleanup;
@@ -375,6 +389,36 @@ static void test_create_ex_and_timeout_validation(void)
     if (n != 0) { FAIL("epoll_wait_ex zero timeout"); goto timeout_cleanup; }
     n = epoll_pwait2_ex(epfd, out, 1, &zero, &empty_mask);
     if (n != 0) { FAIL("epoll_pwait2_ex zero timeout"); goto timeout_cleanup; }
+    epoll_event_ex large_output[64];
+    n = epoll_wait_ex(epfd, large_output, 64, 0);
+    if (n != 0) { FAIL("epoll_wait_ex heap-buffer fallback"); goto timeout_cleanup; }
+    PASS();
+
+    TEST("extended waits distinguish NULL events from invalid maxevents");
+    errno = 0;
+    n = epoll_wait_ex(epfd, NULL, 1, 0);
+    if (n != -1 || errno != EFAULT) {
+        FAIL("epoll_wait_ex NULL events should return EFAULT");
+        goto timeout_cleanup;
+    }
+    errno = 0;
+    n = epoll_wait_ex(epfd, out, 0, 0);
+    if (n != -1 || errno != EINVAL) {
+        FAIL("epoll_wait_ex zero maxevents should return EINVAL");
+        goto timeout_cleanup;
+    }
+    errno = 0;
+    n = epoll_pwait2_ex(epfd, NULL, 1, &zero, NULL);
+    if (n != -1 || errno != EFAULT) {
+        FAIL("epoll_pwait2_ex NULL events should return EFAULT");
+        goto timeout_cleanup;
+    }
+    errno = 0;
+    n = epoll_pwait2_ex(epfd, out, 0, &zero, NULL);
+    if (n != -1 || errno != EINVAL) {
+        FAIL("epoll_pwait2_ex zero maxevents should return EINVAL");
+        goto timeout_cleanup;
+    }
     PASS();
 
     TEST("epoll_pwait2_ex rejects invalid and overflowing timespecs");
@@ -620,6 +664,109 @@ static void test_duplicate_data_context(void)
 duplicate_cleanup:
     wepoll_close(epfd);
 duplicate_socket_cleanup:
+    close(pairs[0][0]); close(pairs[0][1]);
+    close(pairs[1][0]); close(pairs[1][1]);
+}
+
+static void test_mod_updates_duplicate_data_index(void)
+{
+    TEST("MOD updates duplicate-data context indexing");
+
+    int pairs[2][2] = { { -1, -1 }, { -1, -1 } };
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pairs[0]) != 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, pairs[1]) != 0) {
+        FAIL("socketpair");
+        if (pairs[0][0] >= 0) { close(pairs[0][0]); close(pairs[0][1]); }
+        if (pairs[1][0] >= 0) { close(pairs[1][0]); close(pairs[1][1]); }
+        return;
+    }
+
+    int epfd = epoll_create_ex(0, 0);
+    if (epfd < 0) {
+        FAIL("epoll_create_ex");
+        goto index_socket_cleanup;
+    }
+
+    int contexts[2];
+    const uint64_t data_a = UINT64_C(0x1010101010101010);
+    const uint64_t data_b = UINT64_C(0x2020202020202020);
+    const uint64_t data_c = UINT64_C(0x3030303030303030);
+    struct epoll_event events[2] = {
+        { .events = EPOLLIN, .data.u64 = data_a },
+        { .events = EPOLLIN, .data.u64 = data_b }
+    };
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, pairs[0][0], &events[0],
+                      &contexts[0]) != 0 ||
+        epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, pairs[1][0], &events[1],
+                      &contexts[1]) != 0) {
+        FAIL("initial ADD");
+        goto index_cleanup;
+    }
+
+    events[1].data.u64 = data_a;
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_MOD, pairs[1][0], &events[1],
+                      &contexts[1]) != 0 ||
+        write(pairs[0][1], "a", 1) != 1 ||
+        write(pairs[1][1], "b", 1) != 1) {
+        FAIL("MOD into duplicate/write");
+        goto index_cleanup;
+    }
+
+    epoll_event_ex output[2];
+    int count = epoll_wait_ex(epfd, output, 2, 100);
+    if (count != 2) {
+        FAIL("duplicate wait count");
+        goto index_cleanup;
+    }
+    for (int i = 0; i < count; i++) {
+        if (output[i].data.u64 != data_a || output[i].user_ctx != NULL) {
+            FAIL("MOD-created duplicate was not ambiguous");
+            goto index_cleanup;
+        }
+    }
+    if (read(pairs[0][0], &(char){0}, 1) != 1 ||
+        read(pairs[1][0], &(char){0}, 1) != 1) {
+        FAIL("read duplicate readiness");
+        goto index_cleanup;
+    }
+
+    events[1].data.u64 = data_c;
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_MOD, pairs[1][0], &events[1],
+                      &contexts[1]) != 0 ||
+        write(pairs[0][1], "c", 1) != 1 ||
+        write(pairs[1][1], "d", 1) != 1) {
+        FAIL("MOD out of duplicate/write");
+        goto index_cleanup;
+    }
+
+    count = epoll_wait_ex(epfd, output, 2, 100);
+    if (count != 2) {
+        FAIL("unique wait count");
+        goto index_cleanup;
+    }
+    int saw_a = 0;
+    int saw_c = 0;
+    for (int i = 0; i < count; i++) {
+        if (output[i].data.u64 == data_a &&
+            output[i].user_ctx == &contexts[0]) {
+            saw_a = 1;
+        } else if (output[i].data.u64 == data_c &&
+                   output[i].user_ctx == &contexts[1]) {
+            saw_c = 1;
+        } else {
+            FAIL("unique contexts were not restored");
+            goto index_cleanup;
+        }
+    }
+    if (!saw_a || !saw_c) {
+        FAIL("missing unique indexed event");
+        goto index_cleanup;
+    }
+    PASS();
+
+index_cleanup:
+    wepoll_close(epfd);
+index_socket_cleanup:
     close(pairs[0][0]); close(pairs[0][1]);
     close(pairs[1][0]); close(pairs[1][1]);
 }
@@ -979,6 +1126,13 @@ static void test_invalid_and_closed_descriptors(void)
         return;
     }
     errno = 0;
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, 0, NULL, NULL) != -1 ||
+        errno != EFAULT || epoll_fd_count(epfd) != 0) {
+        FAIL("NULL ADD event should return EFAULT");
+        wepoll_close(epfd);
+        return;
+    }
+    errno = 0;
     if (epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, -1, &ev, NULL) != -1 ||
         errno != EBADF || epoll_fd_count(epfd) != 0) {
         FAIL("failed ADD changed metadata");
@@ -1112,6 +1266,211 @@ static int wait_atomic_at_least(atomic_int *value, int target,
         }
         sched_yield();
     }
+}
+
+typedef struct posix_wait_thread_context {
+    int             epfd;
+    atomic_int      started;
+    int             result;
+    int             error;
+    epoll_event_ex  event;
+} posix_wait_thread_context_t;
+
+static void *posix_wait_thread(void *opaque)
+{
+    posix_wait_thread_context_t *context = opaque;
+
+    /* A nonblocking probe ensures the extension metadata port is acquired
+     * before the caller is told that the blocking phase is ready. */
+    epoll_event_ex probe;
+    (void)epoll_wait_ex(context->epfd, &probe, 1, 0);
+    atomic_store_explicit(&context->started, 1, memory_order_release);
+
+    errno = 0;
+    context->result = epoll_wait_ex(context->epfd, &context->event, 1, -1);
+    context->error = errno;
+    return NULL;
+}
+
+static int sleep_milliseconds(long milliseconds)
+{
+    struct timespec request = {
+        .tv_sec = milliseconds / 1000,
+        .tv_nsec = (milliseconds % 1000) * 1000000L
+    };
+    while (nanosleep(&request, &request) != 0) {
+        if (errno == EINTR) continue;
+        return -1;
+    }
+    return 0;
+}
+
+static void test_close_wakes_blocking_extended_wait(void)
+{
+    enum { WAITER_COUNT = 2 };
+
+    TEST("wepoll_close wakes all blocking epoll_wait_ex waiters");
+
+    int epfd = epoll_create_ex(0, 0);
+    if (epfd < 0) {
+        FAIL("epoll_create_ex");
+        return;
+    }
+
+    posix_wait_thread_context_t contexts[WAITER_COUNT];
+    pthread_t threads[WAITER_COUNT];
+    int created = 0;
+    for (; created < WAITER_COUNT; created++) {
+        contexts[created].epfd = epfd;
+        atomic_init(&contexts[created].started, 0);
+        contexts[created].result = 0;
+        contexts[created].error = 0;
+        memset(&contexts[created].event, 0, sizeof(contexts[created].event));
+
+        int create_error = pthread_create(&threads[created], NULL,
+                                          posix_wait_thread,
+                                          &contexts[created]);
+        if (create_error != 0) {
+            errno = create_error;
+            break;
+        }
+    }
+    if (created != WAITER_COUNT) {
+        int saved_errno = errno;
+        (void)wepoll_close(epfd);
+        for (int i = 0; i < created; i++) pthread_join(threads[i], NULL);
+        errno = saved_errno;
+        FAIL("pthread_create");
+        return;
+    }
+
+    for (int i = 0; i < WAITER_COUNT; i++) {
+        if (wait_atomic_at_least(&contexts[i].started, 1, 2000) != 0) {
+            FAIL("blocking waiter did not start");
+            (void)wepoll_close(epfd);
+            for (int j = 0; j < WAITER_COUNT; j++) {
+                pthread_join(threads[j], NULL);
+            }
+            return;
+        }
+    }
+    if (sleep_milliseconds(100) != 0) {
+        FAIL("blocking waiter startup delay");
+        (void)wepoll_close(epfd);
+        for (int i = 0; i < WAITER_COUNT; i++) {
+            pthread_join(threads[i], NULL);
+        }
+        return;
+    }
+
+    errno = 0;
+    int close_result = wepoll_close(epfd);
+    int close_error = errno;
+    for (int i = 0; i < WAITER_COUNT; i++) pthread_join(threads[i], NULL);
+    if (close_result != 0) {
+        errno = close_error;
+        FAIL("wepoll_close");
+        return;
+    }
+    for (int i = 0; i < WAITER_COUNT; i++) {
+        if (contexts[i].result != -1 || contexts[i].error != EBADF) {
+            errno = contexts[i].error;
+            FAIL("one blocking wait did not wake with EBADF");
+            return;
+        }
+    }
+    PASS();
+}
+
+static void test_context_change_during_wait_is_not_stale(void)
+{
+    TEST("overlapping context changes suppress stale user_ctx");
+
+    int pair[2] = { -1, -1 };
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        FAIL("socketpair");
+        return;
+    }
+    int epfd = epoll_create_ex(0, 0);
+    if (epfd < 0) {
+        FAIL("epoll_create_ex");
+        close(pair[0]);
+        close(pair[1]);
+        return;
+    }
+
+    int old_context;
+    int new_context;
+    struct epoll_event event = {
+        .events = EPOLLIN,
+        .data.u64 = UINT64_C(0x9988776655443322)
+    };
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, pair[0], &event,
+                      &old_context) != 0) {
+        FAIL("initial ADD");
+        wepoll_close(epfd);
+        close(pair[0]);
+        close(pair[1]);
+        return;
+    }
+
+    posix_wait_thread_context_t context = {
+        .epfd = epfd,
+        .started = ATOMIC_VAR_INIT(0),
+        .result = 0,
+        .error = 0,
+        .event = {0}
+    };
+    pthread_t thread;
+    int create_error = pthread_create(&thread, NULL, posix_wait_thread,
+                                      &context);
+    if (create_error != 0) {
+        errno = create_error;
+        FAIL("pthread_create");
+        wepoll_close(epfd);
+        close(pair[0]);
+        close(pair[1]);
+        return;
+    }
+    if (wait_atomic_at_least(&context.started, 1, 2000) != 0 ||
+        sleep_milliseconds(100) != 0) {
+        FAIL("blocking waiter did not start");
+        (void)wepoll_close(epfd);
+        pthread_join(thread, NULL);
+        close(pair[0]);
+        close(pair[1]);
+        return;
+    }
+
+    /* Keep the payload identical.  A wait which overlaps this MOD cannot
+     * distinguish the old and new registration versions from epoll_data
+     * alone; returning either context would be unsafe, so the implementation
+     * deliberately returns NULL for the event. */
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_MOD, pair[0], &event,
+                      &new_context) != 0 ||
+        write(pair[1], "c", 1) != 1) {
+        FAIL("MOD/write");
+        (void)wepoll_close(epfd);
+        pthread_join(thread, NULL);
+        close(pair[0]);
+        close(pair[1]);
+        return;
+    }
+    pthread_join(thread, NULL);
+    if (context.result != 1 ||
+        context.event.data.u64 != event.data.u64 ||
+        context.event.user_ctx != NULL) {
+        errno = context.error;
+        FAIL("wait returned a stale context after overlapping MOD");
+        wepoll_close(epfd);
+        close(pair[0]);
+        close(pair[1]);
+        return;
+    }
+    wepoll_close(epfd);
+    close(pair[0]);
+    close(pair[1]);
+    PASS();
 }
 
 static void *close_stress_worker(void *argument)
@@ -1399,6 +1758,296 @@ native_close_socket_cleanup:
 }
 
 /* --------------------------------------------------------------------- */
+/* Linux epoll distinguishes reused fd numbers by open file description. */
+/* --------------------------------------------------------------------- */
+
+static void test_live_registration_fd_reuse(void)
+{
+    TEST("live dup/close fd reuse preserves both registrations");
+
+    int old_pair[2] = { -1, -1 };
+    int new_pair[2] = { -1, -1 };
+    int keeper = -1;
+    int epfd = -1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, old_pair) != 0) {
+        FAIL("old socketpair");
+        return;
+    }
+
+    epfd = epoll_create_ex(0, 0);
+    if (epfd < 0) {
+        FAIL("epoll_create_ex");
+        goto live_reuse_cleanup;
+    }
+    keeper = dup(old_pair[0]);
+    if (keeper < 0) {
+        FAIL("dup old registration");
+        goto live_reuse_cleanup;
+    }
+
+    int reused_fd = old_pair[0];
+    int old_context;
+    int new_context;
+    int modified_context;
+    const uint64_t old_data = UINT64_C(0x4141414141414141);
+    const uint64_t new_data = UINT64_C(0x4242424242424242);
+    const uint64_t modified_data = UINT64_C(0x4343434343434343);
+    struct epoll_event old_event = {
+        .events = EPOLLIN,
+        .data.u64 = old_data
+    };
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, reused_fd, &old_event,
+                      &old_context) != 0) {
+        FAIL("old ADD");
+        goto live_reuse_cleanup;
+    }
+
+    /* The duplicated descriptor keeps the old open file description and its
+     * epoll registration alive while the original integer is reused. */
+    close(old_pair[0]);
+    old_pair[0] = -1;
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, new_pair) != 0) {
+        FAIL("new socketpair");
+        goto live_reuse_cleanup;
+    }
+    if (new_pair[0] != reused_fd) {
+        if (new_pair[1] == reused_fd) {
+            int peer = new_pair[0];
+            new_pair[0] = reused_fd;
+            new_pair[1] = peer;
+        } else {
+            if (dup2(new_pair[0], reused_fd) != reused_fd) {
+                FAIL("dup2 reused fd");
+                goto live_reuse_cleanup;
+            }
+            close(new_pair[0]);
+            new_pair[0] = reused_fd;
+        }
+    }
+
+    struct epoll_event new_event = {
+        .events = EPOLLIN,
+        .data.u64 = new_data
+    };
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, new_pair[0], &new_event,
+                      &new_context) != 0 ||
+        epoll_fd_count(epfd) != 2 ||
+        write(old_pair[1], "o", 1) != 1 ||
+        write(new_pair[1], "n", 1) != 1) {
+        FAIL("new ADD/count/write");
+        goto live_reuse_cleanup;
+    }
+
+    epoll_event_ex output[2];
+    int count = epoll_wait_ex(epfd, output, 2, 100);
+    int saw_old = 0;
+    int saw_new = 0;
+    if (count != 2) {
+        FAIL("expected both reused-fd registrations");
+        goto live_reuse_cleanup;
+    }
+    for (int i = 0; i < count; i++) {
+        if (output[i].data.u64 == old_data &&
+            output[i].user_ctx == &old_context) {
+            saw_old = 1;
+        } else if (output[i].data.u64 == new_data &&
+                   output[i].user_ctx == &new_context) {
+            saw_new = 1;
+        } else {
+            FAIL("reused-fd event metadata mismatch");
+            goto live_reuse_cleanup;
+        }
+    }
+    if (!saw_old || !saw_new ||
+        read(keeper, &(char){0}, 1) != 1 ||
+        read(new_pair[0], &(char){0}, 1) != 1) {
+        FAIL("missing reused-fd event/read");
+        goto live_reuse_cleanup;
+    }
+
+    /* MOD and DEL must select the current open file description without
+     * overwriting or removing the still-live old registration. */
+    new_event.data.u64 = modified_data;
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_MOD, new_pair[0], &new_event,
+                      &modified_context) != 0 ||
+        epoll_fd_count(epfd) != 2 ||
+        write(old_pair[1], "p", 1) != 1 ||
+        write(new_pair[1], "q", 1) != 1) {
+        FAIL("reused-fd MOD/count/write");
+        goto live_reuse_cleanup;
+    }
+    count = epoll_wait_ex(epfd, output, 2, 100);
+    saw_old = 0;
+    int saw_modified = 0;
+    if (count != 2) {
+        FAIL("expected both registrations after MOD");
+        goto live_reuse_cleanup;
+    }
+    for (int i = 0; i < count; i++) {
+        if (output[i].data.u64 == old_data &&
+            output[i].user_ctx == &old_context) {
+            saw_old = 1;
+        } else if (output[i].data.u64 == modified_data &&
+                   output[i].user_ctx == &modified_context) {
+            saw_modified = 1;
+        } else {
+            FAIL("reused-fd MOD metadata mismatch");
+            goto live_reuse_cleanup;
+        }
+    }
+    if (!saw_old || !saw_modified ||
+        read(keeper, &(char){0}, 1) != 1 ||
+        read(new_pair[0], &(char){0}, 1) != 1 ||
+        epoll_ctl_ctx(epfd, EPOLL_CTL_DEL, new_pair[0], NULL, NULL) != 0 ||
+        epoll_fd_count(epfd) != 1 ||
+        write(old_pair[1], "r", 1) != 1) {
+        FAIL("reused-fd MOD read/DEL/count/write");
+        goto live_reuse_cleanup;
+    }
+    count = epoll_wait_ex(epfd, output, 1, 100);
+    if (count != 1 || output[0].data.u64 != old_data ||
+        output[0].user_ctx != &old_context ||
+        read(keeper, &(char){0}, 1) != 1) {
+        FAIL("DEL removed the wrong reused-fd registration");
+        goto live_reuse_cleanup;
+    }
+
+    PASS();
+
+live_reuse_cleanup:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (old_pair[0] >= 0) close(old_pair[0]);
+    if (old_pair[1] >= 0) close(old_pair[1]);
+    if (new_pair[0] >= 0) close(new_pair[0]);
+    if (new_pair[1] >= 0) close(new_pair[1]);
+    if (keeper >= 0) close(keeper);
+}
+
+static void test_ambiguous_fd_identity_is_rejected(void)
+{
+    TEST("ambiguous reused-fd identity rejects MOD and DEL");
+
+    int old_fd = -1;
+    int new_fd = -1;
+    int keeper = -1;
+    int epfd = -1;
+    old_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (old_fd < 0) {
+        FAIL("old eventfd");
+        return;
+    }
+    epfd = epoll_create_ex(0, 0);
+    if (epfd < 0) {
+        FAIL("epoll_create_ex");
+        goto ambiguous_cleanup;
+    }
+    keeper = dup(old_fd);
+    if (keeper < 0) {
+        FAIL("dup old eventfd");
+        goto ambiguous_cleanup;
+    }
+
+    int reused_fd = old_fd;
+    int old_context;
+    int new_context;
+    int modified_context;
+    const uint64_t old_data = UINT64_C(0x5151515151515151);
+    const uint64_t new_data = UINT64_C(0x5252525252525252);
+    struct epoll_event old_event = {
+        .events = EPOLLIN,
+        .data.u64 = old_data
+    };
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, old_fd, &old_event,
+                      &old_context) != 0) {
+        FAIL("old eventfd ADD");
+        goto ambiguous_cleanup;
+    }
+
+    close(old_fd);
+    old_fd = -1;
+    new_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (new_fd < 0) {
+        FAIL("new eventfd");
+        goto ambiguous_cleanup;
+    }
+    if (new_fd != reused_fd) {
+        if (dup2(new_fd, reused_fd) != reused_fd) {
+            FAIL("dup2 new eventfd");
+            goto ambiguous_cleanup;
+        }
+        close(new_fd);
+        new_fd = reused_fd;
+    }
+
+    struct epoll_event new_event = {
+        .events = EPOLLIN,
+        .data.u64 = new_data
+    };
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, new_fd, &new_event,
+                      &new_context) != 0 ||
+        epoll_fd_count(epfd) != 2) {
+        FAIL("new eventfd ADD/count");
+        goto ambiguous_cleanup;
+    }
+
+    struct epoll_event modified_event = {
+        .events = EPOLLIN | EPOLLONESHOT,
+        .data.u64 = UINT64_C(0x5353535353535353)
+    };
+    errno = 0;
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_MOD, new_fd, &modified_event,
+                      &modified_context) != -1 ||
+        errno != EOPNOTSUPP || epoll_fd_count(epfd) != 2) {
+        FAIL("ambiguous MOD should return EOPNOTSUPP");
+        goto ambiguous_cleanup;
+    }
+    errno = 0;
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_DEL, new_fd, NULL, NULL) != -1 ||
+        errno != EOPNOTSUPP || epoll_fd_count(epfd) != 2) {
+        FAIL("ambiguous DEL should return EOPNOTSUPP");
+        goto ambiguous_cleanup;
+    }
+
+    uint64_t one = 1;
+    if (write(keeper, &one, sizeof(one)) != (ssize_t)sizeof(one) ||
+        write(new_fd, &one, sizeof(one)) != (ssize_t)sizeof(one)) {
+        FAIL("eventfd write");
+        goto ambiguous_cleanup;
+    }
+    epoll_event_ex output[2];
+    int count = epoll_wait_ex(epfd, output, 2, 100);
+    int saw_old = 0;
+    int saw_new = 0;
+    if (count != 2) {
+        FAIL("failed ambiguous controls changed native state");
+        goto ambiguous_cleanup;
+    }
+    for (int i = 0; i < count; i++) {
+        if (output[i].data.u64 == old_data &&
+            output[i].user_ctx == &old_context) {
+            saw_old = 1;
+        } else if (output[i].data.u64 == new_data &&
+                   output[i].user_ctx == &new_context) {
+            saw_new = 1;
+        } else {
+            FAIL("ambiguous event metadata mismatch");
+            goto ambiguous_cleanup;
+        }
+    }
+    if (!saw_old || !saw_new) {
+        FAIL("missing event after ambiguous controls");
+        goto ambiguous_cleanup;
+    }
+    PASS();
+
+ambiguous_cleanup:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (old_fd >= 0) close(old_fd);
+    if (new_fd >= 0) close(new_fd);
+    if (keeper >= 0) close(keeper);
+}
+
+/* --------------------------------------------------------------------- */
 /* Closing stale metadata must never close an unrelated reused fd.       */
 /* --------------------------------------------------------------------- */
 
@@ -1548,13 +2197,18 @@ int main(void)
     test_sigmask_semantics();
     test_ptr_and_u64_context();
     test_duplicate_data_context();
+    test_mod_updates_duplicate_data_index();
     test_mod_context_and_data();
     test_mod_adopts_native_registration();
     test_rearm_preserves_registration();
     test_drain_and_batch();
     test_invalid_and_closed_descriptors();
+    test_close_wakes_blocking_extended_wait();
+    test_context_change_during_wait_is_not_stale();
     test_concurrent_close_and_reuse();
     test_native_close_and_reuse();
+    test_live_registration_fd_reuse();
+    test_ambiguous_fd_identity_is_rejected();
     test_stale_close_preserves_reused_fd();
 
     printf("\n");

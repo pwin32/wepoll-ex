@@ -103,16 +103,17 @@ typedef struct epoll_event {
  *
  * Carries the source epoll_event plus auxiliary information that high-
  * performance consumers want without a second syscall:
- *   - flags      : internal descriptor state (currently oneshot delivery).
- *   - timestamp  : monotonic nanosecond timestamp sampled near IOCP
- *                  delivery; its origin is intentionally unspecified.
+ *   - flags      : delivery state.  Windows currently reports oneshot
+ *                  delivery; POSIX may also report native edge delivery.
+ *   - timestamp  : monotonic nanosecond timestamp sampled around delivery;
+ *                  its origin is intentionally unspecified.
  *   - user_ctx   : opaque pointer registered per-fd via epoll_ctl_ctx().
  *                  Consumers can associate a stable application object with
  *                  the registration without a separate metadata lookup.
  * ------------------------------------------------------------------------- */
 #define WEPOLL_FLAG_ONESHOT_FIRED  (1U << 0)
-#define WEPOLL_FLAG_ET_DELIVERED   (1U << 1) /* reserved; EPOLLET unsupported */
-#define WEPOLL_FLAG_EDGE_ARMED     (1U << 2) /* reserved; EPOLLET unsupported */
+#define WEPOLL_FLAG_ET_DELIVERED   (1U << 1) /* native EPOLLET was delivered */
+#define WEPOLL_FLAG_EDGE_ARMED     (1U << 2) /* native edge registration */
 
 typedef struct epoll_event_ex {
     uint32_t      events;
@@ -154,22 +155,31 @@ WEPOLL_EX_API int  epoll_pwait2(int epfd, struct epoll_event *events,
  * be Linux-portable and should be guarded with #ifdef WEPOLL_EX_H_.
  * ------------------------------------------------------------------------- */
 
-/* Same as epoll_create1, but allows the caller to reserve a hint about
- * the maximum number of fds that will be registered, so the IOCP
- * completion queue and AFD poll pool can be pre-sized.  Passing 0
- * falls back to a sensible default (64k fds). */
+/* Same as epoll_create1, with an optional Windows capacity hint.  A positive
+ * size pre-grows the fd table and raises the initial AFD/ready pool capacity
+ * (capped internally); it does not resize the fixed IOCP dequeue batch.
+ * Passing 0 uses defaults.  POSIX accepts but otherwise ignores the hint. */
 WEPOLL_EX_API int  epoll_create_ex(int size, int flags);
 
 /* epoll_ctl with an extra user_ctx pointer that will be surfaced in
- * every epoll_event_ex delivered for this fd.  Pass NULL to clear. */
+ * epoll_event_ex results for this fd.  Pass NULL to clear.  On POSIX, any
+ * overlapping extension metadata change suppresses user_ctx for the whole
+ * returned batch; a shared opaque data value also cannot be decorated.
+ * MOD/DEL on reused fd numbers return EOPNOTSUPP when the current fstat
+ * fingerprint cannot identify one metadata registration unambiguously. On
+ * Windows, a stable ADD made with no active waiter may defer an AFD submission
+ * error until the first wait attempts to arm the registration. */
 WEPOLL_EX_API int  epoll_ctl_ctx(int epfd, int op, epoll_fd_t fd,
                                  struct epoll_event *ev, void *user_ctx);
 
-/* epoll_wait that returns extended events. */
+/* epoll_wait that returns extended events.  POSIX waits use a stable
+ * duplicate of the tracked epoll descriptor so wepoll_close() can wake a
+ * blocked extended wait and make it fail with EBADF. */
 WEPOLL_EX_API int  epoll_wait_ex(int epfd, struct epoll_event_ex *events,
                                  int maxevents, int timeout);
 
-/* epoll_pwait2 that returns extended events. */
+/* epoll_pwait2 that returns extended events.  POSIX applies a non-NULL
+ * signal mask atomically through epoll_pwait; Windows accepts only NULL. */
 WEPOLL_EX_API int  epoll_pwait2_ex(int epfd, struct epoll_event_ex *events,
                                    int maxevents,
                                    const struct timespec *timeout,
@@ -184,20 +194,24 @@ WEPOLL_EX_API int  epoll_ctl_batch(int epfd,
                                    const struct epoll_event *events,
                                    int count);
 
-/* Drain the ready queue without blocking.  Returns 0 if no events are
- * ready, otherwise behaves like epoll_wait with timeout=0. */
+/* Perform a zero-timeout readiness probe.  Windows may spend a bounded period
+ * draining internal IOCP packets before returning; POSIX delegates directly
+ * to native epoll_wait(..., 0). */
 WEPOLL_EX_API int  epoll_drain(int epfd, struct epoll_event *events,
                                int maxevents);
 
-/* Re-arm a fd that fired in EPOLLONESHOT mode without a full
- * EPOLL_CTL_MOD round-trip.  Equivalent to:
- *     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &saved_event);
- * but cheaper because it skips user-mode validation and re-uses the
- * cached registration. */
+/* Re-arm a tracked fd after an EPOLLONESHOT delivery while preserving its
+ * saved event, data, and context.  Windows validates socket identity and is a
+ * no-op when the oneshot has not fired; POSIX issues a native MOD. */
 WEPOLL_EX_API int  epoll_rearm(int epfd, epoll_fd_t fd);
 
-/* Return the number of fds currently registered on the epoll
- * instance.  Useful for diagnostics and nginx's status module. */
+/* Return the number of registrations tracked by this extension.  Windows
+ * counts registrations in the virtual epoll instance.  POSIX counts entries
+ * created/adopted through epoll_ctl_ctx or epoll_ctl_batch.  Native ADD is
+ * outside this view until an extension MOD adopts it, and later native
+ * MOD/DEL operations do not update extension metadata.  On POSIX, use
+ * extension DEL before native close when an immediately accurate count is
+ * required. */
 WEPOLL_EX_API int  epoll_fd_count(int epfd);
 
 /* Return library version: 0x00MMmmpp (major, minor, patch). */
@@ -205,12 +219,14 @@ WEPOLL_EX_API uint32_t wepoll_ex_version(void);
 WEPOLL_EX_API const char *wepoll_ex_version_string(void);
 
 /* Close an epoll fd created by epoll_create / epoll_create1 /
- * epoll_create_ex.  On POSIX this normally behaves like close(); a detected
- * stale tracked generation returns -1/EBADF without closing the replacement.
- * Synchronize native close/reuse against this call.  On Windows the user must
- * call wepoll_close() because the integer epfd is virtual and not a real
- * HANDLE.  A Windows teardown failure can return -1 after the virtual epfd has
- * been removed; that descriptor is still closed and must not be retried. */
+ * epoll_create_ex.  On POSIX this normally behaves like close(); tracked
+ * extended waits are woken and fail with EBADF.  A detected stale tracked
+ * generation returns -1/EBADF without closing the replacement.  Plain native
+ * close() cannot wake an extended wait or retire its metadata, so callers
+ * using the extension should use wepoll_close() and synchronize native
+ * close/reuse against it.  On Windows the integer epfd is virtual and this
+ * function is required.  A Windows teardown failure can return -1 after the
+ * virtual epfd has been removed; that descriptor must not be retried. */
 WEPOLL_EX_API int wepoll_close(int epfd);
 
 #ifdef __cplusplus
