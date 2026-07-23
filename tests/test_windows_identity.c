@@ -438,6 +438,16 @@ int main(int argc, char **argv)
     if (argc != 2 || WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
         return 2;
     }
+#ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+    if (strcmp(argv[1], "pending-add") == 0 ||
+        strcmp(argv[1], "oneshot-rearm") == 0 ||
+        strcmp(argv[1], "queued-ready") == 0 ||
+        strcmp(argv[1], "transitional-reuse") == 0) {
+        puts("identity mode skipped: synchronized socket lifetime contract");
+        (void)WSACleanup();
+        return 77;
+    }
+#endif
     if (strcmp(argv[1], "pending-add") == 0) {
         result = test_pending_add_reuse();
     } else if (strcmp(argv[1], "oneshot-rearm") == 0) {

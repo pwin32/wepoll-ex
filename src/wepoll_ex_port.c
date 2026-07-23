@@ -15,6 +15,7 @@
 
 #define EP_CLOSE_DRAIN_TIMEOUT_MS UINT64_C(5000)
 #define EP_CLOSE_DRAIN_SLICE_MS   100U
+#define EP_ZERO_TIMEOUT_BATCH_LIMIT 4U
 
 /* ------------------------------------------------------------------------- */
 /* Time and fd-table helpers.                                                */
@@ -1367,6 +1368,7 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
                  int timeout_ms, const wepoll_sigset_t *sigmask)
 {
     uint64_t deadline = 0;
+    size_t zero_timeout_budget = 0;
     int result = -1;
     int lock_result;
 
@@ -1385,6 +1387,16 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
 
     if (timeout_ms > 0) {
         deadline = GetTickCount64() + (uint64_t)timeout_ms;
+    } else if (timeout_ms == 0) {
+        /* AFD cancellation and wake packets are internal to the API.  Drain
+         * several complete IOCP batches before reporting an empty nonblocking
+         * wait, otherwise a real readiness packet queued behind bookkeeping
+         * completions can be hidden until the caller retries.  Keep a finite
+         * budget so a producer that continuously posts internal packets cannot
+         * turn timeout=0 into an unbounded loop. */
+        zero_timeout_budget = (size_t)port->iocp_batch_size *
+                              EP_ZERO_TIMEOUT_BATCH_LIMIT;
+        if (zero_timeout_budget == 0) zero_timeout_budget = 1;
     }
     lock_result = ep_wait_lock_acquire(port, timeout_ms, deadline);
     if (lock_result <= 0) {
@@ -1439,6 +1451,10 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
             }
             break;
         }
+        if (removed == 0) {
+            result = 0;
+            break;
+        }
 
         for (ULONG i = 0; i < removed; i++) {
             OVERLAPPED *overlapped = port->iocp_entries[i].lpOverlapped;
@@ -1454,11 +1470,19 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
                 iosb->Status);
         }
 
+        if (timeout_ms == 0) {
+            if ((size_t)removed >= zero_timeout_budget) {
+                zero_timeout_budget = 0;
+            } else {
+                zero_timeout_budget -= (size_t)removed;
+            }
+        }
+
         result = ep_drain_to_buffer(port, out, maxevents);
         if (result > 0) {
             break;
         }
-        if (timeout_ms == 0) {
+        if (timeout_ms == 0 && zero_timeout_budget == 0) {
             result = 0;
             break;
         }

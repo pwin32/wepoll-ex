@@ -28,10 +28,36 @@ else()
         _WIN32_WINNT=0x0602
         WIN32_LEAN_AND_MEAN)
 
+    add_executable(test_wepoll_ex_windows_ipv6
+        test_windows_ipv6.c)
+    target_compile_definitions(test_wepoll_ex_windows_ipv6 PRIVATE
+        _WIN32_WINNT=0x0602
+        WIN32_LEAN_AND_MEAN)
+
+    add_executable(test_wepoll_ex_windows_backpressure
+        test_windows_backpressure.c)
+    target_compile_definitions(test_wepoll_ex_windows_backpressure PRIVATE
+        _WIN32_WINNT=0x0602
+        WIN32_LEAN_AND_MEAN)
+
     if(WEPOLL_EX_BUILD_STATIC)
         target_link_libraries(test_wepoll_ex_windows PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
         target_link_libraries(test_wepoll_ex_windows_identity PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_ipv6 PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_backpressure PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+
+        add_executable(test_wepoll_ex_windows_iocp_batch
+            test_windows_iocp_batch.c)
+        target_include_directories(test_wepoll_ex_windows_iocp_batch PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(test_wepoll_ex_windows_iocp_batch PRIVATE
+            _WIN32_WINNT=0x0602
+            WIN32_LEAN_AND_MEAN)
+        target_link_libraries(test_wepoll_ex_windows_iocp_batch PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
         add_executable(test_wepoll_ex_windows_lifecycle
@@ -102,10 +128,29 @@ else()
             wepoll_ex::wepoll_ex ws2_32)
         target_link_libraries(test_wepoll_ex_windows_identity PRIVATE
             wepoll_ex::wepoll_ex ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_ipv6 PRIVATE
+            wepoll_ex::wepoll_ex ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_backpressure PRIVATE
+            wepoll_ex::wepoll_ex ws2_32)
     endif()
 
     add_test(NAME wepoll_ex_windows_api COMMAND test_wepoll_ex_windows)
     set_tests_properties(wepoll_ex_windows_api PROPERTIES TIMEOUT 120)
+
+    add_test(NAME wepoll_ex_windows_ipv6
+        COMMAND test_wepoll_ex_windows_ipv6)
+    set_tests_properties(wepoll_ex_windows_ipv6
+        PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+
+    add_test(NAME wepoll_ex_windows_backpressure
+        COMMAND test_wepoll_ex_windows_backpressure)
+    set_tests_properties(wepoll_ex_windows_backpressure PROPERTIES TIMEOUT 30)
+
+    if(WEPOLL_EX_BUILD_STATIC)
+        add_test(NAME wepoll_ex_windows_iocp_batch
+            COMMAND test_wepoll_ex_windows_iocp_batch)
+        set_tests_properties(wepoll_ex_windows_iocp_batch PROPERTIES TIMEOUT 20)
+    endif()
 
     foreach(_identity_mode IN ITEMS
             pending-add
@@ -117,7 +162,7 @@ else()
         add_test(NAME wepoll_ex_windows_identity_${_identity_name}
             COMMAND test_wepoll_ex_windows_identity ${_identity_mode})
         set_tests_properties(wepoll_ex_windows_identity_${_identity_name}
-            PROPERTIES TIMEOUT 15)
+            PROPERTIES TIMEOUT 15 SKIP_RETURN_CODE 77)
     endforeach()
 
     if(MINGW)
@@ -142,6 +187,8 @@ else()
     if(WEPOLL_EX_BUILD_SHARED AND NOT WEPOLL_EX_BUILD_STATIC)
         set_tests_properties(
             wepoll_ex_windows_api
+            wepoll_ex_windows_ipv6
+            wepoll_ex_windows_backpressure
             wepoll_ex_windows_identity_pending_add
             wepoll_ex_windows_identity_oneshot_rearm
             wepoll_ex_windows_identity_queued_ready

@@ -81,8 +81,10 @@ by the extension path.
   define `WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME` to omit endpoint-token
   probes. Windows DEL removes the public registration even when cancellation
   of an in-flight AFD request fails; storage remains pinned for a later
-  completion or safe close-time quarantine. The nginx addon uses this
-  contract-specific optimization.
+  completion or safe close-time quarantine. Native close/reuse identity tests
+  are skipped under this contract because the caller has assumed that
+  synchronization responsibility. The nginx addon uses this contract-specific
+  optimization.
 - Windows builds set `_WIN32_WINNT=0x0602`; Windows 8 or later is the current
   compile/runtime assumption, not a validated compatibility floor for every
   AFD revision.
@@ -101,6 +103,10 @@ by the extension path.
   failure. Earlier MOD and DEL operations remain applied.
 - Timestamps use `QueryPerformanceCounter` on Windows and have an unspecified
   monotonic origin.
+- A zero-timeout Windows wait drains up to four configured IOCP batches of
+  internal or cancellation completions before returning empty. The finite
+  bound prevents a nonblocking call from spinning forever behind a completion
+  storm.
 - Cancelled registrations remain internally allocated until a wait or close
   drains their IOCP completion, although they are absent from public lookup.
 - Concurrent finite waits include time spent waiting for the single-consumer
@@ -121,8 +127,10 @@ covers read/write readiness, FIN/RDHUP filtering, reset and refused-connect
 mapping, context changes, oneshot/rearm state transitions and rollback, stable
 native socket reuse, invalid arguments, batch rollback and descriptor-table
 collisions, native socket close, concurrent close/wait, bounded waits under
-contention, shutdown fault paths, and the installed-package consumer. Shared,
-static, and combined MinGW configurations are exercised. The nginx 1.31.3
+contention, shutdown fault paths, IPv6 readiness, send-buffer backpressure,
+and the installed-package consumer. The Windows suite also guards zero-timeout
+IOCP batch draining across the configured completion boundary. Shared, static,
+and combined MinGW configurations are exercised. The nginx 1.31.3
 adapter also passes strict addon
 compilation, full minimal and HTTP Win32 links, configuration bounds checks,
 `nginx -t`, 100 loopback HTTP requests across a worker reload, and graceful

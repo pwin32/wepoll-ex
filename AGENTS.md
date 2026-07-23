@@ -26,8 +26,10 @@ ctest --test-dir build-release --output-on-failure
 For Windows, use `/path/to/msys64/usr/bin/bash.exe`, put `/mingw64/bin:/usr/bin`
 first in `PATH`, configure with `-G "MinGW Makefiles"`, and run CTest. Validate
 combined, shared-only, and (for nginx) `WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME`
-builds. Build the nginx adapter with its configured nginx tree, then run
-`nginx -t` and a bounded loopback smoke before collecting benchmarks.
+builds. The synchronized-lifetime contract intentionally skips native
+close/reuse identity modes. Build the nginx adapter with its configured nginx
+tree, then run `nginx -t` and a bounded loopback smoke before collecting
+benchmarks.
 
 Never run `rg`, `find`, or similar searches on `/` or a Windows drive
 mountpoint; scope searches to this repository or an explicitly named build.
@@ -38,7 +40,9 @@ Use strict C11, four-space indentation, the surrounding brace style, project
 headers before system headers, `snake_case` names, `_t` project types, `ep_*`
 internals, and uppercase macros. There is no configured formatter or linter.
 Add behavior-focused plain-C tests and run both named executables plus CTest.
-Record compiler, Windows version, and relevant build flags for Windows runs.
+Windows CTest includes IPv6, send-backpressure, and bounded IOCP-batch
+regressions. Record compiler, Windows version, and relevant build flags for
+Windows runs.
 
 ## Packaging, Commits, and Network
 

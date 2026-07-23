@@ -14,6 +14,12 @@ exercise readiness, socket reuse, cancellation, concurrent wait/close, fault
 injection, and bounded teardown. The nginx adapter has been compile-checked and
 smoke-tested with loopback HTTP traffic across a worker reload.
 
+The Windows regression suite now also covers IPv6 listener/stream readiness,
+send-buffer backpressure, and zero-timeout waits with more than one IOCP batch
+of internal completion packets. Zero-timeout waits use a bounded internal
+completion drain so an initial cancellation burst cannot hide a queued
+readiness event or create an unbounded nonblocking loop.
+
 This validation is not a support matrix. MSVC and other Windows toolchains are
 not yet validated, and AFD is undocumented. `_WIN32_WINNT=0x0602` is the
 Windows 8-or-later compile/runtime assumption; Windows 8 itself was not tested.
