@@ -103,7 +103,11 @@ static int test_cancel_failure(void)
 
 static int test_del_cancel_failure(void)
 {
-    enum { MAX_CANDIDATES = 64 };
+    /* A socket whose AFD poll request is still pending may not be returned by
+     * the Windows handle allocator immediately after closesocket().  Keep a
+     * bounded batch of candidates open so the test reaches numeric reuse on
+     * normal Windows builds without making reuse itself an optional check. */
+    enum { MAX_CANDIDATES = 4096 };
     static const char byte = 'd';
     static const uint64_t replacement_data =
         UINT64_C(0xdedecafefeed1234);

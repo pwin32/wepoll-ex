@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(wepoll-ex
-    VERSION 1.0.0
+    VERSION 0.1.0
     DESCRIPTION "Experimental extended epoll compatibility layer for Windows"
     LANGUAGES C)
 
@@ -168,7 +168,7 @@ if(WEPOLL_EX_BUILD_SHARED)
         OUTPUT_NAME wepoll_ex
         POSITION_INDEPENDENT_CODE ON
         VERSION ${PROJECT_VERSION}
-        SOVERSION 1
+        SOVERSION 0
         C_VISIBILITY_PRESET hidden)
     target_include_directories(wepoll_ex_shared
         PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -244,6 +244,11 @@ endif()
 # --------------------------------------------------------------------- #
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(FILES
+    LICENSE
+    NOTICE
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/wepoll-ex)
 
 if(WEPOLL_EX_BUILD_SHARED)
     install(TARGETS wepoll_ex_shared

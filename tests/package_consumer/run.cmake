@@ -3,7 +3,8 @@ foreach(_required_var IN ITEMS
         WEPOLL_EX_BUILD_DIR
         WEPOLL_EX_CONSUMER_BUILD_DIR
         WEPOLL_EX_INSTALL_PREFIX
-        WEPOLL_EX_INSTALL_LIBDIR)
+        WEPOLL_EX_INSTALL_LIBDIR
+        WEPOLL_EX_INSTALL_DATADIR)
     if(NOT DEFINED ${_required_var} OR "${${_required_var}}" STREQUAL "")
         message(FATAL_ERROR "${_required_var} is required")
     endif()
@@ -33,6 +34,15 @@ if(NOT _install_result EQUAL 0)
     message(FATAL_ERROR
         "Package install failed:\n${_install_output}\n${_install_error}")
 endif()
+
+foreach(_notice_file IN ITEMS LICENSE NOTICE)
+    set(_notice_path
+        "${WEPOLL_EX_INSTALL_PREFIX}/${WEPOLL_EX_INSTALL_DATADIR}/licenses/wepoll-ex/${_notice_file}")
+    if(NOT EXISTS "${_notice_path}")
+        message(FATAL_ERROR
+            "Installed package is missing ${_notice_file}: ${_notice_path}")
+    endif()
+endforeach()
 
 set(_configure_command
     "${CMAKE_COMMAND}"

@@ -552,7 +552,7 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
         events[i].user_ctx = NULL;
 
         if (p) {
-            posix_sock_snapshot_t snapshot;
+            posix_sock_snapshot_t snapshot = {0};
             if (node_snapshot_by_data(p, kevs[i].data, &snapshot)) {
                 events[i].user_ctx = snapshot.user_ctx;
                 if (snapshot.event.events & EPOLLET) {
@@ -717,9 +717,13 @@ WEPOLL_EX_API int epoll_fd_count(int epfd)
     return result;
 }
 
-WEPOLL_EX_API uint32_t wepoll_ex_version(void)        { return 0x00010000; }
-WEPOLL_EX_API const char *wepoll_ex_version_string(void) {
-    return "wepoll-ex 1.0.0 (POSIX wrapper)";
+WEPOLL_EX_API uint32_t wepoll_ex_version(void)
+{
+    return UINT32_C(0x00000100);
+}
+WEPOLL_EX_API const char *wepoll_ex_version_string(void)
+{
+    return "wepoll-ex 0.1.0 (POSIX wrapper)";
 }
 
 WEPOLL_EX_API int wepoll_close(int epfd)

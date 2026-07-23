@@ -15,8 +15,13 @@ if(WEPOLL_EX_EXPECT_STATIC)
     list(APPEND _wepoll_ex_components static)
 endif()
 
-find_package(wepoll_ex 1.0.0 EXACT CONFIG REQUIRED
+find_package(wepoll_ex 0.1.0 EXACT CONFIG REQUIRED
     COMPONENTS ${_wepoll_ex_components})
+
+if(NOT wepoll_ex_VERSION STREQUAL "0.1.0" OR
+   NOT WEPOLL_EX_VERSION STREQUAL "0.1.0")
+    message(FATAL_ERROR "Installed package reports an unexpected version")
+endif()
 
 if(NOT TARGET wepoll_ex::wepoll_ex)
     message(FATAL_ERROR "Installed package is missing wepoll_ex::wepoll_ex")

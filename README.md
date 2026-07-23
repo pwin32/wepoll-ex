@@ -98,7 +98,36 @@ select the static winpthreads archive and CTest rejects an accidental
 `libwinpthread-1.dll` dependency. Record the exact command, compiler, and OS
 for new results.
 
+## Install and consume
+
+Version 0.1.0 is an experimental preview and does not promise a stable ABI.
+Install it to an isolated prefix while evaluating it:
+
+```sh
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \
+    -DWEPOLL_EX_BUILD_TESTS=OFF
+cmake --build build-release --parallel
+cmake --install build-release --prefix /path/to/wepoll-ex-prefix
+```
+
+CMake consumers can use the installed package and its default target (shared
+when both library forms are installed):
+
+```cmake
+find_package(wepoll_ex 0.1.0 CONFIG REQUIRED)
+target_link_libraries(my_server PRIVATE wepoll_ex::wepoll_ex)
+```
+
+Use `wepoll_ex::wepoll_ex_static` or `wepoll_ex::wepoll_ex_shared` when the
+linkage must be explicit. Set `CMAKE_PREFIX_PATH` to the install prefix, or set
+`wepoll_ex_DIR` to its `<libdir>/cmake/wepoll_ex` directory.
+
+Release-specific validation and limitations are recorded in
+[`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md).
+
 ## Credits and license
 
-The AFD/IOCP approach is derived from wepoll by Bert Belder. See `LICENSE` for
-the ISC license text.
+New wepoll-ex contributions are distributed under the ISC terms in `LICENSE`.
+The Windows AFD/IOCP implementation contains work derived from wepoll by Bert
+Belder; the upstream BSD-2-Clause terms are preserved in `NOTICE`. Installed
+packages include both files under `share/licenses/wepoll-ex`.
