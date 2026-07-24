@@ -281,6 +281,11 @@ struct ep_sock {
      * uses it to avoid cancelling a request whose mask already covers the
      * new interests. */
     uint32_t submitted_afd_events;
+    /* Edge-triggered latch: interest bits already reported to the user while
+     * the corresponding level remains continuously true.  Cleared for bits
+     * that drop out of the latest AFD level snapshot so a later re-assert
+     * can form a new edge. */
+    uint32_t observed_events;
 
     /* Poll lifecycle.  The IO_STATUS_BLOCK is also used as the ApcContext
      * returned in the IOCP packet, so it must remain embedded until the
@@ -290,6 +295,10 @@ struct ep_sock {
     _Atomic uint32_t ready_queued;
     uint8_t oneshot_fired;
     uint8_t needs_rearm;
+    /* When EPOLLET produces an empty edge from a still-true level, defer
+     * re-submission until the next wait arm pass so completion handling
+     * cannot busy-loop on a permanently readable/writable socket. */
+    uint8_t et_holdoff;
 
     /* Exactly-once membership in the per-port deferred-work lists.  These
      * links are protected by fd_table_lock and are independent of the live

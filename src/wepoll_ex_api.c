@@ -286,18 +286,8 @@ static int epoll_ctl_port(ep_port_t *port,
             ep_set_errno(EFAULT);
             return -1;
         }
-        if ((event->events & EPOLLET) != 0) {
-            /* AFD_POLL is one-shot/level-triggered; re-arming it while a
-             * socket remains ready would duplicate unread events.  Fail
-             * explicitly until a real edge-triggered state machine exists. */
-            ep_set_errno(EOPNOTSUPP);
-            return -1;
-        }
-        if ((event->events & EPOLLEXCLUSIVE) != 0) {
-            ep_set_errno(EOPNOTSUPP);
-            return -1;
-        }
-        flags = event->events & (EPOLLONESHOT | EPOLLEXCLUSIVE);
+        /* EPOLLEXCLUSIVE may only be set at ADD time, matching Linux. */
+        flags = event->events & (EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLET);
         return ep_port_register(port, (SOCKET)fd,
                                 event->events, flags,
                                 event->data, user_ctx);
@@ -307,15 +297,12 @@ static int epoll_ctl_port(ep_port_t *port,
             ep_set_errno(EFAULT);
             return -1;
         }
-        if ((event->events & EPOLLET) != 0) {
-            ep_set_errno(EOPNOTSUPP);
-            return -1;
-        }
         if ((event->events & EPOLLEXCLUSIVE) != 0) {
-            ep_set_errno(EOPNOTSUPP);
+            /* Linux rejects EPOLLEXCLUSIVE on MOD. */
+            ep_set_errno(EINVAL);
             return -1;
         }
-        flags = event->events & EPOLLONESHOT;
+        flags = event->events & (EPOLLONESHOT | EPOLLET);
         return ep_port_modify(port, (SOCKET)fd,
                               event->events, flags,
                               event->data, user_ctx);

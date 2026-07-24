@@ -9,6 +9,8 @@
  *   - Common Linux entry points are exposed on Windows, plus an `_ex`
  *     extension family for diagnostics and per-registration context.
  *   - All EPOLL* event flag bits defined by Linux uapi are present.
+ *   - Windows implements EPOLLET (observed-edge) and ADD-time
+ *     EPOLLEXCLUSIVE; non-null wait signal masks remain unsupported.
  *   - errno is set to the closest portable/Linux-style value on failure.
  *     See docs/DESIGN.md for the current platform limitations.
  *

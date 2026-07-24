@@ -163,9 +163,13 @@ optional heap event buffer and metadata reference before unwinding.
 - `EPOLLONESHOT`, context delivery, RDHUP mapping, zero-timeout waits, native
   socket close cleanup and stable numeric reuse, and concurrent epoll close
   have regression coverage.
-- `EPOLLET` and `EPOLLEXCLUSIVE` are rejected with `EOPNOTSUPP`. Silently
-  treating AFD's one-shot level notification as an edge would duplicate unread
-  readiness.
+- `EPOLLET` is implemented as an observed-edge filter over AFD level
+  snapshots: each interest bit is delivered once while continuously true, then
+  suppressed until it drops out of the latest level and reappears. Empty edge
+  completions defer re-arming to the next wait so permanently ready sockets do
+  not spin. `EPOLLEXCLUSIVE` may be set only at ADD (MOD with the flag returns
+  `EINVAL`) and submits AFD polls with `Exclusive=TRUE` so peer wepoll-ex
+  instances watching the same provider handle are cancelled on wake.
 - The nginx adapter leaves `ngx_event_actions.notify` unset. nginx 1.31.3
   rejects `--with-threads` on Win32 and its thread-pool sources are POSIX-only,
   so thread-pool integration is outside this prototype's supported boundary.

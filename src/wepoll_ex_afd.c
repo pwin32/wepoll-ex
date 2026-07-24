@@ -369,7 +369,11 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
     memset(info, 0, sizeof(*info));
     info->Timeout.QuadPart  = INT64_MAX;
     info->NumberOfHandles   = 1;
-    info->Exclusive         = FALSE;
+    /* Exclusive AFD polls cancel peer non-exclusive/exclusive requests for
+     * the same provider handle, approximating Linux EPOLLEXCLUSIVE wake
+     * uniqueness among wepoll-ex instances watching the same socket. */
+    info->Exclusive         = (sock->user_flags & EPOLLEXCLUSIVE) != 0
+                                  ? TRUE : FALSE;
     info->Handles[0].Handle = (HANDLE)sock->base_socket;
     info->Handles[0].Events = afd_events;
 
@@ -409,6 +413,13 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
         sock->submitted_afd_events = old_submitted_afd_events;
         ep_set_errno(ep_status_to_errno(status));
         return -1;
+    }
+    /* A pending poll means the provider is not currently matching the
+     * requested level.  Clear the edge latch so a later assert can form a
+     * fresh EPOLLET edge after the user drained to EAGAIN.  Immediate
+     * success keeps the latch so unread level does not redeliver. */
+    if (status == STATUS_PENDING && (sock->user_flags & EPOLLET) != 0) {
+        sock->observed_events = 0;
     }
     return 0;
 #else

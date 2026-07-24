@@ -47,6 +47,12 @@ else()
         _WIN32_WINNT=0x0602
         WIN32_LEAN_AND_MEAN)
 
+    add_executable(test_wepoll_ex_windows_edge
+        test_windows_edge.c)
+    target_compile_definitions(test_wepoll_ex_windows_edge PRIVATE
+        _WIN32_WINNT=0x0602
+        WIN32_LEAN_AND_MEAN)
+
     if(WEPOLL_EX_BUILD_STATIC)
         target_link_libraries(test_wepoll_ex_windows PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
@@ -57,6 +63,8 @@ else()
         target_link_libraries(test_wepoll_ex_windows_backpressure PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
         target_link_libraries(test_wepoll_ex_windows_stress PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_edge PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
         add_executable(test_wepoll_ex_pool test_pool.c)
@@ -215,6 +223,8 @@ else()
             wepoll_ex::wepoll_ex ws2_32)
         target_link_libraries(test_wepoll_ex_windows_stress PRIVATE
             wepoll_ex::wepoll_ex ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_edge PRIVATE
+            wepoll_ex::wepoll_ex ws2_32)
     endif()
 
     add_test(NAME wepoll_ex_windows_api COMMAND test_wepoll_ex_windows)
@@ -232,6 +242,18 @@ else()
     add_test(NAME wepoll_ex_windows_stress
         COMMAND test_wepoll_ex_windows_stress)
     set_tests_properties(wepoll_ex_windows_stress PROPERTIES TIMEOUT 30)
+
+    foreach(_edge_mode IN ITEMS
+            readable
+            writable
+            exclusive-mod
+            exclusive-wake)
+        string(REPLACE "-" "_" _edge_name "${_edge_mode}")
+        add_test(NAME wepoll_ex_windows_edge_${_edge_name}
+            COMMAND test_wepoll_ex_windows_edge ${_edge_mode})
+        set_tests_properties(wepoll_ex_windows_edge_${_edge_name}
+            PROPERTIES TIMEOUT 20)
+    endforeach()
 
     if(WEPOLL_EX_BUILD_STATIC)
         add_test(NAME wepoll_ex_pool_mpsc COMMAND test_wepoll_ex_pool)

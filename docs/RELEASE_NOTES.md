@@ -43,6 +43,13 @@ queue, pool, rearm, stale-event, identity, asynchronous-error, drain-budget,
 quarantine, reaper, and close-timeout diagnostics. Linux reports its extension
 registration count and a not-applicable lifetime policy.
 
+Windows `EPOLLET` and ADD-time `EPOLLEXCLUSIVE` are no longer rejected.
+Edge-triggered delivery latches observed interest bits from AFD level
+snapshots and suppresses redelivery until those bits clear and reassert; empty
+edge completions defer re-arming to the next wait. Exclusive registrations
+submit AFD polls with `Exclusive=TRUE`, and MOD with `EPOLLEXCLUSIVE` returns
+`EINVAL` as on Linux.
+
 Rearm and fired-oneshot tracking now use intrusive worklists. Wait preparation
 is proportional to pending work rather than all registrations; a regression
 places 50,000 synthetic inert socket-state nodes beside one rearm to guard that
@@ -138,8 +145,11 @@ local noise, so this run does not demonstrate a throughput improvement.
 This validation is not a support matrix. MSVC and other Windows toolchains are
 not yet validated, and AFD is undocumented. `_WIN32_WINNT=0x0602` is the
 Windows 8-or-later compile/runtime assumption; Windows 8 itself was not tested.
-`EPOLLET`, `EPOLLEXCLUSIVE`, and non-null signal masks are not supported by the
-Windows backend. Performance measurements are local loopback observations, not
+Windows now accepts `EPOLLET` and ADD-time `EPOLLEXCLUSIVE`. Edge delivery is
+an observed-bit filter over AFD level reports rather than a kernel edge
+queue, and exclusive wake uniqueness relies on AFD exclusive-poll cancellation
+among wepoll-ex instances. Non-null signal masks remain unsupported on
+Windows. Performance measurements are local loopback observations, not
 portable throughput guarantees.
 
 See `README.md`, `docs/DESIGN.md`, and `docs/NGINX_INTEGRATION.md` for current

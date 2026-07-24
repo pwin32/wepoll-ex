@@ -22,6 +22,74 @@
 #define EP_MAX_ACTIVE_QUARANTINES        4U
 
 static _Atomic uint64_t g_quarantined_ports;
+
+/* EPOLLEXCLUSIVE wake uniqueness among wepoll-ex instances.  AFD Exclusive
+ * cancels peer polls when it can, but already-queued completions can still
+ * race.  Claim the provider base handle for one exclusive delivery at a time
+ * and release it after that registration is drained or deleted. */
+#define EP_EXCLUSIVE_CLAIM_SLOTS 128
+typedef struct ep_exclusive_claim {
+    SOCKET base;
+    uint8_t held;
+} ep_exclusive_claim_t;
+static ep_exclusive_claim_t g_exclusive_claims[EP_EXCLUSIVE_CLAIM_SLOTS];
+static pthread_mutex_t g_exclusive_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned ep_exclusive_slot(SOCKET base)
+{
+    uintptr_t value = (uintptr_t)base;
+    value ^= value >> 17;
+    value *= UINT64_C(0x9e3779b97f4a7c15);
+    return (unsigned)(value % EP_EXCLUSIVE_CLAIM_SLOTS);
+}
+
+static int ep_exclusive_try_claim(SOCKET base)
+{
+    unsigned start = ep_exclusive_slot(base);
+    unsigned i;
+    int free_idx = -1;
+
+    pthread_mutex_lock(&g_exclusive_lock);
+    for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
+        unsigned idx = (start + i) % EP_EXCLUSIVE_CLAIM_SLOTS;
+        ep_exclusive_claim_t *claim = &g_exclusive_claims[idx];
+        if (claim->held && claim->base == base) {
+            pthread_mutex_unlock(&g_exclusive_lock);
+            return 0;
+        }
+        if (!claim->held && free_idx < 0) {
+            free_idx = (int)idx;
+        }
+    }
+    if (free_idx >= 0) {
+        g_exclusive_claims[free_idx].base = base;
+        g_exclusive_claims[free_idx].held = 1;
+        pthread_mutex_unlock(&g_exclusive_lock);
+        return 1;
+    }
+    pthread_mutex_unlock(&g_exclusive_lock);
+    /* Table full: fail open and deliver rather than drop readiness. */
+    return 1;
+}
+
+static void ep_exclusive_release(SOCKET base)
+{
+    unsigned start = ep_exclusive_slot(base);
+    unsigned i;
+
+    pthread_mutex_lock(&g_exclusive_lock);
+    for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
+        unsigned idx = (start + i) % EP_EXCLUSIVE_CLAIM_SLOTS;
+        ep_exclusive_claim_t *claim = &g_exclusive_claims[idx];
+        if (claim->held && claim->base == base) {
+            claim->held = 0;
+            claim->base = INVALID_SOCKET;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_exclusive_lock);
+}
+
 static _Atomic uint64_t g_active_quarantines;
 static _Atomic uint64_t g_reaped_ports;
 static _Atomic uint64_t g_irrecoverable_ports;
@@ -683,6 +751,11 @@ static void ep_sock_free_locked(ep_port_t *port, ep_sock_t *sock)
 {
     ep_sock_set_needs_rearm_locked(sock, 0);
     ep_sock_set_oneshot_fired_locked(sock, 0);
+    if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
+        ep_exclusive_release(sock->base_socket);
+    }
+    sock->observed_events = 0;
+    sock->et_holdoff = 0;
     ep_sock_list_remove_locked(port, sock);
     if (sock->afd_info != NULL) {
         ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
@@ -795,6 +868,21 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
         return 0;
     }
 
+    /* A deferred edge-triggered re-arm is eligible again once a wait is
+     * preparing submissions. */
+    sock->et_holdoff = 0;
+    if ((sock->user_flags & EPOLLET) != 0 &&
+        (sock->user_events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP)) != 0) {
+        u_long available = 1;
+        if (ioctlsocket(sock->fd, FIONREAD, &available) == 0 &&
+            available == 0) {
+            sock->observed_events &= ~(EPOLLIN | EPOLLRDNORM | EPOLLRDHUP |
+                                      EPOLLHUP | EPOLLERR);
+            if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
+                ep_exclusive_release(sock->base_socket);
+            }
+        }
+    }
     uint32_t afd_events = ep_sock_afd_events_locked(sock, sock->user_events);
     if (ep_afd_poll_submit(sock, afd_events) != 0) {
         if (ep_last_err() == ENOTSOCK || ep_last_err() == EBADF) {
@@ -1028,12 +1116,44 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     }
     delivered &= sock->user_events | EPOLLERR | EPOLLHUP;
 
+    if ((sock->user_flags & EPOLLET) != 0) {
+        uint32_t level = delivered;
+        uint32_t interest = sock->user_events | EPOLLERR | EPOLLHUP;
+        uint32_t edge;
+
+        /* Bits no longer present in the latest level snapshot become eligible
+         * for a future edge when they reappear. */
+        sock->observed_events &= level & interest;
+        edge = level & ~sock->observed_events;
+        delivered = edge;
+        if (edge != 0) {
+            sock->observed_events |= edge;
+        }
+    } else {
+        sock->observed_events = 0;
+        sock->et_holdoff = 0;
+    }
+
     if (delivered == 0) {
+        /* Level-triggered empty reports re-arm immediately.  Edge-triggered
+         * empty reports mean the level is still true but already observed;
+         * defer re-arming to the next wait so permanently ready sockets do
+         * not spin inside completion handling. */
+        if ((sock->user_flags & EPOLLEXCLUSIVE) != 0 &&
+            (sock->user_flags & EPOLLET) == 0) {
+            /* Level exclusive: an empty completion means this instance saw no
+             * reportable readiness; keep the claim only around a delivered
+             * exclusive wake. */
+            ep_exclusive_release(sock->base_socket);
+        }
+        sock->et_holdoff = (sock->user_flags & EPOLLET) != 0;
         ep_sock_set_needs_rearm_locked(sock, 1);
-        if (EP_SOCK_SUBMIT_LOCKED(sock, 0) < 0) {
-            int error = ep_last_err();
-            ep_sock_set_needs_rearm_locked(sock, 1);
-            ep_port_record_async_error_locked(port, error);
+        if ((sock->user_flags & EPOLLET) == 0) {
+            if (EP_SOCK_SUBMIT_LOCKED(sock, 0) < 0) {
+                int error = ep_last_err();
+                ep_sock_set_needs_rearm_locked(sock, 1);
+                ep_port_record_async_error_locked(port, error);
+            }
         }
         pthread_mutex_unlock(&port->fd_table_lock);
         return;
@@ -1065,7 +1185,18 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     }
     node->timestamp = ep_now_ns();
 
+    if ((sock->user_flags & EPOLLEXCLUSIVE) != 0 &&
+        !ep_exclusive_try_claim(sock->base_socket)) {
+        /* Another exclusive registration already owns this wake. */
+        ep_ready_node_free(port, node);
+        sock->et_holdoff = 0;
+        ep_sock_set_needs_rearm_locked(sock, 1);
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return;
+    }
+
     sock->pending_events = delivered;
+    sock->et_holdoff = 0;
     atomic_store_explicit(&sock->ready_queued, 1, memory_order_relaxed);
     atomic_store_explicit(&sock->state, EP_SOCK_READY, memory_order_relaxed);
     ep_ready_push(&port->ready_queue, node);
@@ -1607,6 +1738,8 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
     sock->user_flags = flags;
     sock->user_data = data;
     sock->user_ctx = ctx;
+    sock->observed_events = 0;
+    sock->et_holdoff = 0;
 
     if (ep_fd_table_insert(port, sock) != 0) {
         ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
@@ -1716,10 +1849,16 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     old_state = atomic_load_explicit(&sock->state, memory_order_relaxed);
 
     sock->user_events = events;
-    sock->user_flags = flags;
+    /* Preserve ADD-time EPOLLEXCLUSIVE across MOD, matching Linux. */
+    sock->user_flags = (flags & ~EPOLLEXCLUSIVE) |
+                       (sock->user_flags & EPOLLEXCLUSIVE);
     sock->user_data = data;
     sock->user_ctx = ctx;
     sock->pending_events = 0;
+    /* MOD resets edge observation so a newly requested interest can form a
+     * fresh edge against the current level. */
+    sock->observed_events = 0;
+    sock->et_holdoff = 0;
     ep_sock_set_oneshot_fired_locked(sock, 0);
     if (!pending_poll_covers_request) {
         ep_sock_set_needs_rearm_locked(sock, 1);
@@ -1955,7 +2094,24 @@ static int ep_drain_to_buffer(ep_port_t *port,
                                       memory_order_relaxed);
                 atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
                                       memory_order_relaxed);
+                if ((sock->user_flags & EPOLLET) != 0 &&
+                    (node->events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP)) != 0) {
+                    u_long available = 1;
+                    if (ioctlsocket(sock->fd, FIONREAD, &available) == 0 &&
+                        available == 0) {
+                        sock->observed_events &=
+                            ~(EPOLLIN | EPOLLRDNORM | EPOLLRDHUP |
+                              EPOLLHUP | EPOLLERR);
+                        if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
+                            ep_exclusive_release(sock->base_socket);
+                        }
+                    }
+                }
                 if (!sock->oneshot_fired) {
+                    /* Level and edge registrations both re-arm after a
+                     * delivered snapshot.  Edge filtering above suppresses
+                     * duplicates while the observed level remains true. */
+                    sock->et_holdoff = 0;
                     ep_sock_set_needs_rearm_locked(sock, 1);
                 }
             }

@@ -725,7 +725,7 @@ static void test_unsupported_event_modes(void)
     struct epoll_event event;
     int epfd;
 
-    TEST("reject unsupported edge-triggered and exclusive modes");
+    TEST("accept EPOLLET and ADD-time EPOLLEXCLUSIVE contracts");
     if (make_tcp_pair(&pair) != 0) {
         FAIL("make_tcp_pair");
         return;
@@ -738,19 +738,32 @@ static void test_unsupported_event_modes(void)
     }
     memset(&event, 0, sizeof(event));
     event.events = EPOLLIN | EPOLLET;
-    errno = 0;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != -1 ||
-        errno != EOPNOTSUPP || epoll_fd_count(epfd) != 0) {
-        FAIL("EPOLLET should be rejected");
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
+        epoll_fd_count(epfd) != 1) {
+        FAIL("EPOLLET ADD should succeed");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL) != 0) {
+        FAIL("DEL after EPOLLET");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
+        epoll_fd_count(epfd) != 1) {
+        FAIL("EPOLLEXCLUSIVE ADD should succeed");
         wepoll_close(epfd);
         tcp_pair_close(&pair);
         return;
     }
     event.events = EPOLLIN | EPOLLEXCLUSIVE;
     errno = 0;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != -1 ||
-        errno != EOPNOTSUPP || epoll_fd_count(epfd) != 0) {
-        FAIL("EPOLLEXCLUSIVE should be rejected");
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, pair.server, &event) != -1 ||
+        errno != EINVAL) {
+        FAIL("EPOLLEXCLUSIVE MOD should return EINVAL");
         wepoll_close(epfd);
         tcp_pair_close(&pair);
         return;

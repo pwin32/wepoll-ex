@@ -72,12 +72,14 @@ helpers, socket-lifetime policy and statistics queries, and `wepoll_close`.
 `epoll_ctl_batch` applies operations in order and best-effort rolls back ADDs;
 it is not transactional.
 
-On Windows, registrations are socket-only. `EPOLLONESHOT` is supported;
-`EPOLLET` and `EPOLLEXCLUSIVE` are rejected with `EOPNOTSUPP` because the AFD
-backend does not provide their required semantics. Windows `epoll_pwait*`
-accepts a null signal mask only; Linux `epoll_pwait2_ex` applies a supplied
-mask atomically through the native wait. Call `wepoll_close()` for the
-virtual Windows epoll descriptor and for prompt Linux extended-wait wakeup.
+On Windows, registrations are socket-only. `EPOLLONESHOT` is supported.
+`EPOLLET` is supported via observed-edge filtering over AFD level snapshots
+(with deferred re-arm on empty edges). `EPOLLEXCLUSIVE` is supported on ADD
+only and uses exclusive AFD polls; MOD with `EPOLLEXCLUSIVE` returns `EINVAL`,
+matching Linux. Windows `epoll_pwait*` still accepts a null signal mask only;
+Linux `epoll_pwait2_ex` applies a supplied mask atomically through the native
+wait. Call `wepoll_close()` for the virtual Windows epoll descriptor and for
+prompt Linux extended-wait wakeup.
 
 On Linux, `epoll_fd_count()` reports registrations owned by the extension
 metadata, including successful `epoll_ctl_batch` operations. Native
