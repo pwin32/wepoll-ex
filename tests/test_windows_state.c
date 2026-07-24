@@ -108,6 +108,69 @@ static ep_sock_t *fixture_sock(state_fixture_t *fixture)
     return sock;
 }
 
+/* Attach inert registrations to the live-socket list without allocating
+ * Winsock handles.  They are deliberately absent from both worklists and the
+ * fd table; this lets the queued-rearm regression distinguish O(work) from an
+ * accidental O(all registrations) arm pass without consuming 50k sockets. */
+static ep_sock_t *attach_idle_socks(ep_port_t *port, size_t count)
+{
+    ep_sock_t *socks = (ep_sock_t *)calloc(count, sizeof(*socks));
+
+    if (socks == NULL) return NULL;
+    for (size_t i = 0; i < count; i++) {
+        socks[i].port = port;
+        socks[i].prev = i == 0 ? NULL : &socks[i - 1];
+        socks[i].next = i + 1 == count ? NULL : &socks[i + 1];
+        atomic_init(&socks[i].state, EP_SOCK_REGISTERED);
+        atomic_init(&socks[i].poll_status, EP_POLL_IDLE);
+        atomic_init(&socks[i].delete_pending, 0);
+        atomic_init(&socks[i].ready_queued, 0);
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    if (count > 0) {
+        ep_sock_t *old_head = port->sock_list_head;
+        socks[count - 1].next = old_head;
+        if (old_head != NULL) old_head->prev = &socks[count - 1];
+        port->sock_list_head = socks;
+    }
+    if (!ep_port_worklists_valid_locked(port)) {
+        if (count > 0) {
+            port->sock_list_head = socks[count - 1].next;
+            if (port->sock_list_head != NULL) port->sock_list_head->prev = NULL;
+        }
+        pthread_mutex_unlock(&port->fd_table_lock);
+        free(socks);
+        ep_set_errno(EIO);
+        return NULL;
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+    return socks;
+}
+
+static int detach_idle_socks(ep_port_t *port, ep_sock_t *socks, size_t count)
+{
+    int valid;
+
+    if (socks == NULL) return 0;
+    pthread_mutex_lock(&port->fd_table_lock);
+    if (count == 0 || port->sock_list_head != socks) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        ep_set_errno(EIO);
+        return -1;
+    }
+    port->sock_list_head = socks[count - 1].next;
+    if (port->sock_list_head != NULL) port->sock_list_head->prev = NULL;
+    valid = ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    free(socks);
+    if (!valid) {
+        ep_set_errno(EIO);
+        return -1;
+    }
+    return 0;
+}
+
 /* Consume IOCP packets and run their handlers without draining the ready
  * queue.  This creates the otherwise tiny "completion queued, wait not yet
  * called" window deterministically. */
@@ -345,9 +408,16 @@ static int expect_one_oneshot(ep_port_t *port, uint64_t value,
 static int test_queued_rearm(void)
 {
     static const uint64_t value = UINT64_C(0x1111222233334444);
+    static const size_t idle_count = 50000;
     state_fixture_t fixture;
+    epoll_event_ex event;
+    epoll_event_ex extra;
+    ep_sock_t *idle_socks = NULL;
     ep_sock_t *sock;
+    uint64_t oneshot_visits_before;
     uint64_t queued_generation;
+    uint64_t rearm_visits_before;
+    int wait_result;
     int context;
     int state_ok;
     int result = -1;
@@ -368,11 +438,16 @@ static int test_queued_rearm(void)
     queued_generation = sock->generation;
     state_ok = sock->oneshot_fired != 0 &&
         fixture.port->oneshot_fired_count == 1 &&
+        fixture.port->oneshot_head == sock &&
+        fixture.port->oneshot_tail == sock &&
+        fixture.port->rearm_head == NULL &&
+        fixture.port->rearm_tail == NULL &&
         atomic_load_explicit(&sock->ready_queued,
                              memory_order_relaxed) != 0 &&
         atomic_load_explicit(&sock->poll_status,
                              memory_order_relaxed) == EP_POLL_IDLE &&
         fixture.port->needs_rearm_count == 0 &&
+        ep_port_worklists_valid_locked(fixture.port) &&
         atomic_load_explicit(&fixture.port->ready_queue.queued,
                              memory_order_relaxed) == 1;
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
@@ -384,18 +459,80 @@ static int test_queued_rearm(void)
     state_ok = sock->generation != queued_generation &&
         sock->oneshot_fired == 0 &&
         fixture.port->oneshot_fired_count == 0 &&
+        fixture.port->oneshot_head == NULL &&
+        fixture.port->oneshot_tail == NULL &&
         atomic_load_explicit(&sock->ready_queued,
                              memory_order_relaxed) == 0 &&
         atomic_load_explicit(&sock->poll_status,
                              memory_order_relaxed) == EP_POLL_IDLE &&
-        fixture.port->needs_rearm_count == 1;
+        fixture.port->needs_rearm_count == 1 &&
+        fixture.port->rearm_head == sock &&
+        fixture.port->rearm_tail == sock &&
+        ep_port_worklists_valid_locked(fixture.port);
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
-    if (!state_ok || expect_one_oneshot(fixture.port, value, &context) != 0) {
+    if (!state_ok) {
         goto cleanup;
     }
+
+    idle_socks = attach_idle_socks(fixture.port, idle_count);
+    if (idle_socks == NULL) goto cleanup;
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    rearm_visits_before = fixture.port->rearm_work_visits;
+    oneshot_visits_before = fixture.port->oneshot_probe_visits;
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+
+    memset(&event, 0, sizeof(event));
+    wait_result = ep_port_wait(fixture.port, &event, 1, 2000, NULL);
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok = wait_result == 1 && event.data.u64 == value &&
+        event.user_ctx == &context && (event.events & EPOLLIN) != 0 &&
+        (event.flags & WEPOLL_FLAG_ONESHOT_FIRED) != 0 &&
+        fixture.port->rearm_work_visits - rearm_visits_before == 1 &&
+        fixture.port->oneshot_probe_visits - oneshot_visits_before == 0 &&
+        fixture.port->needs_rearm_count == 0 &&
+        fixture.port->oneshot_fired_count == 1 &&
+        fixture.port->oneshot_head == sock &&
+        fixture.port->oneshot_tail == sock &&
+        ep_port_worklists_valid_locked(fixture.port);
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok || detach_idle_socks(fixture.port, idle_socks,
+                                       idle_count) != 0) {
+        goto cleanup;
+    }
+    idle_socks = NULL;
+
+    memset(&extra, 0, sizeof(extra));
+    if (ep_port_wait(fixture.port, &extra, 1, 0, NULL) != 0) goto cleanup;
+
+    /* A fired oneshot remains on the probe list until rearmed, deleted, or
+     * closed natively.  The latter must unlink and free it during a wait. */
+    (void)closesocket(fixture.server);
+    fixture.server = INVALID_SOCKET;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        memset(&extra, 0, sizeof(extra));
+        if (ep_port_wait(fixture.port, &extra, 1, 0, NULL) != 0) goto cleanup;
+        pthread_mutex_lock(&fixture.port->fd_table_lock);
+        state_ok = fixture.port->fd_table_count == 0;
+        pthread_mutex_unlock(&fixture.port->fd_table_lock);
+        if (state_ok) break;
+        Sleep(1);
+    }
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok = fixture.port->fd_table_count == 0 &&
+        fixture.port->needs_rearm_count == 0 &&
+        fixture.port->oneshot_fired_count == 0 &&
+        fixture.port->rearm_head == NULL && fixture.port->rearm_tail == NULL &&
+        fixture.port->oneshot_head == NULL &&
+        fixture.port->oneshot_tail == NULL &&
+        ep_port_worklists_valid_locked(fixture.port);
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok) goto cleanup;
     result = 0;
 
 cleanup:
+    if (idle_socks != NULL) {
+        (void)detach_idle_socks(fixture.port, idle_socks, idle_count);
+    }
     fixture_close(&fixture);
     return result;
 }
@@ -426,6 +563,9 @@ static int test_queued_mod(void)
     queued_generation = sock->generation;
     state_ok = sock->oneshot_fired != 0 &&
         fixture.port->oneshot_fired_count == 1 &&
+        fixture.port->oneshot_head == sock &&
+        fixture.port->oneshot_tail == sock &&
+        ep_port_worklists_valid_locked(fixture.port) &&
         atomic_load_explicit(&sock->ready_queued,
                              memory_order_relaxed) != 0;
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
@@ -447,16 +587,32 @@ static int test_queued_mod(void)
         sock->user_data.u64 == new_value &&
         sock->user_ctx == &new_context && sock->oneshot_fired == 0 &&
         fixture.port->oneshot_fired_count == 0 &&
+        fixture.port->oneshot_head == NULL &&
+        fixture.port->oneshot_tail == NULL &&
         atomic_load_explicit(&sock->ready_queued,
                              memory_order_relaxed) == 0 &&
         atomic_load_explicit(&sock->poll_status,
                              memory_order_relaxed) == EP_POLL_IDLE &&
-        fixture.port->needs_rearm_count == 1;
+        fixture.port->needs_rearm_count == 1 &&
+        fixture.port->rearm_head == sock &&
+        fixture.port->rearm_tail == sock &&
+        ep_port_worklists_valid_locked(fixture.port);
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
     if (!state_ok ||
         expect_one_oneshot(fixture.port, new_value, &new_context) != 0) {
         goto cleanup;
     }
+    if (ep_port_unregister(fixture.port, fixture.server) != 0) goto cleanup;
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok = fixture.port->fd_table_count == 0 &&
+        fixture.port->needs_rearm_count == 0 &&
+        fixture.port->oneshot_fired_count == 0 &&
+        fixture.port->rearm_head == NULL && fixture.port->rearm_tail == NULL &&
+        fixture.port->oneshot_head == NULL &&
+        fixture.port->oneshot_tail == NULL &&
+        ep_port_worklists_valid_locked(fixture.port);
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok) goto cleanup;
     result = 0;
 
 cleanup:
@@ -509,6 +665,9 @@ static int test_deferred_add_failure(void)
         InterlockedCompareExchange(&counted_submit_calls, 0, 0) == 1 &&
         fixture.port->fd_table_count == 1 &&
         fixture.port->needs_rearm_count == 1 &&
+        fixture.port->rearm_head == sock &&
+        fixture.port->rearm_tail == sock &&
+        ep_port_worklists_valid_locked(fixture.port) &&
         atomic_load_explicit(&sock->poll_status,
                              memory_order_relaxed) == EP_POLL_IDLE;
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
@@ -570,6 +729,11 @@ static int test_failed_mod_rollback(void)
         sock->user_data.u64 == old_value && sock->user_ctx == &old_context &&
         sock->oneshot_fired != 0 &&
         fixture.port->oneshot_fired_count == 1 &&
+        fixture.port->oneshot_head == sock &&
+        fixture.port->oneshot_tail == sock &&
+        fixture.port->rearm_head == NULL &&
+        fixture.port->rearm_tail == NULL &&
+        ep_port_worklists_valid_locked(fixture.port) &&
         atomic_load_explicit(&sock->ready_queued,
                              memory_order_relaxed) != 0 &&
         atomic_load_explicit(&sock->poll_status,
@@ -630,6 +794,11 @@ static int test_failed_rearm_rollback(void)
     state_ok = rearm_result == -1 && rearm_error == EACCES &&
         sock->generation == old_generation && sock->oneshot_fired != 0 &&
         fixture.port->oneshot_fired_count == 1 &&
+        fixture.port->oneshot_head == sock &&
+        fixture.port->oneshot_tail == sock &&
+        fixture.port->rearm_head == NULL &&
+        fixture.port->rearm_tail == NULL &&
+        ep_port_worklists_valid_locked(fixture.port) &&
         atomic_load_explicit(&sock->ready_queued,
                              memory_order_relaxed) != 0 &&
         atomic_load_explicit(&sock->poll_status,
@@ -690,7 +859,9 @@ static int test_pending_metadata_mod(void)
                              memory_order_relaxed) == EP_POLL_PENDING &&
         sock->submitted_afd_events == submitted_mask &&
         sock->user_data.u64 == new_value && sock->user_ctx == &new_context &&
-        fixture.port->needs_rearm_count == 0;
+        fixture.port->needs_rearm_count == 0 &&
+        fixture.port->oneshot_fired_count == 0 &&
+        ep_port_worklists_valid_locked(fixture.port);
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
     if (!state_ok || send_byte(fixture.client) != 0 ||
         expect_one_oneshot(fixture.port, new_value, &new_context) != 0)
@@ -749,7 +920,9 @@ static int test_pending_narrowing_mod(void)
         (ep_epoll_to_afd_events(new_events) & ~submitted_mask) == 0 &&
         sock->submitted_afd_events == submitted_mask &&
         sock->user_data.u64 == new_value && sock->user_ctx == &new_context &&
-        fixture.port->needs_rearm_count == 0;
+        fixture.port->needs_rearm_count == 0 &&
+        fixture.port->oneshot_fired_count == 0 &&
+        ep_port_worklists_valid_locked(fixture.port);
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
     if (!state_ok || send_byte(fixture.client) != 0) goto cleanup;
 
@@ -762,7 +935,9 @@ static int test_pending_narrowing_mod(void)
                                     memory_order_relaxed) == EP_POLL_PENDING &&
         sock->submitted_afd_events == ep_epoll_to_afd_events(new_events) &&
         sock->user_data.u64 == new_value && sock->user_ctx == &new_context &&
-        fixture.port->needs_rearm_count == 0;
+        fixture.port->needs_rearm_count == 0 &&
+        fixture.port->oneshot_fired_count == 0 &&
+        ep_port_worklists_valid_locked(fixture.port);
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
     if (!state_ok || shutdown(fixture.client, SD_SEND) == SOCKET_ERROR)
         goto cleanup;
@@ -820,7 +995,10 @@ static int test_pending_expansion_cancelled_mod(void)
         atomic_load_explicit(&sock->poll_status,
                              memory_order_relaxed) == EP_POLL_CANCELLED &&
         sock->user_data.u64 == new_value && sock->user_ctx == &new_context &&
-        fixture.port->needs_rearm_count == 1;
+        fixture.port->needs_rearm_count == 1 &&
+        fixture.port->rearm_head == sock &&
+        fixture.port->rearm_tail == sock &&
+        ep_port_worklists_valid_locked(fixture.port);
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
     if (!state_ok) goto restore_cancel;
 
@@ -835,13 +1013,20 @@ static int test_pending_expansion_cancelled_mod(void)
                              memory_order_relaxed) == EP_POLL_CANCELLED &&
         sock->user_data.u64 == latest_value &&
         sock->user_ctx == &latest_context &&
-        fixture.port->needs_rearm_count == 1;
+        fixture.port->needs_rearm_count == 1 &&
+        fixture.port->rearm_head == sock &&
+        fixture.port->rearm_tail == sock &&
+        ep_port_worklists_valid_locked(fixture.port);
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
     if (!state_ok || send_byte(fixture.client) != 0 ||
         expect_one_oneshot(fixture.port, latest_value, &latest_context) != 0)
         goto cleanup;
     pthread_mutex_lock(&fixture.port->fd_table_lock);
-    state_ok = fixture.port->needs_rearm_count == 0;
+    state_ok = fixture.port->needs_rearm_count == 0 &&
+        fixture.port->oneshot_fired_count == 1 &&
+        fixture.port->oneshot_head == sock &&
+        fixture.port->oneshot_tail == sock &&
+        ep_port_worklists_valid_locked(fixture.port);
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
     if (!state_ok) goto cleanup;
     result = 0;

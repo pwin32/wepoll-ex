@@ -72,6 +72,15 @@ if(DEFINED WEPOLL_EX_C_COMPILER AND
     list(APPEND _configure_command
         "-DCMAKE_C_COMPILER=${WEPOLL_EX_C_COMPILER}")
 endif()
+if(DEFINED WEPOLL_EX_C_FLAGS AND NOT "${WEPOLL_EX_C_FLAGS}" STREQUAL "")
+    list(APPEND _configure_command
+        "-DCMAKE_C_FLAGS=${WEPOLL_EX_C_FLAGS}")
+endif()
+if(DEFINED WEPOLL_EX_EXE_LINKER_FLAGS AND
+   NOT "${WEPOLL_EX_EXE_LINKER_FLAGS}" STREQUAL "")
+    list(APPEND _configure_command
+        "-DCMAKE_EXE_LINKER_FLAGS=${WEPOLL_EX_EXE_LINKER_FLAGS}")
+endif()
 if(DEFINED WEPOLL_EX_TOOLCHAIN_FILE AND
    NOT "${WEPOLL_EX_TOOLCHAIN_FILE}" STREQUAL "")
     list(APPEND _configure_command
@@ -82,8 +91,15 @@ if(DEFINED WEPOLL_EX_BUILD_TYPE AND NOT "${WEPOLL_EX_BUILD_TYPE}" STREQUAL "")
         "-DCMAKE_BUILD_TYPE=${WEPOLL_EX_BUILD_TYPE}")
 endif()
 
+# Nested configure/build must not inherit ASan/UBSan LD_PRELOAD from a
+# parent sanitizer qualification lane.  Those hooks trip LeakSanitizer inside
+# the compiler itself and break CMake's compiler identity checks.  The
+# consumer executable still inherits the parent environment at run time.
 execute_process(
-    COMMAND ${_configure_command}
+    COMMAND "${CMAKE_COMMAND}" -E env
+            "LD_PRELOAD="
+            "DYLD_INSERT_LIBRARIES="
+            ${_configure_command}
     RESULT_VARIABLE _configure_result
     OUTPUT_VARIABLE _configure_output
     ERROR_VARIABLE _configure_error)
@@ -93,7 +109,10 @@ if(NOT _configure_result EQUAL 0)
 endif()
 
 execute_process(
-    COMMAND "${CMAKE_COMMAND}" --build "${WEPOLL_EX_CONSUMER_BUILD_DIR}"
+    COMMAND "${CMAKE_COMMAND}" -E env
+            "LD_PRELOAD="
+            "DYLD_INSERT_LIBRARIES="
+            "${CMAKE_COMMAND}" --build "${WEPOLL_EX_CONSUMER_BUILD_DIR}"
             --config "${WEPOLL_EX_CONFIG}"
     RESULT_VARIABLE _build_result
     OUTPUT_VARIABLE _build_output

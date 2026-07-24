@@ -10,13 +10,107 @@
  */
 #include "wepoll_ex_internal.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define EP_CLOSE_DRAIN_TIMEOUT_MS UINT64_C(5000)
+#define EP_QUARANTINE_DRAIN_TIMEOUT_MS UINT64_C(60000)
 #define EP_CLOSE_DRAIN_SLICE_MS   100U
 #define EP_ZERO_TIMEOUT_DRAIN_BUDGET_MS 10U
 #define EP_ZERO_TIMEOUT_MIN_DEQUEUES     16U
+#define EP_MAX_ACTIVE_QUARANTINES        4U
+
+static _Atomic uint64_t g_quarantined_ports;
+static _Atomic uint64_t g_active_quarantines;
+static _Atomic uint64_t g_reaped_ports;
+static _Atomic uint64_t g_irrecoverable_ports;
+
+static void ep_port_record_async_error_locked(ep_port_t *port, int error)
+{
+    if (error <= 0) error = EIO;
+    port->asynchronous_errors++;
+    if (port->async_error != 0) return;
+
+    port->async_error = error;
+    if (!atomic_load_explicit(&port->closing, memory_order_acquire) &&
+        !atomic_load_explicit(&port->waiter_active, memory_order_acquire) &&
+        port->iocp != NULL &&
+        !atomic_load_explicit(&port->iocp_closed, memory_order_acquire)) {
+        if (ep_fault_hit(EP_FAULT_IOCP_POST) == 0) {
+            (void)PostQueuedCompletionStatus(port->iocp, 0, 0, NULL);
+        }
+    }
+}
+
+static int ep_port_take_async_error_locked(ep_port_t *port)
+{
+    int error = port->async_error;
+
+    port->async_error = 0;
+    return error;
+}
+
+void ep_get_global_stats(wepoll_ex_global_stats *stats)
+{
+    memset(stats, 0, sizeof(*stats));
+    stats->version = WEPOLL_EX_STATS_VERSION;
+    stats->struct_size = (uint32_t)sizeof(*stats);
+    stats->quarantined_ports = atomic_load_explicit(
+        &g_quarantined_ports, memory_order_relaxed);
+    stats->active_quarantines = atomic_load_explicit(
+        &g_active_quarantines, memory_order_relaxed);
+    stats->reaped_ports = atomic_load_explicit(
+        &g_reaped_ports, memory_order_relaxed);
+    stats->irrecoverable_ports = atomic_load_explicit(
+        &g_irrecoverable_ports, memory_order_relaxed);
+    stats->api_close_timeouts = ep_api_close_timeout_count();
+}
+
+int ep_port_get_stats(ep_port_t *port, wepoll_ex_stats *stats)
+{
+    if (port == NULL || stats == NULL) {
+        ep_set_errno(EFAULT);
+        return -1;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    stats->version = WEPOLL_EX_STATS_VERSION;
+    stats->struct_size = (uint32_t)sizeof(*stats);
+#if defined(WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME)
+    stats->socket_lifetime_policy =
+        WEPOLL_EX_SOCKET_LIFETIME_SYNCHRONIZED;
+#elif defined(WEPOLL_EX_STRICT_SOCKET_IDENTITY)
+    stats->socket_lifetime_policy = WEPOLL_EX_SOCKET_LIFETIME_STRICT;
+#else
+    stats->socket_lifetime_policy = WEPOLL_EX_SOCKET_LIFETIME_BEST_EFFORT;
+#endif
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    stats->active_registrations = port->fd_table_count;
+    stats->pending_polls = port->pending_poll_count;
+    stats->rearm_queue_depth = port->needs_rearm_count;
+    stats->oneshot_probe_queue_depth = port->oneshot_fired_count;
+    stats->rearm_work_items = port->rearm_work_visits +
+                              port->oneshot_probe_visits;
+    stats->stale_events_dropped = port->stale_events_dropped;
+    stats->identity_failures = port->identity_failures;
+    stats->asynchronous_errors = port->asynchronous_errors;
+    stats->zero_timeout_budget_hits = port->zero_timeout_budget_hits;
+    pthread_mutex_unlock(&port->fd_table_lock);
+
+    stats->ready_queue_depth = atomic_load_explicit(
+        &port->ready_queue.queued, memory_order_relaxed);
+    stats->afd_pool_in_use = atomic_load_explicit(
+        &port->afd_info_pool.in_use, memory_order_relaxed);
+    stats->afd_pool_peak = atomic_load_explicit(
+        &port->afd_info_pool.peak, memory_order_relaxed);
+    stats->ready_pool_in_use = atomic_load_explicit(
+        &port->ready_node_pool.in_use, memory_order_relaxed);
+    stats->ready_pool_peak = atomic_load_explicit(
+        &port->ready_node_pool.peak, memory_order_relaxed);
+    return 0;
+}
 
 /* ------------------------------------------------------------------------- */
 /* Time and fd-table helpers.                                                */
@@ -185,9 +279,102 @@ static void ep_sock_list_remove_locked(ep_port_t *port, ep_sock_t *sock)
     sock->prev = NULL;
 }
 
-/* Keep the re-arm worklist count in lockstep with the per-socket bit.  All
- * callers hold fd_table_lock, so a plain size_t is sufficient and the wait
- * path can skip a full socket-list scan when no registration needs work. */
+static void ep_rearm_list_append_locked(ep_port_t *port, ep_sock_t *sock)
+{
+    assert(sock->rearm_next == NULL);
+    assert(sock->rearm_prev == NULL);
+
+    sock->rearm_prev = port->rearm_tail;
+    if (port->rearm_tail != NULL) {
+        port->rearm_tail->rearm_next = sock;
+    } else {
+        port->rearm_head = sock;
+    }
+    port->rearm_tail = sock;
+}
+
+static void ep_rearm_list_remove_locked(ep_port_t *port, ep_sock_t *sock)
+{
+    if (sock->rearm_prev != NULL) {
+        sock->rearm_prev->rearm_next = sock->rearm_next;
+    } else {
+        assert(port->rearm_head == sock);
+        port->rearm_head = sock->rearm_next;
+    }
+    if (sock->rearm_next != NULL) {
+        sock->rearm_next->rearm_prev = sock->rearm_prev;
+    } else {
+        assert(port->rearm_tail == sock);
+        port->rearm_tail = sock->rearm_prev;
+    }
+    sock->rearm_next = NULL;
+    sock->rearm_prev = NULL;
+}
+
+static void ep_rearm_list_rotate_locked(ep_port_t *port, ep_sock_t *sock)
+{
+    assert(port->rearm_head == sock);
+    if (port->rearm_tail == sock) {
+        return;
+    }
+
+    port->rearm_head = sock->rearm_next;
+    port->rearm_head->rearm_prev = NULL;
+    sock->rearm_next = NULL;
+    sock->rearm_prev = port->rearm_tail;
+    port->rearm_tail->rearm_next = sock;
+    port->rearm_tail = sock;
+}
+
+static void ep_oneshot_list_append_locked(ep_port_t *port, ep_sock_t *sock)
+{
+    assert(sock->oneshot_next == NULL);
+    assert(sock->oneshot_prev == NULL);
+
+    sock->oneshot_prev = port->oneshot_tail;
+    if (port->oneshot_tail != NULL) {
+        port->oneshot_tail->oneshot_next = sock;
+    } else {
+        port->oneshot_head = sock;
+    }
+    port->oneshot_tail = sock;
+}
+
+static void ep_oneshot_list_remove_locked(ep_port_t *port, ep_sock_t *sock)
+{
+    if (sock->oneshot_prev != NULL) {
+        sock->oneshot_prev->oneshot_next = sock->oneshot_next;
+    } else {
+        assert(port->oneshot_head == sock);
+        port->oneshot_head = sock->oneshot_next;
+    }
+    if (sock->oneshot_next != NULL) {
+        sock->oneshot_next->oneshot_prev = sock->oneshot_prev;
+    } else {
+        assert(port->oneshot_tail == sock);
+        port->oneshot_tail = sock->oneshot_prev;
+    }
+    sock->oneshot_next = NULL;
+    sock->oneshot_prev = NULL;
+}
+
+static void ep_oneshot_list_rotate_locked(ep_port_t *port, ep_sock_t *sock)
+{
+    assert(port->oneshot_head == sock);
+    if (port->oneshot_tail == sock) {
+        return;
+    }
+
+    port->oneshot_head = sock->oneshot_next;
+    port->oneshot_head->oneshot_prev = NULL;
+    sock->oneshot_next = NULL;
+    sock->oneshot_prev = port->oneshot_tail;
+    port->oneshot_tail->oneshot_next = sock;
+    port->oneshot_tail = sock;
+}
+
+/* Keep re-arm state, exactly-once worklist membership, and the diagnostic
+ * count in lockstep.  All callers hold fd_table_lock. */
 static void ep_sock_set_needs_rearm_locked(ep_sock_t *sock, int needs_rearm)
 {
     ep_port_t *port = sock->port;
@@ -198,17 +385,19 @@ static void ep_sock_set_needs_rearm_locked(ep_sock_t *sock, int needs_rearm)
     }
     if (requested) {
         sock->needs_rearm = 1;
+        ep_rearm_list_append_locked(port, sock);
         port->needs_rearm_count++;
     } else {
+        assert(port->needs_rearm_count > 0);
+        ep_rearm_list_remove_locked(port, sock);
         sock->needs_rearm = 0;
-        if (port->needs_rearm_count > 0) {
-            port->needs_rearm_count--;
-        }
+        port->needs_rearm_count--;
     }
 }
 
 /* Fired oneshot registrations are not re-armed, but the wait path still
- * probes their provider handles so a native closesocket() retires them. */
+ * probes their provider handles so a native closesocket() retires them.  The
+ * intrusive list limits those probes to registrations that actually fired. */
 static void ep_sock_set_oneshot_fired_locked(ep_sock_t *sock, int fired)
 {
     ep_port_t *port = sock->port;
@@ -219,13 +408,122 @@ static void ep_sock_set_oneshot_fired_locked(ep_sock_t *sock, int fired)
     }
     if (requested) {
         sock->oneshot_fired = 1;
+        ep_oneshot_list_append_locked(port, sock);
         port->oneshot_fired_count++;
     } else {
+        assert(port->oneshot_fired_count > 0);
+        ep_oneshot_list_remove_locked(port, sock);
         sock->oneshot_fired = 0;
-        if (port->oneshot_fired_count > 0) {
-            port->oneshot_fired_count--;
+        port->oneshot_fired_count--;
+    }
+}
+
+int ep_port_worklists_valid_locked(const ep_port_t *port)
+{
+    const ep_sock_t *slow;
+    const ep_sock_t *fast;
+    const ep_sock_t *previous;
+    size_t live_rearm_count = 0;
+    size_t live_oneshot_count = 0;
+    size_t list_count = 0;
+
+    if ((port->rearm_head == NULL) != (port->rearm_tail == NULL) ||
+        (port->oneshot_head == NULL) != (port->oneshot_tail == NULL)) {
+        return 0;
+    }
+
+    slow = port->sock_list_head;
+    fast = port->sock_list_head;
+    while (fast != NULL && fast->next != NULL) {
+        slow = slow->next;
+        fast = fast->next->next;
+        if (slow == fast) {
+            return 0;
         }
     }
+
+    previous = NULL;
+    for (const ep_sock_t *sock = port->sock_list_head;
+         sock != NULL;
+         sock = sock->next) {
+        int rearm_linked = sock->rearm_prev != NULL ||
+            sock->rearm_next != NULL || port->rearm_head == sock;
+        int oneshot_linked = sock->oneshot_prev != NULL ||
+            sock->oneshot_next != NULL || port->oneshot_head == sock;
+
+        if (sock->prev != previous || sock->port != port ||
+            (sock->needs_rearm != 0) != rearm_linked ||
+            (sock->oneshot_fired != 0) != oneshot_linked ||
+            (sock->needs_rearm && sock->oneshot_fired) ||
+            (atomic_load_explicit(&sock->delete_pending,
+                                  memory_order_relaxed) &&
+             (sock->needs_rearm || sock->oneshot_fired))) {
+            return 0;
+        }
+        if (sock->needs_rearm) {
+            live_rearm_count++;
+        }
+        if (sock->oneshot_fired) {
+            live_oneshot_count++;
+        }
+        previous = sock;
+    }
+
+    previous = NULL;
+    list_count = 0;
+    for (const ep_sock_t *sock = port->rearm_head;
+         sock != NULL;
+         sock = sock->rearm_next) {
+        int found_live = 0;
+
+        for (const ep_sock_t *live = port->sock_list_head;
+             live != NULL;
+             live = live->next) {
+            if (live == sock) {
+                found_live = 1;
+                break;
+            }
+        }
+        if (!sock->needs_rearm || sock->port != port ||
+            !found_live ||
+            sock->rearm_prev != previous ||
+            ++list_count > port->needs_rearm_count) {
+            return 0;
+        }
+        previous = sock;
+    }
+    if (previous != port->rearm_tail ||
+        list_count != port->needs_rearm_count ||
+        list_count != live_rearm_count) {
+        return 0;
+    }
+
+    previous = NULL;
+    list_count = 0;
+    for (const ep_sock_t *sock = port->oneshot_head;
+         sock != NULL;
+         sock = sock->oneshot_next) {
+        int found_live = 0;
+
+        for (const ep_sock_t *live = port->sock_list_head;
+             live != NULL;
+             live = live->next) {
+            if (live == sock) {
+                found_live = 1;
+                break;
+            }
+        }
+        if (!sock->oneshot_fired || sock->port != port ||
+            !found_live ||
+            sock->oneshot_prev != previous ||
+            ++list_count > port->oneshot_fired_count) {
+            return 0;
+        }
+        previous = sock;
+    }
+    return previous == port->oneshot_tail &&
+        list_count == port->oneshot_fired_count &&
+        list_count == live_oneshot_count;
 }
 
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
@@ -281,6 +579,7 @@ static ep_identity_check_t ep_sock_validate_identity_locked(
          * legacy numeric-handle semantics.  Losing a token that was already
          * observed is not a safe identity match. */
         ep_set_errno(EIO);
+        sock->port->identity_failures++;
         return EP_IDENTITY_ERROR;
     }
     if (identity_result < 0) {
@@ -292,6 +591,7 @@ static ep_identity_check_t ep_sock_validate_identity_locked(
         if (error == ENOTSOCK || error == EBADF) {
             return EP_IDENTITY_CLOSED;
         }
+        sock->port->identity_failures++;
         return EP_IDENTITY_ERROR;
     }
 
@@ -340,11 +640,19 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     identity_result = ep_socket_get_endpoint_id(fd, &sock->endpoint_id);
     if (identity_result < 0) {
+        port->identity_failures++;
         free(sock);
         return NULL;
     }
     if (identity_result == 0) {
+#ifdef WEPOLL_EX_STRICT_SOCKET_IDENTITY
+        port->identity_failures++;
+        free(sock);
+        ep_set_errno(EOPNOTSUPP);
+        return NULL;
+#else
         sock->endpoint_id_state = EP_SOCKET_ID_UNAVAILABLE;
+#endif
     } else if (ep_socket_identity_is_stable(fd)) {
         sock->endpoint_id_state = EP_SOCKET_ID_STABLE;
     } else {
@@ -532,6 +840,7 @@ static void ep_sock_retire_stale_locked(ep_port_t *port, ep_sock_t *sock)
         (void)ep_sock_cancel_locked(sock);
     }
     atomic_fetch_add_explicit(&port->generation, 1, memory_order_relaxed);
+    port->stale_events_dropped++;
     ep_sock_drop_closed_locked(port, sock);
     ep_set_errno(saved_errno);
 }
@@ -568,19 +877,63 @@ static int ep_sock_validate_control_locked(ep_port_t *port, ep_sock_t *sock)
 
 static int ep_port_arm_pending_locked(ep_port_t *port)
 {
-    if (port->needs_rearm_count == 0 &&
-        port->oneshot_fired_count == 0) {
-        return 0;
+    size_t rearm_budget = port->needs_rearm_count;
+    size_t oneshot_budget = port->oneshot_fired_count;
+    int first_error = 0;
+
+    /* Snapshot the starting queue lengths.  A deferred item that cannot be
+     * submitted yet (for example while an AFD cancellation is pending) is
+     * rotated to the tail and retried by a later wait iteration, not spun on
+     * indefinitely here.  Successful submission removes it in O(1). */
+    while (rearm_budget-- > 0) {
+        ep_sock_t *sock = port->rearm_head;
+        int submit_result;
+
+        assert(sock != NULL);
+        port->rearm_work_visits++;
+        submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 0);
+        if (submit_result < 0) {
+            int error = ep_last_err();
+
+            if (first_error == 0) first_error = error == 0 ? EIO : error;
+            ep_port_record_async_error_locked(port, error);
+            if (sock->needs_rearm) {
+                ep_rearm_list_rotate_locked(port, sock);
+            }
+            continue;
+        }
+        if (submit_result == 0 && sock->needs_rearm) {
+            ep_rearm_list_rotate_locked(port, sock);
+        }
     }
 
-    for (ep_sock_t *sock = port->sock_list_head;
-         sock != NULL;) {
-        ep_sock_t *next = sock->next;
-        int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 0);
+    /* Fired oneshots have no AFD request to re-arm.  Keep each one queued so
+     * subsequent waits continue to detect native closesocket(), but probe it
+     * only once per arm pass and only among fired oneshots. */
+    while (oneshot_budget-- > 0) {
+        ep_sock_t *sock = port->oneshot_head;
+        int submit_result;
+
+        assert(sock != NULL);
+        port->oneshot_probe_visits++;
+        submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 0);
         if (submit_result < 0) {
-            return -1;
+            int error = ep_last_err();
+
+            if (first_error == 0) first_error = error == 0 ? EIO : error;
+            ep_port_record_async_error_locked(port, error);
+            if (sock->oneshot_fired) {
+                ep_oneshot_list_rotate_locked(port, sock);
+            }
+            continue;
         }
-        sock = next;
+        if (submit_result == 0 && sock->oneshot_fired) {
+            ep_oneshot_list_rotate_locked(port, sock);
+        }
+    }
+    if (first_error != 0) {
+        ep_set_errno(first_error);
+        return -1;
     }
     return 0;
 }
@@ -626,7 +979,9 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
 
     if (old_poll_status == EP_POLL_CANCELLED || status == STATUS_CANCELLED) {
         if (EP_SOCK_SUBMIT_LOCKED(sock, 0) < 0) {
+            int error = ep_last_err();
             ep_sock_set_needs_rearm_locked(sock, 1);
+            ep_port_record_async_error_locked(port, error);
         }
         pthread_mutex_unlock(&port->fd_table_lock);
         return;
@@ -652,6 +1007,18 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
                 pthread_mutex_unlock(&port->fd_table_lock);
                 return;
             }
+#ifdef WEPOLL_EX_STRICT_SOCKET_IDENTITY
+            if (identity_check == EP_IDENTITY_ERROR) {
+                int error = ep_last_err();
+
+                atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                      memory_order_relaxed);
+                ep_sock_set_needs_rearm_locked(sock, 1);
+                ep_port_record_async_error_locked(port, error);
+                pthread_mutex_unlock(&port->fd_table_lock);
+                return;
+            }
+#endif
         }
 #endif
         delivered = ep_afd_to_epoll_events(
@@ -664,16 +1031,21 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     if (delivered == 0) {
         ep_sock_set_needs_rearm_locked(sock, 1);
         if (EP_SOCK_SUBMIT_LOCKED(sock, 0) < 0) {
+            int error = ep_last_err();
             ep_sock_set_needs_rearm_locked(sock, 1);
+            ep_port_record_async_error_locked(port, error);
         }
         pthread_mutex_unlock(&port->fd_table_lock);
         return;
     }
 
-    node = ep_ready_node_alloc(port);
+    node = ep_fault_hit(EP_FAULT_READY_NODE_ALLOC) == 0
+        ? ep_ready_node_alloc(port) : NULL;
     if (node == NULL) {
+        int error = ep_last_err();
+
         ep_sock_set_needs_rearm_locked(sock, 1);
-        (void)EP_SOCK_SUBMIT_LOCKED(sock, 0);
+        ep_port_record_async_error_locked(port, error == 0 ? ENOMEM : error);
         pthread_mutex_unlock(&port->fd_table_lock);
         return;
     }
@@ -790,6 +1162,9 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     }
     port->get_queued_completion_status_ex = GetQueuedCompletionStatusEx;
 
+    if (ep_fault_hit(EP_FAULT_IOCP_CREATE) != 0) {
+        goto fail;
+    }
     port->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (port->iocp == NULL) {
         ep_set_errno(ep_winerr_to_errno(GetLastError()));
@@ -804,6 +1179,8 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     atomic_init(&port->closing, 0);
     atomic_init(&port->iocp_closed, 0);
     atomic_init(&port->generation, 0);
+    port->close_drain_timeout_ms = EP_CLOSE_DRAIN_TIMEOUT_MS;
+    port->quarantine_drain_timeout_ms = EP_QUARANTINE_DRAIN_TIMEOUT_MS;
     port->next_sock_generation = 0;
     *out = port;
     return 0;
@@ -842,25 +1219,145 @@ fail:
 
 void ep_port_begin_close(ep_port_t *port)
 {
+    HANDLE iocp_to_close = NULL;
+
     if (port == NULL) {
         return;
     }
-    if (atomic_exchange_explicit(&port->closing, 1, memory_order_acq_rel) == 0 &&
-        port->iocp != NULL) {
-        if (!PostQueuedCompletionStatus(port->iocp, 0, 0, NULL)) {
+    if (atomic_exchange_explicit(&port->closing, 1,
+                                 memory_order_acq_rel) == 0) {
+        /* Async-error wakeups and the close wake use the same lock so no
+         * thread can post through a HANDLE after this path publishes it as
+         * closed. */
+        pthread_mutex_lock(&port->fd_table_lock);
+        if (port->iocp != NULL &&
+            (ep_fault_hit(EP_FAULT_IOCP_POST) != 0 ||
+             !PostQueuedCompletionStatus(port->iocp, 0, 0, NULL))) {
             /* A failed wake must not leave an API waiter holding the port
              * reference forever.  Closing the completion port wakes blocked
              * GetQueuedCompletionStatusEx calls with an abandoned-wait error.
              * Pending request storage is quarantined later if it cannot be
              * drained safely. */
-            (void)CloseHandle(port->iocp);
+            iocp_to_close = port->iocp;
+            port->iocp = NULL;
             atomic_store_explicit(&port->iocp_closed, 1,
                                   memory_order_release);
+        }
+        pthread_mutex_unlock(&port->fd_table_lock);
+        if (iocp_to_close != NULL) {
+            (void)CloseHandle(iocp_to_close);
         }
     }
 }
 
-static int ep_port_quarantine(ep_port_t *port, int error)
+static int ep_port_pending_count(ep_port_t *port, size_t *pending_out)
+{
+    pthread_mutex_lock(&port->fd_table_lock);
+    *pending_out = port->pending_poll_count;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    return 0;
+}
+
+/* Continue consuming cancellation completions until every kernel request has
+ * released its embedded socket storage, the deadline expires, or IOCP becomes
+ * unusable.  The caller owns wait_lock. */
+static int ep_port_drain_pending_until(ep_port_t *port, uint64_t deadline)
+{
+    for (;;) {
+        size_t pending;
+
+        (void)ep_port_pending_count(port, &pending);
+        if (pending == 0) return 0;
+        if (atomic_load_explicit(&port->iocp_closed,
+                                 memory_order_acquire)) {
+            ep_set_errno(EIO);
+            return -1;
+        }
+
+        uint64_t now = GetTickCount64();
+        if (now >= deadline) {
+            ep_set_errno(ETIMEDOUT);
+            return 1;
+        }
+        uint64_t remaining = deadline - now;
+        DWORD wait_ms = remaining < EP_CLOSE_DRAIN_SLICE_MS
+            ? (DWORD)remaining : EP_CLOSE_DRAIN_SLICE_MS;
+        ULONG removed = 0;
+        if (ep_fault_hit(EP_FAULT_IOCP_DEQUEUE) != 0) {
+            return -1;
+        }
+        BOOL ok = port->get_queued_completion_status_ex(
+            port->iocp, port->iocp_entries, port->iocp_batch_size,
+            &removed, wait_ms, FALSE);
+
+        if (!ok) {
+            DWORD error = GetLastError();
+            if (error == WAIT_TIMEOUT) continue;
+            ep_set_errno(ep_winerr_to_errno(error));
+            return -1;
+        }
+        for (ULONG i = 0; i < removed; i++) {
+            OVERLAPPED *overlapped = port->iocp_entries[i].lpOverlapped;
+            if (overlapped == NULL) continue;
+
+            IO_STATUS_BLOCK *iosb = (IO_STATUS_BLOCK *)overlapped;
+            ep_sock_t *completed = (ep_sock_t *)(
+                (unsigned char *)iosb - offsetof(ep_sock_t, io_status_block));
+            ep_sock_handle_completion(
+                completed,
+                port->iocp_entries[i].dwNumberOfBytesTransferred,
+                iosb->Status);
+        }
+    }
+}
+
+/* Final reclamation after pending_poll_count reaches zero.  The caller owns
+ * wait_lock and no public API reference can reach the port. */
+static void ep_port_finish_destroy_locked(ep_port_t *port)
+{
+    pthread_mutex_lock(&port->fd_table_lock);
+    ep_sock_t *sock = port->sock_list_head;
+    while (sock != NULL) {
+        ep_sock_t *next = sock->next;
+        ep_sock_free_locked(port, sock);
+        sock = next;
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+
+    for (;;) {
+        ep_ready_node_t *node = ep_ready_drain(&port->ready_queue, INT_MAX);
+        if (node == NULL) break;
+        while (node != NULL) {
+            ep_ready_node_t *next = atomic_load_explicit(
+                &node->next, memory_order_relaxed);
+            ep_ready_node_free(port, node);
+            node = next;
+        }
+    }
+    ep_ready_destroy(&port->ready_queue);
+
+    if (port->afd != NULL) {
+        (void)CloseHandle(port->afd);
+        port->afd = NULL;
+    }
+    if (port->iocp != NULL &&
+        atomic_exchange_explicit(&port->iocp_closed, 1,
+                                 memory_order_acq_rel) == 0) {
+        (void)CloseHandle(port->iocp);
+    }
+    port->iocp = NULL;
+    ep_afd_pool_destroy(&port->afd_info_pool);
+    ep_afd_pool_destroy(&port->ready_node_pool);
+    free(port->fd_table);
+    free(port->iocp_entries);
+
+    pthread_mutex_unlock(&port->wait_lock);
+    pthread_mutex_destroy(&port->wait_lock);
+    pthread_mutex_destroy(&port->fd_table_lock);
+    free(port);
+}
+
+static void ep_port_abandon_locked(ep_port_t *port)
 {
     if (port->afd != NULL) {
         (void)CloseHandle(port->afd);
@@ -872,11 +1369,125 @@ static int ep_port_quarantine(ep_port_t *port, int error)
         (void)CloseHandle(port->iocp);
     }
     port->iocp = NULL;
+    atomic_fetch_add_explicit(&g_irrecoverable_ports, 1,
+                              memory_order_relaxed);
 
     /* Outstanding AFD operations still reference sock->io_status_block and
      * afd_info.  Leaking this unreachable port is safer than freeing storage
      * that the kernel may complete asynchronously. */
     pthread_mutex_unlock(&port->wait_lock);
+}
+
+typedef struct ep_port_reaper_context {
+    ep_port_t *port;
+    HMODULE module;
+} ep_port_reaper_context_t;
+
+static int ep_port_pin_containing_module(HMODULE *module_out)
+{
+    HMODULE module = NULL;
+
+    *module_out = NULL;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCWSTR)(const void *)&g_quarantined_ports,
+            &module)) {
+        return -1;
+    }
+    if (module == GetModuleHandleW(NULL)) {
+        /* Code linked directly into the process image cannot be unloaded
+         * while the process is alive, so it needs no reference pin. */
+        return 0;
+    }
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            (LPCWSTR)(const void *)&g_quarantined_ports,
+            &module)) {
+        return -1;
+    }
+    *module_out = module;
+    return 0;
+}
+
+static int ep_port_reaper_admit(void)
+{
+    uint64_t active = atomic_load_explicit(
+        &g_active_quarantines, memory_order_relaxed);
+
+    while (active < EP_MAX_ACTIVE_QUARANTINES) {
+        if (atomic_compare_exchange_weak_explicit(
+                &g_active_quarantines, &active, active + 1,
+                memory_order_acq_rel, memory_order_relaxed)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static DWORD WINAPI ep_port_reaper_thread(void *opaque)
+{
+    ep_port_reaper_context_t *context =
+        (ep_port_reaper_context_t *)opaque;
+    ep_port_t *port = context->port;
+    HMODULE module = context->module;
+    int drain_result;
+
+    free(context);
+    pthread_mutex_lock(&port->wait_lock);
+    drain_result = ep_port_drain_pending_until(
+        port, GetTickCount64() + port->quarantine_drain_timeout_ms);
+    if (drain_result == 0) {
+        ep_port_finish_destroy_locked(port);
+        atomic_fetch_add_explicit(&g_reaped_ports, 1, memory_order_relaxed);
+    } else {
+        ep_port_abandon_locked(port);
+    }
+    atomic_fetch_sub_explicit(&g_active_quarantines, 1,
+                              memory_order_release);
+
+    if (module != NULL) {
+        FreeLibraryAndExitThread(module, 0);
+    }
+    return 0;
+}
+
+static int ep_port_quarantine_recoverable_locked(ep_port_t *port, int error)
+{
+    ep_port_reaper_context_t *context =
+        (ep_port_reaper_context_t *)calloc(1, sizeof(*context));
+    HANDLE thread = NULL;
+
+    atomic_fetch_add_explicit(&g_quarantined_ports, 1,
+                              memory_order_relaxed);
+    if (!ep_port_reaper_admit()) {
+        ep_port_abandon_locked(port);
+        ep_set_errno(error);
+        return -1;
+    }
+    if (context != NULL) {
+        context->port = port;
+        if (ep_port_pin_containing_module(&context->module) != 0) {
+            free(context);
+            context = NULL;
+        }
+    }
+    if (context != NULL) {
+        thread = CreateThread(NULL, 0, ep_port_reaper_thread,
+                              context, 0, NULL);
+    }
+    if (thread == NULL) {
+        if (context != NULL && context->module != NULL) {
+            (void)FreeLibrary(context->module);
+        }
+        free(context);
+        atomic_fetch_sub_explicit(&g_active_quarantines, 1,
+                                  memory_order_release);
+        ep_port_abandon_locked(port);
+    } else {
+        (void)CloseHandle(thread);
+        pthread_mutex_unlock(&port->wait_lock);
+    }
     ep_set_errno(error);
     return -1;
 }
@@ -927,97 +1538,24 @@ int ep_port_destroy(ep_port_t *port)
     }
     pthread_mutex_unlock(&port->fd_table_lock);
 
-    uint64_t drain_deadline =
-        GetTickCount64() + EP_CLOSE_DRAIN_TIMEOUT_MS;
-    for (;;) {
-        size_t pending;
-        pthread_mutex_lock(&port->fd_table_lock);
-        pending = port->pending_poll_count;
-        pthread_mutex_unlock(&port->fd_table_lock);
-        if (pending == 0) {
-            break;
-        }
-        if (atomic_load_explicit(&port->iocp_closed,
-                                 memory_order_acquire)) {
-            return ep_port_quarantine(port, EIO);
-        }
+    int drain_result = ep_port_drain_pending_until(
+        port, GetTickCount64() + port->close_drain_timeout_ms);
+    if (drain_result != 0) {
+        int error = ep_last_err();
 
-        uint64_t now = GetTickCount64();
-        if (now >= drain_deadline) {
-            return ep_port_quarantine(port, ETIMEDOUT);
+        if (drain_result > 0 &&
+            !atomic_load_explicit(&port->iocp_closed,
+                                  memory_order_acquire)) {
+            return ep_port_quarantine_recoverable_locked(port, error);
         }
-        uint64_t remaining = drain_deadline - now;
-        DWORD wait_ms = remaining < EP_CLOSE_DRAIN_SLICE_MS
-            ? (DWORD)remaining : EP_CLOSE_DRAIN_SLICE_MS;
-
-        ULONG removed = 0;
-        BOOL ok = port->get_queued_completion_status_ex(
-            port->iocp, port->iocp_entries, port->iocp_batch_size,
-            &removed, wait_ms, FALSE);
-        if (!ok) {
-            DWORD error = GetLastError();
-            if (error == WAIT_TIMEOUT) {
-                continue;
-            }
-            return ep_port_quarantine(port, ep_winerr_to_errno(error));
-        }
-        for (ULONG i = 0; i < removed; i++) {
-            OVERLAPPED *overlapped = port->iocp_entries[i].lpOverlapped;
-            if (overlapped == NULL) {
-                continue;
-            }
-            IO_STATUS_BLOCK *iosb = (IO_STATUS_BLOCK *)overlapped;
-            ep_sock_t *completed = (ep_sock_t *)(
-                (unsigned char *)iosb - offsetof(ep_sock_t, io_status_block));
-            ep_sock_handle_completion(
-                completed,
-                port->iocp_entries[i].dwNumberOfBytesTransferred,
-                iosb->Status);
-        }
+        atomic_fetch_add_explicit(&g_quarantined_ports, 1,
+                                  memory_order_relaxed);
+        ep_port_abandon_locked(port);
+        ep_set_errno(error);
+        return -1;
     }
 
-    pthread_mutex_lock(&port->fd_table_lock);
-    sock = port->sock_list_head;
-    while (sock != NULL) {
-        ep_sock_t *next = sock->next;
-        ep_sock_free_locked(port, sock);
-        sock = next;
-    }
-    pthread_mutex_unlock(&port->fd_table_lock);
-
-    for (;;) {
-        ep_ready_node_t *node = ep_ready_drain(&port->ready_queue, INT_MAX);
-        if (node == NULL) {
-            break;
-        }
-        while (node != NULL) {
-            ep_ready_node_t *next = atomic_load_explicit(
-                &node->next, memory_order_relaxed);
-            ep_ready_node_free(port, node);
-            node = next;
-        }
-    }
-    ep_ready_destroy(&port->ready_queue);
-
-    if (port->afd != NULL) {
-        (void)CloseHandle(port->afd);
-        port->afd = NULL;
-    }
-    if (port->iocp != NULL &&
-        atomic_exchange_explicit(&port->iocp_closed, 1,
-                                 memory_order_acq_rel) == 0) {
-        (void)CloseHandle(port->iocp);
-    }
-    port->iocp = NULL;
-    ep_afd_pool_destroy(&port->afd_info_pool);
-    ep_afd_pool_destroy(&port->ready_node_pool);
-    free(port->fd_table);
-    free(port->iocp_entries);
-
-    pthread_mutex_unlock(&port->wait_lock);
-    pthread_mutex_destroy(&port->wait_lock);
-    pthread_mutex_destroy(&port->fd_table_lock);
-    free(port);
+    ep_port_finish_destroy_locked(port);
     return 0;
 }
 
@@ -1389,13 +1927,29 @@ static int ep_drain_to_buffer(ep_port_t *port,
                  * Retire it before a queued snapshot can surface stale data
                  * for a replacement that reused the same numeric handle. */
                 ep_sock_retire_stale_locked(port, sock);
+            } else if (identity_check == EP_IDENTITY_ERROR) {
+#ifdef WEPOLL_EX_STRICT_SOCKET_IDENTITY
+                int error = ep_last_err();
+
+                sock->pending_events = 0;
+                atomic_store_explicit(&sock->ready_queued, 0,
+                                      memory_order_relaxed);
+                atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                      memory_order_relaxed);
+                ep_sock_set_oneshot_fired_locked(sock, 0);
+                ep_sock_set_needs_rearm_locked(sock, 1);
+                ep_port_record_async_error_locked(port, error);
+#else
+                /* Best-effort builds preserve legacy delivery when a provider
+                 * identity query fails transiently. */
+                valid = 1;
+#endif
             } else
 #endif
             {
-                /* Endpoint identity is an optional hardening layer.  If its
-                 * query fails transiently, retain legacy delivery semantics
-                 * rather than losing a level-triggered or oneshot event. */
                 valid = 1;
+            }
+            if (valid) {
                 sock->pending_events = 0;
                 atomic_store_explicit(&sock->ready_queued, 0,
                                       memory_order_relaxed);
@@ -1405,6 +1959,8 @@ static int ep_drain_to_buffer(ep_port_t *port,
                     ep_sock_set_needs_rearm_locked(sock, 1);
                 }
             }
+        } else {
+            port->stale_events_dropped++;
         }
         pthread_mutex_unlock(&port->fd_table_lock);
 
@@ -1507,18 +2063,65 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
     }
     atomic_store_explicit(&port->waiter_active, 1, memory_order_release);
 
+    /* An error deferred behind a previously returned ready batch wins at the
+     * start of the next wait call.  This prevents a perpetually ready socket
+     * from starving the error forever while preserving ready-before-error
+     * ordering within the call that first observed both conditions. */
+    if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
+        ep_set_errno(EBADF);
+        result = -1;
+        goto done;
+    }
+    pthread_mutex_lock(&port->fd_table_lock);
+    {
+        int deferred_error = ep_port_take_async_error_locked(port);
+        pthread_mutex_unlock(&port->fd_table_lock);
+        if (deferred_error != 0) {
+            ep_set_errno(deferred_error);
+            result = -1;
+            goto done;
+        }
+    }
+
     for (;;) {
+        int async_error;
+
         if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
             ep_set_errno(EBADF);
             result = -1;
             break;
         }
 
+        result = ep_drain_to_buffer(port, out, maxevents);
+        if (result > 0) {
+            break;
+        }
+
         pthread_mutex_lock(&port->fd_table_lock);
-        int arm_result = ep_port_arm_pending_locked(port);
+        async_error = ep_port_take_async_error_locked(port);
+        int arm_result = async_error == 0
+            ? ep_port_arm_pending_locked(port) : 0;
         pthread_mutex_unlock(&port->fd_table_lock);
-        if (arm_result != 0) {
+        if (async_error != 0) {
+            ep_set_errno(async_error);
             result = -1;
+            break;
+        }
+        if (arm_result != 0) {
+            int arm_error = ep_last_err();
+
+            result = ep_drain_to_buffer(port, out, maxevents);
+            if (result <= 0) {
+                pthread_mutex_lock(&port->fd_table_lock);
+                {
+                    int reported_error =
+                        ep_port_take_async_error_locked(port);
+                    if (reported_error != 0) arm_error = reported_error;
+                }
+                pthread_mutex_unlock(&port->fd_table_lock);
+                ep_set_errno(arm_error);
+                result = -1;
+            }
             break;
         }
 
@@ -1542,6 +2145,10 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
         }
 
         ULONG removed = 0;
+        if (ep_fault_hit(EP_FAULT_IOCP_DEQUEUE) != 0) {
+            result = -1;
+            break;
+        }
         BOOL ok = port->get_queued_completion_status_ex(
             port->iocp, port->iocp_entries, port->iocp_batch_size,
             &removed, wait_ms, FALSE);
@@ -1593,9 +2200,20 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
         if (result > 0) {
             break;
         }
+        pthread_mutex_lock(&port->fd_table_lock);
+        async_error = ep_port_take_async_error_locked(port);
+        pthread_mutex_unlock(&port->fd_table_lock);
+        if (async_error != 0) {
+            ep_set_errno(async_error);
+            result = -1;
+            break;
+        }
         if (timeout_ms == 0 &&
             zero_timeout_dequeues >= EP_ZERO_TIMEOUT_MIN_DEQUEUES &&
             GetTickCount64() >= zero_timeout_deadline) {
+            pthread_mutex_lock(&port->fd_table_lock);
+            port->zero_timeout_budget_hits++;
+            pthread_mutex_unlock(&port->fd_table_lock);
             result = 0;
             break;
         }
@@ -1605,6 +2223,7 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
         }
     }
 
+done:
     atomic_store_explicit(&port->waiter_active, 0, memory_order_release);
     pthread_mutex_unlock(&port->wait_lock);
     return result;

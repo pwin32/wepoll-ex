@@ -83,6 +83,29 @@ static NTSTATUS NTAPI cancel_failure_stub(
     return STATUS_ACCESS_DENIED;
 }
 
+static PGetQueuedCompletionStatusEx late_reap_native_dequeue;
+static volatile LONG late_reap_allow_dequeue;
+
+static BOOL WINAPI late_reap_dequeue_stub(
+    HANDLE completion_port,
+    OVERLAPPED_ENTRY *entries,
+    ULONG count,
+    PULONG removed,
+    DWORD milliseconds,
+    BOOL alertable)
+{
+    if (InterlockedCompareExchange(&late_reap_allow_dequeue, 0, 0) == 0) {
+        DWORD delay = milliseconds == 0 ? 1 : milliseconds;
+        if (delay > 10) delay = 10;
+        Sleep(delay);
+        *removed = 0;
+        SetLastError(WAIT_TIMEOUT);
+        return FALSE;
+    }
+    return late_reap_native_dequeue(completion_port, entries, count,
+                                    removed, milliseconds, alertable);
+}
+
 static int test_cancel_failure(void)
 {
     ep_port_t *port;
@@ -273,6 +296,51 @@ static int test_drain_timeout(void)
            elapsed >= 4000 && elapsed < 12000 ? 0 : -1;
 }
 
+static int test_late_completion_reap(void)
+{
+    wepoll_ex_global_stats before;
+    wepoll_ex_global_stats after;
+    ep_port_t *port = NULL;
+    SOCKET socket_fd = INVALID_SOCKET;
+    int destroy_result;
+    int destroy_error;
+
+    if (wepoll_ex_get_global_stats(&before, sizeof(before)) != 0 ||
+        make_pending_port(&port, &socket_fd) != 0) {
+        return -1;
+    }
+
+    late_reap_native_dequeue = GetQueuedCompletionStatusEx;
+    InterlockedExchange(&late_reap_allow_dequeue, 0);
+    port->get_queued_completion_status_ex = late_reap_dequeue_stub;
+    port->close_drain_timeout_ms = 20;
+    port->quarantine_drain_timeout_ms = 2000;
+
+    errno = 0;
+    destroy_result = ep_port_destroy(port);
+    destroy_error = errno;
+    port = NULL; /* timeout transfers ownership to the detached reaper */
+    if (destroy_result != -1 || destroy_error != ETIMEDOUT) {
+        if (socket_fd != INVALID_SOCKET) closesocket(socket_fd);
+        return -1;
+    }
+
+    InterlockedExchange(&late_reap_allow_dequeue, 1);
+    for (int attempt = 0; attempt < 300; attempt++) {
+        if (wepoll_ex_get_global_stats(&after, sizeof(after)) != 0) break;
+        if (after.quarantined_ports == before.quarantined_ports + 1 &&
+            after.reaped_ports == before.reaped_ports + 1 &&
+            after.irrecoverable_ports == before.irrecoverable_ports) {
+            closesocket(socket_fd);
+            return 0;
+        }
+        Sleep(10);
+    }
+
+    if (socket_fd != INVALID_SOCKET) closesocket(socket_fd);
+    return -1;
+}
+
 typedef struct internal_wait_context {
     ep_port_t *port;
     HANDLE started;
@@ -348,6 +416,8 @@ int main(int argc, char **argv)
         result = test_iocp_failure();
     } else if (strcmp(argv[1], "drain-timeout") == 0) {
         result = test_drain_timeout();
+    } else if (strcmp(argv[1], "late-completion-reap") == 0) {
+        result = test_late_completion_reap();
     } else if (strcmp(argv[1], "wake-failure") == 0) {
         result = test_wake_failure();
     } else {

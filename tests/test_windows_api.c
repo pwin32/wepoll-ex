@@ -147,6 +147,54 @@ static void test_create_close(void)
     PASS();
 }
 
+static void test_operational_stats(void)
+{
+    wepoll_ex_global_stats global_stats;
+    wepoll_ex_stats stats;
+    uint32_t prefix[2] = { 0, 0 };
+    int policy;
+    int epfd;
+
+    TEST("versioned operational statistics and lifetime policy");
+    epfd = epoll_create_ex(8, 0);
+    if (epfd < 0) {
+        FAIL("epoll_create_ex");
+        return;
+    }
+    policy = wepoll_ex_get_socket_lifetime_policy();
+    if (policy < WEPOLL_EX_SOCKET_LIFETIME_BEST_EFFORT ||
+        policy > WEPOLL_EX_SOCKET_LIFETIME_SYNCHRONIZED ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.version != WEPOLL_EX_STATS_VERSION ||
+        stats.struct_size != sizeof(stats) ||
+        stats.socket_lifetime_policy != (uint32_t)policy ||
+        stats.active_registrations != 0 ||
+        stats.rearm_queue_depth != 0 || stats.ready_queue_depth != 0 ||
+        wepoll_ex_get_global_stats(&global_stats, sizeof(global_stats)) != 0 ||
+        global_stats.version != WEPOLL_EX_STATS_VERSION ||
+        global_stats.struct_size != sizeof(global_stats) ||
+        wepoll_ex_get_stats(epfd, (wepoll_ex_stats *)prefix,
+                            sizeof(prefix)) != 0 ||
+        prefix[0] != WEPOLL_EX_STATS_VERSION ||
+        prefix[1] != sizeof(stats)) {
+        FAIL("statistics snapshot");
+        (void)wepoll_close(epfd);
+        return;
+    }
+    errno = 0;
+    if (wepoll_ex_get_stats(epfd, &stats, sizeof(uint32_t)) != -1 ||
+        errno != EINVAL) {
+        FAIL("statistics size validation");
+        (void)wepoll_close(epfd);
+        return;
+    }
+    if (wepoll_close(epfd) != 0) {
+        FAIL("wepoll_close");
+        return;
+    }
+    PASS();
+}
+
 static void test_invalid_args(void)
 {
     struct epoll_event event;
@@ -431,9 +479,10 @@ static void test_connect_failure(void)
     int socket_error = 0;
     int socket_error_length = (int)sizeof(socket_error);
     int immediate_refusal = 0;
+    int add_result;
     int epfd = -1;
 
-    TEST("refused connect reports OUT and ERR");
+    TEST("refused connect reports OUT and ERR or strict identity rejection");
     reserved = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (reserved == INVALID_SOCKET) {
         FAIL("reserved socket");
@@ -478,8 +527,31 @@ static void test_connect_failure(void)
     epfd = epoll_create1(0);
     memset(&event, 0, sizeof(event));
     event.events = EPOLLOUT;
-    if (epfd < 0 ||
-        epoll_ctl(epfd, EPOLL_CTL_ADD, client, &event) != 0 ||
+    if (epfd < 0) {
+        FAIL("create epoll for refused connect");
+        closesocket(client);
+        closesocket(reserved);
+        return;
+    }
+    add_result = epoll_ctl(epfd, EPOLL_CTL_ADD, client, &event);
+    if (add_result != 0 &&
+        wepoll_ex_get_socket_lifetime_policy() ==
+            WEPOLL_EX_SOCKET_LIFETIME_STRICT &&
+        errno == EOPNOTSUPP) {
+        /* A refused connect may lose its WFP ALE endpoint token before ADD.
+         * Strict mode must reject that unprovable identity instead of falling
+         * back to numeric SOCKET matching. */
+        if (epoll_fd_count(epfd) != 0) {
+            FAIL("strict refused-connect rollback");
+        } else {
+            PASS();
+        }
+        wepoll_close(epfd);
+        closesocket(client);
+        closesocket(reserved);
+        return;
+    }
+    if (add_result != 0 ||
         epoll_wait(epfd, &output, 1, 5000) != 1 ||
         (output.events & (EPOLLOUT | EPOLLERR)) !=
             (EPOLLOUT | EPOLLERR) ||
@@ -1121,6 +1193,7 @@ int main(void)
     }
 
     test_create_close();
+    test_operational_stats();
     test_invalid_args();
     test_basic_io();
     test_write_ready();

@@ -5,23 +5,44 @@ project(wepoll-ex
     DESCRIPTION "Experimental extended epoll compatibility layer for Windows"
     LANGUAGES C)
 
+# PROJECT_IS_TOP_LEVEL was added in CMake 3.21.  Keep the declared 3.16
+# minimum while providing the same subproject distinction to older CMake
+# releases.
+if(NOT DEFINED PROJECT_IS_TOP_LEVEL)
+    if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+        set(PROJECT_IS_TOP_LEVEL ON)
+    else()
+        set(PROJECT_IS_TOP_LEVEL OFF)
+    endif()
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+include(CheckSymbolExists)
+include(CTest)
 
-# Default to Release for non-config builds.
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+# Default a standalone, single-config build to Release.  Do not alter a
+# parent project's build type when wepoll-ex is consumed with add_subdirectory.
+if(PROJECT_IS_TOP_LEVEL AND
+   NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Choose the type of build")
 endif()
 
 option(WEPOLL_EX_BUILD_SHARED   "Build shared library"      ON)
 option(WEPOLL_EX_BUILD_STATIC   "Build static library"      ON)
-option(WEPOLL_EX_BUILD_TESTS    "Build test suite"          ON)
+option(WEPOLL_EX_BUILD_TESTS    "Build test suite"
+       ${PROJECT_IS_TOP_LEVEL})
 option(WEPOLL_EX_BUILD_BENCH    "Build microbenchmarks"     OFF)
 option(WEPOLL_EX_BUILD_NGINX    "Compile-check nginx adapter" OFF)
+set(WEPOLL_EX_SOCKET_LIFETIME_MODE "best-effort" CACHE STRING
+    "Windows socket lifetime policy: best-effort, strict, or synchronized")
+set_property(CACHE WEPOLL_EX_SOCKET_LIFETIME_MODE PROPERTY STRINGS
+    best-effort strict synchronized)
 
 set(WEPOLL_EX_NGINX_SOURCE_DIR "" CACHE PATH
     "Configured nginx source tree for the optional adapter compile check")
@@ -44,8 +65,11 @@ endif()
 
 if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Windows")
     set(WEPOLL_EX_PLATFORM_WINDOWS ON)
-else()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(WEPOLL_EX_PLATFORM_POSIX   ON)
+else()
+    message(FATAL_ERROR
+        "wepoll-ex supports only Windows and Linux; the POSIX shim requires Linux epoll and eventfd")
 endif()
 
 # --------------------------------------------------------------------- #
@@ -89,12 +113,14 @@ if(WEPOLL_EX_PLATFORM_WINDOWS)
     set(WEPOLL_EX_SOURCES
         src/wepoll_ex_global.c
         src/wepoll_ex_errno.c
+        src/wepoll_ex_fault.c
         src/wepoll_ex_afd.c
         src/wepoll_ex_pool.c
         src/wepoll_ex_port.c
         src/wepoll_ex_api.c)
 else()
     set(WEPOLL_EX_SOURCES
+        src/wepoll_ex_fault.c
         src/wepoll_ex_posix.c
         src/wepoll_ex_pool.c)
 endif()
@@ -114,6 +140,31 @@ if(WEPOLL_EX_PLATFORM_WINDOWS)
         _WIN32_WINNT=0x0602  # Win8 — required for AFD poll bits
         WIN32_LEAN_AND_MEAN
         _CRT_SECURE_NO_WARNINGS)
+    if(WEPOLL_EX_SOCKET_LIFETIME_MODE STREQUAL "strict")
+        list(APPEND WEPOLL_EX_PLATFORM_DEFINITIONS
+            WEPOLL_EX_STRICT_SOCKET_IDENTITY=1)
+    elseif(WEPOLL_EX_SOCKET_LIFETIME_MODE STREQUAL "synchronized")
+        list(APPEND WEPOLL_EX_PLATFORM_DEFINITIONS
+            WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME=1)
+    elseif(NOT WEPOLL_EX_SOCKET_LIFETIME_MODE STREQUAL "best-effort")
+        message(FATAL_ERROR
+            "WEPOLL_EX_SOCKET_LIFETIME_MODE must be best-effort, strict, or synchronized")
+    endif()
+    message(STATUS
+        "wepoll-ex Windows socket lifetime policy: ${WEPOLL_EX_SOCKET_LIFETIME_MODE}")
+else()
+    set(_wepoll_ex_saved_required_definitions
+        "${CMAKE_REQUIRED_DEFINITIONS}")
+    list(APPEND CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+    check_symbol_exists(epoll_pwait2 "sys/epoll.h"
+        WEPOLL_EX_HAVE_EPOLL_PWAIT2)
+    set(CMAKE_REQUIRED_DEFINITIONS
+        "${_wepoll_ex_saved_required_definitions}")
+    unset(_wepoll_ex_saved_required_definitions)
+    if(WEPOLL_EX_HAVE_EPOLL_PWAIT2)
+        list(APPEND WEPOLL_EX_PLATFORM_DEFINITIONS
+            WEPOLL_EX_HAVE_EPOLL_PWAIT2=1)
+    endif()
 endif()
 
 # --------------------------------------------------------------------- #
@@ -224,8 +275,7 @@ endif()
 # Tests.
 # --------------------------------------------------------------------- #
 
-if(WEPOLL_EX_BUILD_TESTS)
-    enable_testing()
+if(BUILD_TESTING AND WEPOLL_EX_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
@@ -233,10 +283,8 @@ endif()
 # Benchmarks.
 # --------------------------------------------------------------------- #
 
-if(WEPOLL_EX_BUILD_BENCH AND WEPOLL_EX_PLATFORM_POSIX)
+if(WEPOLL_EX_BUILD_BENCH)
     add_subdirectory(bench)
-elseif(WEPOLL_EX_BUILD_BENCH)
-    message(STATUS "Skipping benchmark: bench_latency requires POSIX APIs")
 endif()
 
 # --------------------------------------------------------------------- #

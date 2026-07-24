@@ -24,6 +24,11 @@
 #include <limits.h>
 #include <errno.h>
 
+#if defined(WEPOLL_EX_STRICT_SOCKET_IDENTITY) && \
+    defined(WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME)
+#  error "strict and synchronized socket lifetime modes are mutually exclusive"
+#endif
+
 #ifdef _WIN32
 #  include <winsock2.h>
 #  include <mswsock.h>
@@ -285,6 +290,15 @@ struct ep_sock {
     _Atomic uint32_t ready_queued;
     uint8_t oneshot_fired;
     uint8_t needs_rearm;
+
+    /* Exactly-once membership in the per-port deferred-work lists.  These
+     * links are protected by fd_table_lock and are independent of the live
+     * socket list above: a socket can be removed from either work list in
+     * O(1) during MOD, DEL, native-close retirement, or final reclamation. */
+    struct ep_sock *rearm_next;
+    struct ep_sock *rearm_prev;
+    struct ep_sock *oneshot_next;
+    struct ep_sock *oneshot_prev;
     IO_STATUS_BLOCK io_status_block;
     uint64_t generation;
 
@@ -403,8 +417,25 @@ struct ep_port {
     _Atomic int closing;
     _Atomic int iocp_closed;
     size_t pending_poll_count;
+
+    /* Deferred AFD submissions and fired-oneshot identity probes.  Counts
+     * are diagnostic invariants; arm_pending consumes the intrusive lists
+     * directly and therefore does no work proportional to all registrations. */
+    ep_sock_t *rearm_head;
+    ep_sock_t *rearm_tail;
+    ep_sock_t *oneshot_head;
+    ep_sock_t *oneshot_tail;
     size_t needs_rearm_count;
     size_t oneshot_fired_count;
+    uint64_t rearm_work_visits;
+    uint64_t oneshot_probe_visits;
+    uint64_t stale_events_dropped;
+    uint64_t identity_failures;
+    uint64_t asynchronous_errors;
+    uint64_t zero_timeout_budget_hits;
+    int async_error;
+    uint64_t close_drain_timeout_ms;
+    uint64_t quarantine_drain_timeout_ms;
     uint64_t next_sock_generation;
 
     /* Atomic generation counter bumped on every ADD/DEL/MOD.  Used by
@@ -425,6 +456,44 @@ typedef struct ep_ntdll {
 } ep_ntdll_t;
 
 extern ep_ntdll_t g_ntdll;
+
+/* ----------------------------------------------------------------------- */
+/* Deterministic internal fault injection.                                 */
+/*                                                                         */
+/* A configured point fails exactly once, on its Nth hit.  Production      */
+/* builds leave every point disabled; the initial mask check is then the   */
+/* only work performed by ep_fault_hit().  These symbols are intentionally  */
+/* absent from the public header and shared-library export surface.         */
+/* ----------------------------------------------------------------------- */
+
+typedef enum ep_fault_point {
+    EP_FAULT_POOL_INIT_ALLOC = 0,
+    EP_FAULT_POOL_GROW,
+    EP_FAULT_AFD_OPEN,
+    EP_FAULT_AFD_SUBMIT,
+    EP_FAULT_AFD_CANCEL,
+    EP_FAULT_ENDPOINT_IDENTITY,
+    EP_FAULT_ENDPOINT_UNAVAILABLE,
+    EP_FAULT_PROVIDER_BASE,
+    EP_FAULT_READY_NODE_ALLOC,
+    EP_FAULT_IOCP_CREATE,
+    EP_FAULT_IOCP_POST,
+    EP_FAULT_IOCP_DEQUEUE,
+    EP_FAULT_POINT_COUNT
+} ep_fault_point_t;
+
+#ifdef WEPOLL_EX_ENABLE_FAULT_INJECTION
+int      ep_fault_configure(ep_fault_point_t point, uint64_t fail_at,
+                            int error);
+void     ep_fault_reset(void);
+int      ep_fault_hit(ep_fault_point_t point);
+uint64_t ep_fault_hits(ep_fault_point_t point);
+#else
+/* Keep production and embedded builds free of fault-injection branches and
+ * link dependencies.  The dedicated fault-test library enables the real
+ * implementation for deterministic regression coverage. */
+#  define ep_fault_hit(point) ((void)(point), 0)
+#endif
 
 /* ----------------------------------------------------------------------- */
 /* Internal API.                                                           */
@@ -451,6 +520,14 @@ int  ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
 
 void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes,
                                NTSTATUS status);
+int  ep_port_get_stats(ep_port_t *port, wepoll_ex_stats *stats);
+void ep_get_global_stats(wepoll_ex_global_stats *stats);
+uint64_t ep_api_close_timeout_count(void);
+
+#ifdef _WIN32
+/* Test/debug invariant checker.  The caller must hold fd_table_lock. */
+int ep_port_worklists_valid_locked(const ep_port_t *port);
+#endif
 
 /* errno shim. */
 void ep_set_errno(int e);

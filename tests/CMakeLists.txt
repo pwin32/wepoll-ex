@@ -26,7 +26,8 @@ else()
         test_windows_identity.c)
     target_compile_definitions(test_wepoll_ex_windows_identity PRIVATE
         _WIN32_WINNT=0x0602
-        WIN32_LEAN_AND_MEAN)
+        WIN32_LEAN_AND_MEAN
+        ${WEPOLL_EX_PLATFORM_DEFINITIONS})
 
     add_executable(test_wepoll_ex_windows_ipv6
         test_windows_ipv6.c)
@@ -40,6 +41,12 @@ else()
         _WIN32_WINNT=0x0602
         WIN32_LEAN_AND_MEAN)
 
+    add_executable(test_wepoll_ex_windows_stress
+        test_windows_stress.c)
+    target_compile_definitions(test_wepoll_ex_windows_stress PRIVATE
+        _WIN32_WINNT=0x0602
+        WIN32_LEAN_AND_MEAN)
+
     if(WEPOLL_EX_BUILD_STATIC)
         target_link_libraries(test_wepoll_ex_windows PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
@@ -49,6 +56,60 @@ else()
             wepoll_ex_static Threads::Threads ws2_32)
         target_link_libraries(test_wepoll_ex_windows_backpressure PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_stress PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+
+        add_executable(test_wepoll_ex_pool test_pool.c)
+        target_include_directories(test_wepoll_ex_pool PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(test_wepoll_ex_pool PRIVATE
+            ${WEPOLL_EX_PLATFORM_DEFINITIONS})
+        target_link_libraries(test_wepoll_ex_pool PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+
+        add_executable(test_wepoll_ex_windows_close_refs
+            test_windows_close_refs.c)
+        target_include_directories(test_wepoll_ex_windows_close_refs PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(test_wepoll_ex_windows_close_refs PRIVATE
+            ${WEPOLL_EX_PLATFORM_DEFINITIONS})
+        target_link_libraries(test_wepoll_ex_windows_close_refs PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+
+        add_executable(test_wepoll_ex_windows_faults
+            test_windows_faults.c)
+        target_include_directories(test_wepoll_ex_windows_faults PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(test_wepoll_ex_windows_faults PRIVATE
+            WEPOLL_EX_ENABLE_FAULT_INJECTION=1
+            ${WEPOLL_EX_PLATFORM_DEFINITIONS})
+
+        # Compile a private copy of the implementation with deterministic
+        # fault hooks enabled.  Normal libraries (including installed and
+        # nginx-embedded builds) compile those hooks to zero-cost no-ops.
+        set(_wepoll_ex_fault_test_sources)
+        foreach(_source IN LISTS WEPOLL_EX_SOURCES WEPOLL_EX_HEADERS)
+            list(APPEND _wepoll_ex_fault_test_sources
+                "${PROJECT_SOURCE_DIR}/${_source}")
+        endforeach()
+        add_library(wepoll_ex_fault_test_static STATIC
+            ${_wepoll_ex_fault_test_sources})
+        unset(_wepoll_ex_fault_test_sources)
+        target_include_directories(wepoll_ex_fault_test_static
+            PUBLIC  ${PROJECT_SOURCE_DIR}/include
+            PRIVATE ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(wepoll_ex_fault_test_static
+            PUBLIC  WEPOLL_EX_STATIC
+            PRIVATE WEPOLL_EX_ENABLE_FAULT_INJECTION=1
+                    ${WEPOLL_EX_PLATFORM_DEFINITIONS})
+        target_link_libraries(wepoll_ex_fault_test_static PRIVATE
+            Threads::Threads ws2_32 ntdll)
+        if(WEPOLL_EX_WINPTHREAD_LINK_LIBS)
+            target_link_libraries(wepoll_ex_fault_test_static INTERFACE
+                ${WEPOLL_EX_WINPTHREAD_LINK_LIBS})
+        endif()
+        target_link_libraries(test_wepoll_ex_windows_faults PRIVATE
+            wepoll_ex_fault_test_static Threads::Threads ws2_32)
 
         add_executable(test_wepoll_ex_windows_iocp_batch
             test_windows_iocp_batch.c)
@@ -56,7 +117,8 @@ else()
             ${PROJECT_SOURCE_DIR}/src)
         target_compile_definitions(test_wepoll_ex_windows_iocp_batch PRIVATE
             _WIN32_WINNT=0x0602
-            WIN32_LEAN_AND_MEAN)
+            WIN32_LEAN_AND_MEAN
+            ${WEPOLL_EX_PLATFORM_DEFINITIONS})
         target_link_libraries(test_wepoll_ex_windows_iocp_batch PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
@@ -66,7 +128,8 @@ else()
             ${PROJECT_SOURCE_DIR}/src)
         target_compile_definitions(test_wepoll_ex_windows_lifecycle PRIVATE
             _WIN32_WINNT=0x0602
-            WIN32_LEAN_AND_MEAN)
+            WIN32_LEAN_AND_MEAN
+            ${WEPOLL_EX_PLATFORM_DEFINITIONS})
         target_link_libraries(test_wepoll_ex_windows_lifecycle PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
@@ -76,7 +139,8 @@ else()
             ${PROJECT_SOURCE_DIR}/src)
         target_compile_definitions(test_wepoll_ex_windows_state PRIVATE
             _WIN32_WINNT=0x0602
-            WIN32_LEAN_AND_MEAN)
+            WIN32_LEAN_AND_MEAN
+            ${WEPOLL_EX_PLATFORM_DEFINITIONS})
         target_link_libraries(test_wepoll_ex_windows_state PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
@@ -86,7 +150,8 @@ else()
             ${PROJECT_SOURCE_DIR}/src)
         target_compile_definitions(test_wepoll_ex_windows_events PRIVATE
             _WIN32_WINNT=0x0602
-            WIN32_LEAN_AND_MEAN)
+            WIN32_LEAN_AND_MEAN
+            ${WEPOLL_EX_PLATFORM_DEFINITIONS})
         target_link_libraries(test_wepoll_ex_windows_events PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
@@ -96,7 +161,8 @@ else()
             ${PROJECT_SOURCE_DIR}/src)
         target_compile_definitions(test_wepoll_ex_windows_compat PRIVATE
             _WIN32_WINNT=0x0602
-            WIN32_LEAN_AND_MEAN)
+            WIN32_LEAN_AND_MEAN
+            ${WEPOLL_EX_PLATFORM_DEFINITIONS})
         target_link_libraries(test_wepoll_ex_windows_compat PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
@@ -105,6 +171,7 @@ else()
                 del-cancel-failure
                 iocp-failure
                 drain-timeout
+                late-completion-reap
                 wake-failure)
             string(REPLACE "-" "_" _lifecycle_name "${_lifecycle_mode}")
             add_test(NAME wepoll_ex_windows_${_lifecycle_name}
@@ -146,6 +213,8 @@ else()
             wepoll_ex::wepoll_ex ws2_32)
         target_link_libraries(test_wepoll_ex_windows_backpressure PRIVATE
             wepoll_ex::wepoll_ex ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_stress PRIVATE
+            wepoll_ex::wepoll_ex ws2_32)
     endif()
 
     add_test(NAME wepoll_ex_windows_api COMMAND test_wepoll_ex_windows)
@@ -160,7 +229,18 @@ else()
         COMMAND test_wepoll_ex_windows_backpressure)
     set_tests_properties(wepoll_ex_windows_backpressure PROPERTIES TIMEOUT 30)
 
+    add_test(NAME wepoll_ex_windows_stress
+        COMMAND test_wepoll_ex_windows_stress)
+    set_tests_properties(wepoll_ex_windows_stress PROPERTIES TIMEOUT 30)
+
     if(WEPOLL_EX_BUILD_STATIC)
+        add_test(NAME wepoll_ex_pool_mpsc COMMAND test_wepoll_ex_pool)
+        set_tests_properties(wepoll_ex_pool_mpsc PROPERTIES TIMEOUT 60)
+
+        add_test(NAME wepoll_ex_windows_close_refs
+            COMMAND test_wepoll_ex_windows_close_refs)
+        set_tests_properties(wepoll_ex_windows_close_refs PROPERTIES TIMEOUT 10)
+
         add_test(NAME wepoll_ex_windows_iocp_batch
             COMMAND test_wepoll_ex_windows_iocp_batch)
         set_tests_properties(wepoll_ex_windows_iocp_batch PROPERTIES TIMEOUT 20)
@@ -186,6 +266,27 @@ else()
                 set_tests_properties(wepoll_ex_windows_compat_${_compat_name}
                     PROPERTIES SKIP_RETURN_CODE 77)
             endif()
+        endforeach()
+
+        foreach(_fault_mode IN ITEMS
+                framework
+                pool-init
+                pool-grow
+                afd-open
+                afd-submit
+                afd-cancel
+                endpoint-identity
+                endpoint-policy
+                provider-base
+                iocp-create
+                iocp-post
+                iocp-dequeue
+                ready-node-alloc)
+            string(REPLACE "-" "_" _fault_name "${_fault_mode}")
+            add_test(NAME wepoll_ex_windows_fault_${_fault_name}
+                COMMAND test_wepoll_ex_windows_faults ${_fault_mode})
+            set_tests_properties(wepoll_ex_windows_fault_${_fault_name}
+                PROPERTIES TIMEOUT 20)
         endforeach()
     endif()
 
@@ -227,6 +328,7 @@ else()
             wepoll_ex_windows_api
             wepoll_ex_windows_ipv6
             wepoll_ex_windows_backpressure
+            wepoll_ex_windows_stress
             wepoll_ex_windows_identity_pending_add
             wepoll_ex_windows_identity_oneshot_rearm
             wepoll_ex_windows_identity_queued_ready
@@ -255,6 +357,8 @@ add_test(NAME wepoll_ex_package_consumer
         -DWEPOLL_EX_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
         -DWEPOLL_EX_GENERATOR_INSTANCE=${CMAKE_GENERATOR_INSTANCE}
         -DWEPOLL_EX_C_COMPILER=${CMAKE_C_COMPILER}
+        "-DWEPOLL_EX_C_FLAGS=${CMAKE_C_FLAGS}"
+        "-DWEPOLL_EX_EXE_LINKER_FLAGS=${CMAKE_EXE_LINKER_FLAGS}"
         -DWEPOLL_EX_OBJDUMP=${CMAKE_OBJDUMP}
         -DWEPOLL_EX_CHECK_WINPTHREAD=${MINGW}
         -DWEPOLL_EX_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}

@@ -123,6 +123,53 @@ typedef struct epoll_event_ex {
     void         *user_ctx;    /* per-fd opaque pointer */
 } epoll_event_ex;
 
+/* Windows socket-lifetime validation policy selected when the library was
+ * built.  BEST_EFFORT preserves compatibility with providers that cannot
+ * expose a stable WFP endpoint identity.  STRICT rejects those providers.
+ * SYNCHRONIZED relies on the embedding application to DEL every registration
+ * before closesocket().  The POSIX development wrapper reports NOT_APPLICABLE. */
+typedef enum wepoll_ex_socket_lifetime_policy {
+    WEPOLL_EX_SOCKET_LIFETIME_BEST_EFFORT = 0,
+    WEPOLL_EX_SOCKET_LIFETIME_STRICT = 1,
+    WEPOLL_EX_SOCKET_LIFETIME_SYNCHRONIZED = 2,
+    WEPOLL_EX_SOCKET_LIFETIME_NOT_APPLICABLE = 3
+} wepoll_ex_socket_lifetime_policy;
+
+/* Versioned operational snapshots.  Callers pass sizeof(their structure) to
+ * the getter; future releases may append fields while preserving the prefix. */
+#define WEPOLL_EX_STATS_VERSION 1U
+
+typedef struct wepoll_ex_stats {
+    uint32_t version;
+    uint32_t struct_size;
+    uint32_t socket_lifetime_policy;
+    uint32_t reserved;
+    uint64_t active_registrations;
+    uint64_t pending_polls;
+    uint64_t rearm_queue_depth;
+    uint64_t oneshot_probe_queue_depth;
+    uint64_t ready_queue_depth;
+    uint64_t afd_pool_in_use;
+    uint64_t afd_pool_peak;
+    uint64_t ready_pool_in_use;
+    uint64_t ready_pool_peak;
+    uint64_t rearm_work_items;
+    uint64_t stale_events_dropped;
+    uint64_t identity_failures;
+    uint64_t asynchronous_errors;
+    uint64_t zero_timeout_budget_hits;
+} wepoll_ex_stats;
+
+typedef struct wepoll_ex_global_stats {
+    uint32_t version;
+    uint32_t struct_size;
+    uint64_t quarantined_ports;
+    uint64_t reaped_ports;
+    uint64_t irrecoverable_ports;
+    uint64_t api_close_timeouts;
+    uint64_t active_quarantines;
+} wepoll_ex_global_stats;
+
 /* ---------------------------------------------------------------------------
  * Core Linux-compatible API.
  *
@@ -217,6 +264,15 @@ WEPOLL_EX_API int  epoll_fd_count(int epfd);
 /* Return library version: 0x00MMmmpp (major, minor, patch). */
 WEPOLL_EX_API uint32_t wepoll_ex_version(void);
 WEPOLL_EX_API const char *wepoll_ex_version_string(void);
+WEPOLL_EX_API int wepoll_ex_get_socket_lifetime_policy(void);
+
+/* Copy a versioned operational snapshot into caller-provided storage.  The
+ * supplied size must contain at least the version and struct_size prefix. */
+WEPOLL_EX_API int wepoll_ex_get_stats(int epfd,
+                                      wepoll_ex_stats *stats,
+                                      size_t stats_size);
+WEPOLL_EX_API int wepoll_ex_get_global_stats(
+    wepoll_ex_global_stats *stats, size_t stats_size);
 
 /* Close an epoll fd created by epoll_create / epoll_create1 /
  * epoll_create_ex.  On POSIX this normally behaves like close(); tracked

@@ -45,6 +45,8 @@ int ep_afd_open(HANDLE iocp, HANDLE *out)
         ep_set_errno(EINVAL);
         return -1;
     }
+    if (ep_fault_hit(EP_FAULT_AFD_OPEN) != 0)
+        return -1;
 
     static const WCHAR afd_name[] = AFD_DEVICE_NAME;
 
@@ -168,6 +170,8 @@ SOCKET ep_socket_get_base_with_ioctl(SOCKET socket,
         ep_set_errno(current == INVALID_SOCKET ? ENOTSOCK : EFAULT);
         return INVALID_SOCKET;
     }
+    if (ep_fault_hit(EP_FAULT_PROVIDER_BASE) != 0)
+        return INVALID_SOCKET;
     visited[0] = current;
 
     /* A finite bound protects against a broken provider returning a cycle.
@@ -270,6 +274,12 @@ int ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id)
         ep_set_errno(socket == INVALID_SOCKET ? ENOTSOCK : EFAULT);
         return -1;
     }
+    if (ep_fault_hit(EP_FAULT_ENDPOINT_UNAVAILABLE) != 0) {
+        ep_set_errno(0);
+        return 0;
+    }
+    if (ep_fault_hit(EP_FAULT_ENDPOINT_IDENTITY) != 0)
+        return -1;
 
     if (WSAIoctl(socket,
                  SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE,
@@ -373,6 +383,12 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
     sock->submitted_afd_events = afd_events;
     atomic_store(&sock->poll_status, EP_POLL_PENDING);
 
+    if (ep_fault_hit(EP_FAULT_AFD_SUBMIT) != 0) {
+        atomic_store(&sock->poll_status, EP_POLL_IDLE);
+        sock->submitted_afd_events = old_submitted_afd_events;
+        return -1;
+    }
+
     status = g_ntdll.NtDeviceIoControlFile(
         sock->port->afd,
         NULL,                           /* Event — we use IOCP instead */
@@ -417,6 +433,9 @@ int ep_afd_cancel(ep_sock_t *sock)
     if (atomic_load(&sock->poll_status) != EP_POLL_PENDING ||
         sock->io_status_block.Status != STATUS_PENDING)
         return 0;
+
+    if (ep_fault_hit(EP_FAULT_AFD_CANCEL) != 0)
+        return -1;
 
     memset(&cancel_status_block, 0, sizeof(cancel_status_block));
     status = g_ntdll.NtCancelIoFileEx(sock->port->afd,

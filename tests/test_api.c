@@ -267,6 +267,44 @@ static void test_extension_api(void)
     if (vn == 0) { FAIL("zero version"); return; }
     PASS();
 
+    TEST("versioned operational statistics report the POSIX contract");
+    wepoll_ex_stats stats;
+    wepoll_ex_global_stats global_stats;
+    uint32_t stats_prefix[2] = { 0, 0 };
+    int stats_epfd = epoll_create_ex(0, 0);
+    if (stats_epfd < 0 ||
+        wepoll_ex_get_socket_lifetime_policy() !=
+            WEPOLL_EX_SOCKET_LIFETIME_NOT_APPLICABLE ||
+        wepoll_ex_get_stats(stats_epfd, &stats, sizeof(stats)) != 0 ||
+        stats.version != WEPOLL_EX_STATS_VERSION ||
+        stats.struct_size != sizeof(stats) ||
+        stats.socket_lifetime_policy !=
+            WEPOLL_EX_SOCKET_LIFETIME_NOT_APPLICABLE ||
+        stats.active_registrations != 0 ||
+        wepoll_ex_get_global_stats(&global_stats, sizeof(global_stats)) != 0 ||
+        global_stats.version != WEPOLL_EX_STATS_VERSION ||
+        global_stats.struct_size != sizeof(global_stats) ||
+        wepoll_ex_get_stats(stats_epfd, (wepoll_ex_stats *)stats_prefix,
+                            sizeof(stats_prefix)) != 0 ||
+        stats_prefix[0] != WEPOLL_EX_STATS_VERSION ||
+        stats_prefix[1] != sizeof(stats)) {
+        FAIL("statistics snapshot");
+        if (stats_epfd >= 0) (void)wepoll_close(stats_epfd);
+        return;
+    }
+    errno = 0;
+    if (wepoll_ex_get_stats(stats_epfd, &stats,
+                            sizeof(uint32_t)) != -1 || errno != EINVAL) {
+        FAIL("statistics size validation");
+        (void)wepoll_close(stats_epfd);
+        return;
+    }
+    if (wepoll_close(stats_epfd) != 0) {
+        FAIL("statistics epfd close");
+        return;
+    }
+    PASS();
+
     TEST("epoll_fd_count returns 0 on fresh instance");
     int epfd = epoll_create1(0);
     if (epfd < 0) { FAIL("epoll_create1"); return; }
@@ -392,6 +430,30 @@ static void test_create_ex_and_timeout_validation(void)
     epoll_event_ex large_output[64];
     n = epoll_wait_ex(epfd, large_output, 64, 0);
     if (n != 0) { FAIL("epoll_wait_ex heap-buffer fallback"); goto timeout_cleanup; }
+    PASS();
+
+    TEST("sub-millisecond extended wait is accepted and bounded");
+    struct timespec submillisecond = { 0, 250000L };
+    struct timespec wait_start;
+    struct timespec wait_end;
+    if (clock_gettime(CLOCK_MONOTONIC, &wait_start) != 0) {
+        FAIL("clock_gettime before sub-millisecond wait");
+        goto timeout_cleanup;
+    }
+    n = epoll_pwait2_ex(epfd, out, 1, &submillisecond, NULL);
+    int wait_error = errno;
+    if (clock_gettime(CLOCK_MONOTONIC, &wait_end) != 0) {
+        FAIL("clock_gettime after sub-millisecond wait");
+        goto timeout_cleanup;
+    }
+    int64_t elapsed_ns = (int64_t)(wait_end.tv_sec - wait_start.tv_sec) *
+                         INT64_C(1000000000) +
+                         (int64_t)(wait_end.tv_nsec - wait_start.tv_nsec);
+    if (n != 0 || elapsed_ns < 0 || elapsed_ns > INT64_C(250000000)) {
+        errno = wait_error;
+        FAIL("sub-millisecond wait result or duration");
+        goto timeout_cleanup;
+    }
     PASS();
 
     TEST("extended waits distinguish NULL events from invalid maxevents");
@@ -1305,6 +1367,82 @@ static int sleep_milliseconds(long milliseconds)
     return 0;
 }
 
+typedef struct cancel_wait_context {
+    int         epfd;
+    atomic_int  started;
+} cancel_wait_context_t;
+
+static void *cancel_wait_thread(void *opaque)
+{
+    cancel_wait_context_t *context = opaque;
+    epoll_event_ex events[64];
+    struct timespec zero = { 0, 0 };
+
+    /* Create the metadata port before publishing readiness, then use a batch
+     * larger than the internal stack buffer so cancellation must release both
+     * the port reference and a heap allocation. */
+    (void)epoll_pwait2_ex(context->epfd, events, 64, &zero, NULL);
+    atomic_store_explicit(&context->started, 1, memory_order_release);
+    (void)epoll_pwait2_ex(context->epfd, events, 64, NULL, NULL);
+    return context;
+}
+
+static void test_cancel_blocking_extended_wait(void)
+{
+    TEST("cancelling a blocking extended wait releases resources");
+
+    int epfd = epoll_create_ex(0, 0);
+    if (epfd < 0) {
+        FAIL("epoll_create_ex");
+        return;
+    }
+
+    cancel_wait_context_t context = {
+        .epfd = epfd,
+        .started = ATOMIC_VAR_INIT(0)
+    };
+    pthread_t thread;
+    int thread_error = pthread_create(&thread, NULL, cancel_wait_thread,
+                                      &context);
+    if (thread_error != 0) {
+        errno = thread_error;
+        FAIL("pthread_create");
+        wepoll_close(epfd);
+        return;
+    }
+
+    if (wait_atomic_at_least(&context.started, 1, 2000) != 0 ||
+        sleep_milliseconds(50) != 0) {
+        FAIL("cancel waiter did not block");
+        (void)wepoll_close(epfd);
+        pthread_join(thread, NULL);
+        return;
+    }
+
+    thread_error = pthread_cancel(thread);
+    if (thread_error != 0) {
+        errno = thread_error;
+        FAIL("pthread_cancel");
+        (void)wepoll_close(epfd);
+        pthread_join(thread, NULL);
+        return;
+    }
+
+    void *thread_result = NULL;
+    thread_error = pthread_join(thread, &thread_result);
+    if (thread_error != 0 || thread_result != PTHREAD_CANCELED) {
+        if (thread_error != 0) errno = thread_error;
+        FAIL("cancelled wait thread result");
+        (void)wepoll_close(epfd);
+        return;
+    }
+    if (wepoll_close(epfd) != 0) {
+        FAIL("close after cancelled wait");
+        return;
+    }
+    PASS();
+}
+
 static void test_close_wakes_blocking_extended_wait(void)
 {
     enum { WAITER_COUNT = 2 };
@@ -2203,6 +2341,7 @@ int main(void)
     test_rearm_preserves_registration();
     test_drain_and_batch();
     test_invalid_and_closed_descriptors();
+    test_cancel_blocking_extended_wait();
     test_close_wakes_blocking_extended_wait();
     test_context_change_during_wait_is_not_stale();
     test_concurrent_close_and_reuse();

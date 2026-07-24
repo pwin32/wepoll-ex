@@ -1,0 +1,214 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/presets/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "WEPOLL_EX_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "posix-release",
+      "displayName": "Linux strict release",
+      "inherits": "base",
+      "generator": "Unix Makefiles",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "-O3 -Wall -Wextra -Wpedantic -Werror",
+        "WEPOLL_EX_BUILD_BENCH": "ON",
+        "WEPOLL_EX_BUILD_SHARED": "ON",
+        "WEPOLL_EX_BUILD_STATIC": "ON"
+      }
+    },
+    {
+      "name": "posix-asan-ubsan",
+      "displayName": "Linux ASan and UBSan",
+      "inherits": "base",
+      "generator": "Unix Makefiles",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "-O1 -g -Wall -Wextra -Wpedantic -Werror -fno-omit-frame-pointer -fsanitize=address,undefined",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=address,undefined",
+        "WEPOLL_EX_BUILD_BENCH": "OFF",
+        "WEPOLL_EX_BUILD_SHARED": "OFF",
+        "WEPOLL_EX_BUILD_STATIC": "ON"
+      }
+    },
+    {
+      "name": "mingw-base",
+      "hidden": true,
+      "inherits": "base",
+      "generator": "MinGW Makefiles",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "-O2 -Wall -Wextra -Wpedantic -Werror",
+        "WEPOLL_EX_BUILD_BENCH": "ON"
+      }
+    },
+    {
+      "name": "mingw-combined",
+      "displayName": "MinGW shared and static",
+      "inherits": "mingw-base",
+      "cacheVariables": {
+        "WEPOLL_EX_BUILD_SHARED": "ON",
+        "WEPOLL_EX_BUILD_STATIC": "ON"
+      }
+    },
+    {
+      "name": "mingw-static",
+      "displayName": "MinGW static only",
+      "inherits": "mingw-base",
+      "cacheVariables": {
+        "WEPOLL_EX_BUILD_SHARED": "OFF",
+        "WEPOLL_EX_BUILD_STATIC": "ON"
+      }
+    },
+    {
+      "name": "mingw-shared",
+      "displayName": "MinGW shared only",
+      "inherits": "mingw-base",
+      "cacheVariables": {
+        "WEPOLL_EX_BUILD_SHARED": "ON",
+        "WEPOLL_EX_BUILD_STATIC": "OFF"
+      }
+    },
+    {
+      "name": "mingw-strict",
+      "displayName": "MinGW strict socket identity",
+      "inherits": "mingw-combined",
+      "cacheVariables": {
+        "WEPOLL_EX_SOCKET_LIFETIME_MODE": "strict"
+      }
+    },
+    {
+      "name": "mingw-synchronized",
+      "displayName": "MinGW synchronized socket lifetime",
+      "inherits": "mingw-combined",
+      "cacheVariables": {
+        "WEPOLL_EX_SOCKET_LIFETIME_MODE": "synchronized"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "posix-release",
+      "configurePreset": "posix-release",
+      "jobs": 4
+    },
+    {
+      "name": "posix-asan-ubsan",
+      "configurePreset": "posix-asan-ubsan",
+      "jobs": 4
+    },
+    {
+      "name": "mingw-combined",
+      "configurePreset": "mingw-combined",
+      "jobs": 4
+    },
+    {
+      "name": "mingw-static",
+      "configurePreset": "mingw-static",
+      "jobs": 4
+    },
+    {
+      "name": "mingw-shared",
+      "configurePreset": "mingw-shared",
+      "jobs": 4
+    },
+    {
+      "name": "mingw-strict",
+      "configurePreset": "mingw-strict",
+      "jobs": 4
+    },
+    {
+      "name": "mingw-synchronized",
+      "configurePreset": "mingw-synchronized",
+      "jobs": 4
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "posix-release",
+      "configurePreset": "posix-release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "posix-asan-ubsan",
+      "configurePreset": "posix-asan-ubsan",
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=1:halt_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1"
+      },
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "mingw-combined",
+      "configurePreset": "mingw-combined",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "mingw-static",
+      "configurePreset": "mingw-static",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "mingw-shared",
+      "configurePreset": "mingw-shared",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "mingw-strict",
+      "configurePreset": "mingw-strict",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "mingw-synchronized",
+      "configurePreset": "mingw-synchronized",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    }
+  ]
+}

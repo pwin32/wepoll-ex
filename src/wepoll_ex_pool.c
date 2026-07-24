@@ -54,6 +54,11 @@ static ep_pool_entry_t *ep_pool_entry_alloc(ep_afd_pool_t *p, int in_pool)
         return NULL;
     }
 
+    if (ep_fault_hit(in_pool ? EP_FAULT_POOL_INIT_ALLOC
+                             : EP_FAULT_POOL_GROW) != 0) {
+        return NULL;
+    }
+
     ep_pool_entry_t *entry =
         (ep_pool_entry_t *)malloc(header_size + p->buf_size);
     if (entry == NULL) {

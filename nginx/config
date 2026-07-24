@@ -14,10 +14,26 @@ ngx_wepoll_addon=`cygpath -m "$ngx_addon_dir"`
 # The addon is intentionally self-contained: nginx compiles the static
 # wepoll-ex sources into its executable.  This avoids relying on a particular
 # out-of-tree CMake build directory while the integration remains experimental.
-# nginx's DEL-before-closesocket contract permits the documented endpoint-
-# identity hot-path opt-out for this embedded build.
-CFLAGS="$CFLAGS -DWEPOLL_EX_STATIC \
-    -DWEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME"
+# Select socket-lifetime behavior explicitly.  Best-effort preserves provider
+# compatibility, strict requires stable WFP endpoint identity, and synchronized
+# trusts every nginx/third-party module to DEL before closesocket().
+ngx_wepoll_lifetime_mode=${WEPOLL_EX_NGINX_LIFETIME_MODE:-best-effort}
+case "$ngx_wepoll_lifetime_mode" in
+    best-effort)
+        ngx_wepoll_lifetime_cflag=
+        ;;
+    strict)
+        ngx_wepoll_lifetime_cflag=-DWEPOLL_EX_STRICT_SOCKET_IDENTITY
+        ;;
+    synchronized)
+        ngx_wepoll_lifetime_cflag=-DWEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+        ;;
+    *)
+        echo "$0: error: WEPOLL_EX_NGINX_LIFETIME_MODE must be best-effort, strict, or synchronized"
+        exit 1
+        ;;
+esac
+CFLAGS="$CFLAGS -DWEPOLL_EX_STATIC $ngx_wepoll_lifetime_cflag"
 CORE_INCS="$CORE_INCS $ngx_wepoll_root/include $ngx_wepoll_root/src $ngx_wepoll_addon"
 
 ngx_module_type=EVENT

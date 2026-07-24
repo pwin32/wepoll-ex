@@ -20,19 +20,37 @@
 /* Keep the common wait scratch to a few KiB while retaining a heap fallback
  * for larger caller-requested batches. */
 #define EP_WAIT_STACK_EVENTS 64U
+/* A stuck public operation must not make close hang forever.  This matches
+ * the port's bounded AFD-completion drain while keeping the two waits
+ * independent: this deadline covers only public API references. */
+#define EP_API_CLOSE_TIMEOUT_MS 5000U
 
 typedef struct epfd_entry {
     int fd;
     ep_port_t *port;
     unsigned int refs;
     int closing;
-    pthread_cond_t refs_drained;
+    int detached;
+    HANDLE refs_drained_event;
     struct epfd_entry *next;
 } epfd_entry_t;
 
 static epfd_entry_t *g_epfd_buckets[EPFD_BUCKET_COUNT];
 static pthread_mutex_t g_epfd_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_next_fd = 1;
+static _Atomic unsigned int g_api_close_timeout_ms =
+    EP_API_CLOSE_TIMEOUT_MS;
+static _Atomic uint64_t g_api_close_timeout_count;
+static _Atomic uint64_t g_api_deferred_destroy_count;
+
+/* Internal diagnostics and deterministic-test hooks.  These symbols are not
+ * part of the installed public API and therefore deliberately omit the
+ * WEPOLL_EX_API export annotation. */
+uint64_t ep_api_close_timeout_count(void);
+void ep_test_set_api_close_timeout_ms(unsigned int timeout_ms);
+void *ep_test_api_ref_hold(int epfd);
+void ep_test_api_ref_release(void *reference);
+uint64_t ep_test_api_deferred_destroy_count(void);
 
 static unsigned int epfd_bucket(int fd)
 {
@@ -67,10 +85,10 @@ static int epfd_alloc(ep_port_t *port)
         ep_set_errno(ENOMEM);
         return -1;
     }
-    int cond_rc = pthread_cond_init(&entry->refs_drained, NULL);
-    if (cond_rc != 0) {
+    entry->refs_drained_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (entry->refs_drained_event == NULL) {
         free(entry);
-        ep_set_errno(cond_rc);
+        ep_set_errno(ep_winerr_to_errno(GetLastError()));
         return -1;
     }
 
@@ -96,7 +114,7 @@ static int epfd_alloc(ep_port_t *port)
     pthread_mutex_unlock(&g_epfd_lock);
 
     if (fd < 0) {
-        pthread_cond_destroy(&entry->refs_drained);
+        (void)CloseHandle(entry->refs_drained_event);
         free(entry);
         ep_set_errno(EMFILE);
     }
@@ -118,16 +136,49 @@ static epfd_entry_t *epfd_acquire(int fd)
     return entry;
 }
 
+static int epfd_destroy(epfd_entry_t *entry)
+{
+    int result = ep_port_destroy(entry->port);
+    int saved_errno = ep_last_err();
+
+    (void)CloseHandle(entry->refs_drained_event);
+    free(entry);
+    if (result != 0) {
+        ep_set_errno(saved_errno);
+    }
+    return result;
+}
+
 static void epfd_put(epfd_entry_t *entry)
 {
+    int destroy = 0;
+
     pthread_mutex_lock(&g_epfd_lock);
     if (entry->refs > 0) {
         entry->refs--;
     }
     if (entry->closing && entry->refs == 0) {
-        pthread_cond_signal(&entry->refs_drained);
+        if (entry->detached) {
+            destroy = 1;
+        } else {
+            (void)SetEvent(entry->refs_drained_event);
+        }
     }
     pthread_mutex_unlock(&g_epfd_lock);
+
+    if (destroy) {
+        /* The public operation has already selected its result and errno.
+         * Deferred teardown can report its own error only diagnostically, so
+         * do not let it overwrite the completing operation's errno. */
+        int operation_errno = ep_last_err();
+        int destroy_result = epfd_destroy(entry);
+
+        if (destroy_result == 0) {
+            atomic_fetch_add_explicit(&g_api_deferred_destroy_count, 1,
+                                      memory_order_relaxed);
+        }
+        ep_set_errno(operation_errno);
+    }
 }
 
 static void epfd_unlink_locked(epfd_entry_t *entry)
@@ -150,6 +201,36 @@ static epfd_entry_t *epfd_require(int fd)
         ep_set_errno(EBADF);
     }
     return entry;
+}
+
+uint64_t ep_api_close_timeout_count(void)
+{
+    return atomic_load_explicit(&g_api_close_timeout_count,
+                                memory_order_relaxed);
+}
+
+void ep_test_set_api_close_timeout_ms(unsigned int timeout_ms)
+{
+    atomic_store_explicit(&g_api_close_timeout_ms, timeout_ms,
+                          memory_order_relaxed);
+}
+
+void *ep_test_api_ref_hold(int epfd)
+{
+    return epfd_require(epfd);
+}
+
+void ep_test_api_ref_release(void *reference)
+{
+    if (reference != NULL) {
+        epfd_put((epfd_entry_t *)reference);
+    }
+}
+
+uint64_t ep_test_api_deferred_destroy_count(void)
+{
+    return atomic_load_explicit(&g_api_deferred_destroy_count,
+                                memory_order_relaxed);
 }
 
 static int timeout_from_timespec(const struct timespec *timeout,
@@ -582,10 +663,74 @@ WEPOLL_EX_API const char *wepoll_ex_version_string(void)
     return "wepoll-ex 0.1.0 (experimental IOCP+AFD)";
 }
 
+WEPOLL_EX_API int wepoll_ex_get_socket_lifetime_policy(void)
+{
+#if defined(WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME)
+    return WEPOLL_EX_SOCKET_LIFETIME_SYNCHRONIZED;
+#elif defined(WEPOLL_EX_STRICT_SOCKET_IDENTITY)
+    return WEPOLL_EX_SOCKET_LIFETIME_STRICT;
+#else
+    return WEPOLL_EX_SOCKET_LIFETIME_BEST_EFFORT;
+#endif
+}
+
+static int copy_stats_snapshot(void *destination, size_t destination_size,
+                               const void *snapshot, size_t snapshot_size)
+{
+    size_t prefix_size = sizeof(uint32_t) * 2;
+
+    if (destination == NULL) {
+        ep_set_errno(EFAULT);
+        return -1;
+    }
+    if (destination_size < prefix_size) {
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+    memset(destination, 0, destination_size);
+    memcpy(destination, snapshot,
+           destination_size < snapshot_size ? destination_size : snapshot_size);
+    return 0;
+}
+
+WEPOLL_EX_API int wepoll_ex_get_stats(int epfd, wepoll_ex_stats *stats,
+                                      size_t stats_size)
+{
+    epfd_entry_t *entry;
+    wepoll_ex_stats snapshot;
+    int result;
+
+    if (stats == NULL || stats_size < sizeof(uint32_t) * 2) {
+        ep_set_errno(stats == NULL ? EFAULT : EINVAL);
+        return -1;
+    }
+    entry = epfd_require(epfd);
+    if (entry == NULL) return -1;
+    result = ep_port_get_stats(entry->port, &snapshot);
+    epfd_put(entry);
+    if (result != 0) return -1;
+    return copy_stats_snapshot(stats, stats_size, &snapshot, sizeof(snapshot));
+}
+
+WEPOLL_EX_API int wepoll_ex_get_global_stats(
+    wepoll_ex_global_stats *stats, size_t stats_size)
+{
+    wepoll_ex_global_stats snapshot;
+
+    if (stats == NULL || stats_size < sizeof(uint32_t) * 2) {
+        ep_set_errno(stats == NULL ? EFAULT : EINVAL);
+        return -1;
+    }
+    ep_get_global_stats(&snapshot);
+    return copy_stats_snapshot(stats, stats_size, &snapshot, sizeof(snapshot));
+}
+
 WEPOLL_EX_API int wepoll_close(int epfd)
 {
     epfd_entry_t *entry;
     ep_port_t *port;
+    unsigned int timeout_ms;
+    int wait_error;
 
     pthread_mutex_lock(&g_epfd_lock);
     entry = epfd_find_locked(epfd);
@@ -602,19 +747,44 @@ WEPOLL_EX_API int wepoll_close(int epfd)
      * reference to drain. */
     ep_port_begin_close(port);
 
+    timeout_ms = atomic_load_explicit(&g_api_close_timeout_ms,
+                                      memory_order_relaxed);
     pthread_mutex_lock(&g_epfd_lock);
-    while (entry->refs != 0) {
-        pthread_cond_wait(&entry->refs_drained, &g_epfd_lock);
+    if (entry->refs != 0) {
+        HANDLE refs_drained_event = entry->refs_drained_event;
+        DWORD wait_result;
+
+        pthread_mutex_unlock(&g_epfd_lock);
+        wait_result = WaitForSingleObject(refs_drained_event, timeout_ms);
+        if (wait_result == WAIT_OBJECT_0) {
+            wait_error = 0;
+        } else if (wait_result == WAIT_TIMEOUT) {
+            wait_error = ETIMEDOUT;
+        } else {
+            wait_error = ep_winerr_to_errno(GetLastError());
+            if (wait_error == 0) wait_error = EIO;
+        }
+        pthread_mutex_lock(&g_epfd_lock);
+    } else {
+        wait_error = 0;
+    }
+    if (entry->refs != 0) {
+        /* Public lookup is severed before ownership is transferred.  The
+         * final outstanding operation observes detached under the same lock
+         * and becomes responsible for teardown in epfd_put(). */
+        entry->detached = 1;
+        epfd_unlink_locked(entry);
+        if (wait_error == 0) wait_error = ETIMEDOUT;
+        if (wait_error == ETIMEDOUT) {
+            atomic_fetch_add_explicit(&g_api_close_timeout_count, 1,
+                                      memory_order_relaxed);
+        }
+        pthread_mutex_unlock(&g_epfd_lock);
+        ep_set_errno(wait_error);
+        return -1;
     }
     epfd_unlink_locked(entry);
     pthread_mutex_unlock(&g_epfd_lock);
 
-    int result = ep_port_destroy(port);
-    int saved_errno = ep_last_err();
-    pthread_cond_destroy(&entry->refs_drained);
-    free(entry);
-    if (result != 0) {
-        ep_set_errno(saved_errno);
-    }
-    return result;
+    return epfd_destroy(entry);
 }

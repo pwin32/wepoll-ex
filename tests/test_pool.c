@@ -37,6 +37,19 @@ extern ep_ready_node_t *ep_ready_drain(ep_ready_queue_t *q, int maxevents);
 static int tests_passed;
 static int tests_failed;
 
+#ifdef _WIN32
+static DWORD WINAPI pool_watchdog_thread(void *opaque)
+{
+    HANDLE stop_event = (HANDLE)opaque;
+
+    if (WaitForSingleObject(stop_event, 45000) == WAIT_TIMEOUT) {
+        fputs("pool/MPSC watchdog timeout\n", stderr);
+        ExitProcess(124);
+    }
+    return 0;
+}
+#endif
+
 #define TEST(name) do { printf("  [test] %-58s ", (name)); fflush(stdout); } while (0)
 #define PASS()     do { printf("OK\n"); tests_passed++; } while (0)
 #define FAIL(why)  do { printf("FAIL: %s (errno=%d %s)\n", (why), errno, strerror(errno)); tests_failed++; } while (0)
@@ -589,8 +602,19 @@ static void test_queue_multi_producer(void)
 
 int main(void)
 {
+#ifdef _WIN32
+    HANDLE watchdog_stop = CreateEventA(NULL, TRUE, FALSE, NULL);
+    HANDLE watchdog = watchdog_stop == NULL ? NULL :
+        CreateThread(NULL, 0, pool_watchdog_thread, watchdog_stop, 0, NULL);
+    if (watchdog_stop == NULL || watchdog == NULL) {
+        fputs("could not create pool/MPSC watchdog\n", stderr);
+        if (watchdog_stop != NULL) CloseHandle(watchdog_stop);
+        return 2;
+    }
+#else
     /* CTest also enforces a timeout, but keep direct invocations bounded. */
     (void)alarm(45);
+#endif
 
     printf("wepoll-ex pool + MPSC queue regression tests\n");
     printf("=============================================\n");
@@ -601,7 +625,14 @@ int main(void)
     test_queue_bounded_fifo_and_destroy();
     test_queue_multi_producer();
 
+#ifdef _WIN32
+    SetEvent(watchdog_stop);
+    (void)WaitForSingleObject(watchdog, 1000);
+    CloseHandle(watchdog);
+    CloseHandle(watchdog_stop);
+#else
     (void)alarm(0);
+#endif
     printf("\nSummary: %d passed, %d failed\n", tests_passed, tests_failed);
     return tests_failed ? 1 : 0;
 }

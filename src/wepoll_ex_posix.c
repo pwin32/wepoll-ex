@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/stat.h>
@@ -637,16 +638,25 @@ static int port_rearm(posix_port_t *p, int fd)
     return result;
 }
 
-static int timeout_to_milliseconds(const struct timespec *timeout, int *out)
+static int validate_timespec_timeout(const struct timespec *timeout)
 {
     if (timeout == NULL) {
-        *out = -1;
         return 0;
     }
     if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 ||
         timeout->tv_nsec >= 1000000000L) {
         errno = EINVAL;
         return -1;
+    }
+    return 0;
+}
+
+static int timeout_to_milliseconds(const struct timespec *timeout, int *out)
+{
+    if (validate_timespec_timeout(timeout) != 0) return -1;
+    if (timeout == NULL) {
+        *out = -1;
+        return 0;
     }
     if (timeout->tv_sec > INT_MAX / 1000) {
         errno = EOVERFLOW;
@@ -665,8 +675,56 @@ static int timeout_to_milliseconds(const struct timespec *timeout, int *out)
     return 0;
 }
 
+typedef struct posix_wait_cleanup {
+    posix_port_t       *port;
+    struct epoll_event *heap_events;
+} posix_wait_cleanup_t;
+
+/* epoll_wait and epoll_pwait are pthread cancellation points on Linux.  A
+ * cancelled extended wait must release both its metadata-port reference and
+ * its optional heap buffer, otherwise a later wepoll_close() waits forever
+ * for a reference that no thread can release. */
+static void posix_wait_cancel_cleanup(void *arg)
+{
+    posix_wait_cleanup_t *cleanup = arg;
+
+    free(cleanup->heap_events);
+    port_release(cleanup->port);
+}
+
+static int posix_native_wait(int epfd, struct epoll_event *events,
+                             int maxevents, int timeout_ms,
+                             const struct timespec *timeout,
+                             int use_timespec, const sigset_t *sigmask)
+{
+    if (use_timespec) {
+#if defined(WEPOLL_EX_HAVE_EPOLL_PWAIT2)
+        int result = epoll_pwait2(epfd, events, maxevents, timeout, sigmask);
+        if (result >= 0 || errno != ENOSYS) return result;
+
+        /* A new libc can run on a kernel predating epoll_pwait2.  Preserve
+         * atomic signal-mask handling while falling back to millisecond
+         * timeout precision in that configuration. */
+#else
+        (void)timeout;
+#endif
+        if (timeout_to_milliseconds(timeout, &timeout_ms) != 0) return -1;
+        if (sigmask) {
+            return epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask);
+        }
+        return epoll_wait(epfd, events, maxevents, timeout_ms);
+    }
+
+    if (sigmask) {
+        return epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask);
+    }
+    return epoll_wait(epfd, events, maxevents, timeout_ms);
+}
+
 static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
-                         int maxevents, int timeout,
+                         int maxevents, int timeout_ms,
+                         const struct timespec *timeout,
+                         int use_timespec,
                          const sigset_t *sigmask)
 {
     if (!events) {
@@ -708,12 +766,15 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
         heap_events = 1;
     }
 
+    posix_wait_cleanup_t cleanup = {
+        .port = p,
+        .heap_events = heap_events ? kevs : NULL
+    };
     int n;
-    if (sigmask) {
-        n = epoll_pwait(wait_epfd, kevs, maxevents, timeout, sigmask);
-    } else {
-        n = epoll_wait(wait_epfd, kevs, maxevents, timeout);
-    }
+    pthread_cleanup_push(posix_wait_cancel_cleanup, &cleanup);
+    n = posix_native_wait(wait_epfd, kevs, maxevents, timeout_ms,
+                          timeout, use_timespec, sigmask);
+    pthread_cleanup_pop(0);
     if (n < 0) {
         int saved_errno = errno;
         if (port_is_closing(p)) saved_errno = EBADF;
@@ -818,7 +879,7 @@ WEPOLL_EX_API int epoll_ctl_ctx(int epfd, int op, int fd,
 WEPOLL_EX_API int epoll_wait_ex(int epfd, struct epoll_event_ex *events,
                                 int maxevents, int timeout)
 {
-    return posix_wait_ex(epfd, events, maxevents, timeout, NULL);
+    return posix_wait_ex(epfd, events, maxevents, timeout, NULL, 0, NULL);
 }
 
 WEPOLL_EX_API int epoll_pwait2_ex(int epfd, struct epoll_event_ex *events,
@@ -834,9 +895,8 @@ WEPOLL_EX_API int epoll_pwait2_ex(int epfd, struct epoll_event_ex *events,
         errno = EINVAL;
         return -1;
     }
-    int ms;
-    if (timeout_to_milliseconds(timeout, &ms) != 0) return -1;
-    return posix_wait_ex(epfd, events, maxevents, ms, sigmask);
+    if (validate_timespec_timeout(timeout) != 0) return -1;
+    return posix_wait_ex(epfd, events, maxevents, 0, timeout, 1, sigmask);
 }
 
 WEPOLL_EX_API int epoll_ctl_batch(int epfd, const int *ops,
@@ -938,6 +998,71 @@ WEPOLL_EX_API uint32_t wepoll_ex_version(void)
 WEPOLL_EX_API const char *wepoll_ex_version_string(void)
 {
     return "wepoll-ex 0.1.0 (POSIX wrapper)";
+}
+
+WEPOLL_EX_API int wepoll_ex_get_socket_lifetime_policy(void)
+{
+    return WEPOLL_EX_SOCKET_LIFETIME_NOT_APPLICABLE;
+}
+
+static int copy_stats_snapshot(void *destination, size_t destination_size,
+                               const void *snapshot, size_t snapshot_size)
+{
+    size_t prefix_size = sizeof(uint32_t) * 2;
+
+    if (destination == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    if (destination_size < prefix_size) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(destination, 0, destination_size);
+    memcpy(destination, snapshot,
+           destination_size < snapshot_size ? destination_size : snapshot_size);
+    return 0;
+}
+
+WEPOLL_EX_API int wepoll_ex_get_stats(int epfd, wepoll_ex_stats *stats,
+                                      size_t stats_size)
+{
+    posix_port_t *p;
+    wepoll_ex_stats snapshot;
+
+    if (stats == NULL || stats_size < sizeof(uint32_t) * 2) {
+        errno = stats == NULL ? EFAULT : EINVAL;
+        return -1;
+    }
+    p = port_acquire_or_create(epfd);
+    if (p == NULL) return -1;
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.version = WEPOLL_EX_STATS_VERSION;
+    snapshot.struct_size = (uint32_t)sizeof(snapshot);
+    snapshot.socket_lifetime_policy =
+        WEPOLL_EX_SOCKET_LIFETIME_NOT_APPLICABLE;
+
+    pthread_mutex_lock(&p->lock);
+    snapshot.active_registrations = p->count;
+    pthread_mutex_unlock(&p->lock);
+    port_release(p);
+    return copy_stats_snapshot(stats, stats_size, &snapshot, sizeof(snapshot));
+}
+
+WEPOLL_EX_API int wepoll_ex_get_global_stats(
+    wepoll_ex_global_stats *stats, size_t stats_size)
+{
+    wepoll_ex_global_stats snapshot;
+
+    if (stats == NULL || stats_size < sizeof(uint32_t) * 2) {
+        errno = stats == NULL ? EFAULT : EINVAL;
+        return -1;
+    }
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.version = WEPOLL_EX_STATS_VERSION;
+    snapshot.struct_size = (uint32_t)sizeof(snapshot);
+    return copy_stats_snapshot(stats, stats_size, &snapshot, sizeof(snapshot));
 }
 
 WEPOLL_EX_API int wepoll_close(int epfd)
