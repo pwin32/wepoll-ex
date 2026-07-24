@@ -173,9 +173,12 @@ optional heap event buffer and metadata reference before unwinding.
 - The nginx adapter leaves `ngx_event_actions.notify` unset. nginx 1.31.3
   rejects `--with-threads` on Win32 and its thread-pool sources are POSIX-only,
   so thread-pool integration is outside this prototype's supported boundary.
-- Windows signal masks are opaque API placeholders; non-null masks are
-  rejected with `EOPNOTSUPP`. Linux extended waits pass masks atomically to
-  native `epoll_pwait2` or the `epoll_pwait` fallback.
+- Windows signal masks are opaque API placeholders. Non-null masks are
+  accepted and ignored so portable `epoll_pwait*` call sites run; Windows has
+  no POSIX process signal mask to apply. Linux extended waits pass masks
+  atomically to native `epoll_pwait2` or the `epoll_pwait` fallback.
+- `EPOLLEXCLUSIVE` cannot be combined with `EPOLLONESHOT` or `EPOLLET` on
+  ADD (`EINVAL`), matching Linux. `EPOLLWAKEUP` is accepted and ignored.
 - `epoll_ctl_batch` best-effort rolls back successful ADDs after a later
   failure. Earlier MOD and DEL operations remain applied.
 - Fail-at-N hooks are internal, process-global test symbols. They are absent

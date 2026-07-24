@@ -43,6 +43,10 @@ queue, pool, rearm, stale-event, identity, asynchronous-error, drain-budget,
 quarantine, reaper, and close-timeout diagnostics. Linux reports its extension
 registration count and a not-applicable lifetime policy.
 
+Windows `epoll_pwait*` now accepts opaque non-null signal-mask pointers
+and ignores them. ADD rejects `EPOLLEXCLUSIVE` combined with `EPOLLONESHOT` or
+`EPOLLET` (`EINVAL`). `EPOLLWAKEUP` is accepted and ignored.
+
 Windows `EPOLLET` and ADD-time `EPOLLEXCLUSIVE` are no longer rejected.
 Edge-triggered delivery latches observed interest bits from AFD level
 snapshots and suppresses redelivery until those bits clear and reassert; empty
@@ -148,9 +152,11 @@ Windows 8-or-later compile/runtime assumption; Windows 8 itself was not tested.
 Windows now accepts `EPOLLET` and ADD-time `EPOLLEXCLUSIVE`. Edge delivery is
 an observed-bit filter over AFD level reports rather than a kernel edge
 queue, and exclusive wake uniqueness relies on AFD exclusive-poll cancellation
-among wepoll-ex instances. Non-null signal masks remain unsupported on
-Windows. Performance measurements are local loopback observations, not
-portable throughput guarantees.
+among wepoll-ex instances. Non-null Windows signal-mask pointers are accepted and ignored for
+portable `epoll_pwait*` call sites. `EPOLLEXCLUSIVE` rejects combinations with
+`EPOLLONESHOT`/`EPOLLET`, and `EPOLLWAKEUP` is accepted as a no-op. Performance
+measurements are local loopback observations, not portable throughput
+guarantees.
 
 See `README.md`, `docs/DESIGN.md`, and `docs/NGINX_INTEGRATION.md` for current
 contracts and integration constraints.

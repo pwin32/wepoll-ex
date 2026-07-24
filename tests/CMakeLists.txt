@@ -247,7 +247,10 @@ else()
             readable
             writable
             exclusive-mod
-            exclusive-wake)
+            exclusive-wake
+            exclusive-invalid
+            pwait-sigmask
+            wakeup-flag)
         string(REPLACE "-" "_" _edge_name "${_edge_mode}")
         add_test(NAME wepoll_ex_windows_edge_${_edge_name}
             COMMAND test_wepoll_ex_windows_edge ${_edge_mode})

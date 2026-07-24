@@ -76,10 +76,11 @@ On Windows, registrations are socket-only. `EPOLLONESHOT` is supported.
 `EPOLLET` is supported via observed-edge filtering over AFD level snapshots
 (with deferred re-arm on empty edges). `EPOLLEXCLUSIVE` is supported on ADD
 only and uses exclusive AFD polls; MOD with `EPOLLEXCLUSIVE` returns `EINVAL`,
-matching Linux. Windows `epoll_pwait*` still accepts a null signal mask only;
-Linux `epoll_pwait2_ex` applies a supplied mask atomically through the native
-wait. Call `wepoll_close()` for the virtual Windows epoll descriptor and for
-prompt Linux extended-wait wakeup.
+matching Linux. Windows `epoll_pwait*` accepts a non-null signal-mask pointer and ignores
+it (there is no POSIX process signal mask). Linux `epoll_pwait2_ex` applies a
+supplied mask atomically through the native wait. `EPOLLWAKEUP` is accepted
+and ignored on Windows. Call `wepoll_close()` for the virtual Windows epoll
+descriptor and for prompt Linux extended-wait wakeup.
 
 On Linux, `epoll_fd_count()` reports registrations owned by the extension
 metadata, including successful `epoll_ctl_batch` operations. Native

@@ -2194,10 +2194,10 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
         ep_set_errno(EINVAL);
         return -1;
     }
-    if (sigmask != NULL) {
-        ep_set_errno(EOPNOTSUPP);
-        return -1;
-    }
+    /* Windows has no POSIX process signal mask.  Accept a non-null pointer
+     * so portable epoll_pwait* call sites compile and run; the mask is not
+     * applied.  This matches the public wepoll_sigset_t opacity on Win32. */
+    (void)sigmask;
 
     if (timeout_ms > 0) {
         deadline = GetTickCount64() + (uint64_t)timeout_ms;

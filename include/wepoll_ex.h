@@ -10,7 +10,7 @@
  *     extension family for diagnostics and per-registration context.
  *   - All EPOLL* event flag bits defined by Linux uapi are present.
  *   - Windows implements EPOLLET (observed-edge) and ADD-time
- *     EPOLLEXCLUSIVE; non-null wait signal masks remain unsupported.
+ *     EPOLLEXCLUSIVE; non-null wait signal masks are accepted and ignored.
  *   - errno is set to the closest portable/Linux-style value on failure.
  *     See docs/DESIGN.md for the current platform limitations.
  *
@@ -228,7 +228,8 @@ WEPOLL_EX_API int  epoll_wait_ex(int epfd, struct epoll_event_ex *events,
                                  int maxevents, int timeout);
 
 /* epoll_pwait2 that returns extended events.  POSIX applies a non-NULL
- * signal mask atomically through epoll_pwait; Windows accepts only NULL. */
+ * signal mask atomically through epoll_pwait; Windows accepts and ignores
+ * a non-null mask pointer. */
 WEPOLL_EX_API int  epoll_pwait2_ex(int epfd, struct epoll_event_ex *events,
                                    int maxevents,
                                    const struct timespec *timeout,

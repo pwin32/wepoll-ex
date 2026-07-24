@@ -349,6 +349,160 @@ fail:
     return 1;
 }
 
+static int test_exclusive_invalid_combos(void)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    int epfd = -1;
+
+    if (make_loopback_pair(&listener, &client, &accepted) != 0)
+        return 1;
+    epfd = epoll_create1(0);
+    if (epfd < 0)
+        goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLEXCLUSIVE | EPOLLONESHOT;
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != -1 ||
+        errno != EINVAL) {
+        fprintf(stderr, "exclusive+oneshot: expected EINVAL errno=%d\n",
+                errno);
+        goto fail;
+    }
+
+    event.events = EPOLLIN | EPOLLEXCLUSIVE | EPOLLET;
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != -1 ||
+        errno != EINVAL) {
+        fprintf(stderr, "exclusive+et: expected EINVAL errno=%d\n", errno);
+        goto fail;
+    }
+
+    if (epoll_fd_count(epfd) != 0) {
+        fputs("exclusive invalid combos left a registration\n", stderr);
+        goto fail;
+    }
+
+    (void)wepoll_close(epfd);
+    closesocket(accepted);
+    closesocket(client);
+    closesocket(listener);
+    puts("exclusive-invalid: OK");
+    return 0;
+
+fail:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return 1;
+}
+
+static int test_pwait_nonnull_sigmask(void)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    struct epoll_event events[1];
+    struct epoll_event_ex events_ex[1];
+    struct timespec zero;
+    int dummy_mask = 0x5a5a5a5a;
+    int epfd = -1;
+    int n;
+
+    if (make_loopback_pair(&listener, &client, &accepted) != 0)
+        return 1;
+    epfd = epoll_create1(0);
+    if (epfd < 0)
+        goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = 99;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0)
+        goto fail;
+    if (send(client, "z", 1, 0) != 1)
+        goto fail;
+
+    /* Opaque non-null mask must be accepted and ignored on Windows. */
+    n = epoll_pwait(epfd, events, 1, 1000,
+                    (const wepoll_sigset_t *)&dummy_mask);
+    if (n != 1 || (events[0].events & EPOLLIN) == 0) {
+        fprintf(stderr, "pwait non-null mask failed n=%d errno=%d\n",
+                n, errno);
+        goto fail;
+    }
+
+    if (send(client, "y", 1, 0) != 1)
+        goto fail;
+    zero.tv_sec = 0;
+    zero.tv_nsec = 0;
+    n = epoll_pwait2_ex(epfd, events_ex, 1, &zero,
+                        (const wepoll_sigset_t *)&dummy_mask);
+    if (n != 1 || (events_ex[0].events & EPOLLIN) == 0) {
+        fprintf(stderr, "pwait2_ex non-null mask failed n=%d errno=%d\n",
+                n, errno);
+        goto fail;
+    }
+
+    (void)wepoll_close(epfd);
+    closesocket(accepted);
+    closesocket(client);
+    closesocket(listener);
+    puts("pwait-sigmask: OK");
+    return 0;
+
+fail:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return 1;
+}
+
+static int test_wakeup_flag_accepted(void)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    int epfd = -1;
+
+    if (make_loopback_pair(&listener, &client, &accepted) != 0)
+        return 1;
+    epfd = epoll_create1(0);
+    if (epfd < 0)
+        goto fail;
+
+    memset(&event, 0, sizeof(event));
+    /* EPOLLWAKEUP has no freezable-task equivalent on Windows; accept and
+     * ignore it so portable event masks do not fail registration. */
+    event.events = EPOLLIN | EPOLLWAKEUP;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0 ||
+        epoll_fd_count(epfd) != 1) {
+        fprintf(stderr, "EPOLLWAKEUP ADD failed errno=%d\n", errno);
+        goto fail;
+    }
+
+    (void)wepoll_close(epfd);
+    closesocket(accepted);
+    closesocket(client);
+    closesocket(listener);
+    puts("wakeup-flag: OK");
+    return 0;
+
+fail:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return 1;
+}
+
 static int run_mode(const char *mode)
 {
     if (strcmp(mode, "readable") == 0)
@@ -359,6 +513,12 @@ static int run_mode(const char *mode)
         return test_exclusive_mod_rejected();
     if (strcmp(mode, "exclusive-wake") == 0)
         return test_exclusive_single_wake();
+    if (strcmp(mode, "exclusive-invalid") == 0)
+        return test_exclusive_invalid_combos();
+    if (strcmp(mode, "pwait-sigmask") == 0)
+        return test_pwait_nonnull_sigmask();
+    if (strcmp(mode, "wakeup-flag") == 0)
+        return test_wakeup_flag_accepted();
     fprintf(stderr, "unknown edge mode: %s\n", mode);
     return 2;
 }
@@ -368,7 +528,8 @@ int main(int argc, char **argv)
     WSADATA wsa;
     int failures = 0;
     const char *modes[] = {
-        "readable", "writable", "exclusive-mod", "exclusive-wake"
+        "readable", "writable", "exclusive-mod", "exclusive-wake",
+        "exclusive-invalid", "pwait-sigmask", "wakeup-flag"
     };
     size_t i;
 
