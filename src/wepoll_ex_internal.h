@@ -251,15 +251,22 @@ typedef enum ep_socket_identity_state {
 } ep_socket_identity_state_t;
 #endif
 
+typedef enum ep_reg_kind {
+    EP_REG_SOCKET = 0,
+    EP_REG_WAITABLE = 1
+} ep_reg_kind_t;
+
 struct ep_sock {
     /* Pool linkage (all live sockets on this port). */
     struct ep_sock *next;
     struct ep_sock *prev;
 
     /* The descriptor supplied by the caller and the unwrapped provider
-     * socket used in AFD_POLL. */
+     * socket used in AFD_POLL.  Waitable registrations store the same
+     * HANDLE value in fd/base_socket and set kind=EP_REG_WAITABLE. */
     SOCKET fd;
     SOCKET base_socket;
+    uint8_t kind; /* ep_reg_kind_t */
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     uint64_t endpoint_id;
     uint8_t endpoint_id_state;
@@ -312,8 +319,13 @@ struct ep_sock {
     uint64_t generation;
 
     /* The AFD poll buffer for this socket.  Allocated separately so the
-     * buffer can be reused across re-arming without copying. */
+     * buffer can be reused across re-arming without copying.  NULL for
+     * waitable-HANDLE registrations. */
     AFD_POLL_INFO *afd_info;
+
+    /* RegisterWaitForSingleObject cookie for waitable HANDLE registrations.
+     * NULL when no kernel wait is outstanding. */
+    HANDLE wait_registration;
 
     /* Back-pointer to owning port (for IOCP callback lookup). */
     ep_port_t *port;

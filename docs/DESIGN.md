@@ -130,8 +130,12 @@ optional heap event buffer and metadata reference before unwinding.
 
 ## Supported semantics and boundaries
 
-- Windows registrations accept Winsock sockets only, not files or arbitrary
-  HANDLEs.
+- Windows registrations accept Winsock sockets and waitable HANDLEs
+  (`WaitForSingleObject`-compatible objects such as events).  Non-waitable
+  files and pipes remain unsupported.  Waitable registrations use
+  `RegisterWaitForSingleObject` + IOCP wakeups rather than AFD, reject
+  `EPOLLEXCLUSIVE`, and map a signaled object to the requested
+  `EPOLLIN`/`EPOLLOUT` interest bits.
 - Linux `fstat` fingerprints are a conservative metadata aid, not a formal
   open-file-description identifier. Multiple matching registrations reject
   MOD/DEL/rearm with `EOPNOTSUPP`; a single stale fingerprint collision and a

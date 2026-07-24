@@ -90,6 +90,83 @@ static void ep_exclusive_release(SOCKET base)
     pthread_mutex_unlock(&g_exclusive_lock);
 }
 
+#ifdef _WIN32
+static VOID CALLBACK ep_waitable_callback(PVOID parameter, BOOLEAN timer_or_wait_fired)
+{
+    ep_sock_t *sock = (ep_sock_t *)parameter;
+    ep_port_t *port;
+
+    (void)timer_or_wait_fired;
+    if (sock == NULL || sock->port == NULL) {
+        return;
+    }
+    port = sock->port;
+    sock->io_status_block.Status = STATUS_SUCCESS;
+    sock->io_status_block.Information = 0;
+    if (!PostQueuedCompletionStatus(port->iocp, 0, 0,
+                                    (LPOVERLAPPED)&sock->io_status_block)) {
+        /* Best-effort wake; close/drain paths recover outstanding state. */
+    }
+}
+
+static int ep_handle_is_waitable(HANDLE handle)
+{
+    DWORD wait_result;
+
+    if (handle == NULL || handle == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    wait_result = WaitForSingleObject(handle, 0);
+    if (wait_result == WAIT_OBJECT_0 || wait_result == WAIT_TIMEOUT) {
+        return 1;
+    }
+    return 0;
+}
+
+static uint32_t ep_waitable_level_events(const ep_sock_t *sock)
+{
+    uint32_t interest = sock->user_events &
+        (EPOLLIN | EPOLLOUT | EPOLLPRI | EPOLLRDNORM | EPOLLWRNORM |
+         EPOLLRDBAND | EPOLLWRBAND | EPOLLRDHUP);
+    if (interest == 0) {
+        interest = EPOLLIN;
+    }
+    return interest;
+}
+
+static int ep_waitable_register_locked(ep_sock_t *sock)
+{
+    HANDLE registration = NULL;
+
+    if (sock->wait_registration != NULL) {
+        return 0;
+    }
+    if (!RegisterWaitForSingleObject(
+            &registration,
+            (HANDLE)sock->fd,
+            ep_waitable_callback,
+            sock,
+            INFINITE,
+            WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD)) {
+        ep_set_errno(ep_winerr_to_errno(GetLastError()));
+        return -1;
+    }
+    sock->wait_registration = registration;
+    return 0;
+}
+
+static void ep_waitable_unregister_locked(ep_sock_t *sock)
+{
+    HANDLE registration = sock->wait_registration;
+
+    if (registration == NULL) {
+        return;
+    }
+    sock->wait_registration = NULL;
+    (void)UnregisterWaitEx(registration, INVALID_HANDLE_VALUE);
+}
+#endif
+
 static _Atomic uint64_t g_active_quarantines;
 static _Atomic uint64_t g_reaped_ports;
 static _Atomic uint64_t g_irrecoverable_ports;
@@ -694,43 +771,61 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     int identity_result;
 #endif
+    int base_error = 0;
     if (sock == NULL) {
         ep_set_errno(ENOMEM);
         return NULL;
     }
 
+    sock->kind = EP_REG_SOCKET;
+    sock->wait_registration = NULL;
     sock->base_socket = ep_socket_get_base(fd);
     if (sock->base_socket == INVALID_SOCKET) {
-        free(sock);
-        return NULL;
-    }
-
+        base_error = ep_last_err();
+        if ((base_error == ENOTSOCK || base_error == EBADF || base_error == 0) &&
+            ep_handle_is_waitable((HANDLE)fd)) {
+            sock->kind = EP_REG_WAITABLE;
+            sock->base_socket = fd;
+            sock->afd_info = NULL;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
-    identity_result = ep_socket_get_endpoint_id(fd, &sock->endpoint_id);
-    if (identity_result < 0) {
-        port->identity_failures++;
-        free(sock);
-        return NULL;
-    }
-    if (identity_result == 0) {
-#ifdef WEPOLL_EX_STRICT_SOCKET_IDENTITY
-        port->identity_failures++;
-        free(sock);
-        ep_set_errno(EOPNOTSUPP);
-        return NULL;
-#else
-        sock->endpoint_id_state = EP_SOCKET_ID_UNAVAILABLE;
+            sock->endpoint_id = 0;
+            sock->endpoint_id_state = EP_SOCKET_ID_UNAVAILABLE;
 #endif
-    } else if (ep_socket_identity_is_stable(fd)) {
-        sock->endpoint_id_state = EP_SOCKET_ID_STABLE;
+        } else {
+            free(sock);
+            if (base_error != 0) {
+                ep_set_errno(base_error);
+            }
+            return NULL;
+        }
     } else {
-        sock->endpoint_id_state = EP_SOCKET_ID_TRANSITIONAL;
-    }
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+        identity_result = ep_socket_get_endpoint_id(fd, &sock->endpoint_id);
+        if (identity_result < 0) {
+            port->identity_failures++;
+            free(sock);
+            return NULL;
+        }
+        if (identity_result == 0) {
+#ifdef WEPOLL_EX_STRICT_SOCKET_IDENTITY
+            port->identity_failures++;
+            free(sock);
+            ep_set_errno(EOPNOTSUPP);
+            return NULL;
+#else
+            sock->endpoint_id_state = EP_SOCKET_ID_UNAVAILABLE;
 #endif
-    sock->afd_info = (AFD_POLL_INFO *)ep_afd_pool_take(&port->afd_info_pool);
-    if (sock->afd_info == NULL) {
-        free(sock);
-        return NULL;
+        } else if (ep_socket_identity_is_stable(fd)) {
+            sock->endpoint_id_state = EP_SOCKET_ID_STABLE;
+        } else {
+            sock->endpoint_id_state = EP_SOCKET_ID_TRANSITIONAL;
+        }
+#endif
+        sock->afd_info = (AFD_POLL_INFO *)ep_afd_pool_take(&port->afd_info_pool);
+        if (sock->afd_info == NULL) {
+            free(sock);
+            return NULL;
+        }
     }
 
     sock->fd = fd;
@@ -756,6 +851,9 @@ static void ep_sock_free_locked(ep_port_t *port, ep_sock_t *sock)
     }
     sock->observed_events = 0;
     sock->et_holdoff = 0;
+    if (sock->kind == EP_REG_WAITABLE) {
+        ep_waitable_unregister_locked(sock);
+    }
     ep_sock_list_remove_locked(port, sock);
     if (sock->afd_info != NULL) {
         ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
@@ -848,6 +946,54 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
     }
 #endif
 
+    if (sock->kind == EP_REG_WAITABLE) {
+        DWORD wait_result;
+
+        if (sock->oneshot_fired) {
+            wait_result = WaitForSingleObject((HANDLE)sock->fd, 0);
+            if (wait_result == WAIT_FAILED) {
+                ep_sock_drop_closed_locked(port, sock);
+                ep_set_errno(EBADF);
+                return 1;
+            }
+            return 0;
+        }
+        if (!sock->needs_rearm) {
+            return 0;
+        }
+        sock->et_holdoff = 0;
+        wait_result = WaitForSingleObject((HANDLE)sock->fd, 0);
+        if (wait_result == WAIT_FAILED) {
+            ep_sock_drop_closed_locked(port, sock);
+            ep_set_errno(EBADF);
+            return 1;
+        }
+        if (wait_result != WAIT_OBJECT_0 &&
+            (sock->user_flags & EPOLLET) != 0) {
+            /* Handle is unsignaled: reopen the edge latch. */
+            sock->observed_events = 0;
+        }
+        if (wait_result == WAIT_OBJECT_0) {
+            sock->io_status_block.Status = STATUS_SUCCESS;
+            sock->io_status_block.Information = 0;
+            if (!PostQueuedCompletionStatus(
+                    port->iocp, 0, 0,
+                    (LPOVERLAPPED)&sock->io_status_block)) {
+                ep_set_errno(ep_winerr_to_errno(GetLastError()));
+                return -1;
+            }
+        } else if (ep_waitable_register_locked(sock) != 0) {
+            return -1;
+        }
+        ep_sock_set_needs_rearm_locked(sock, 0);
+        atomic_store_explicit(&sock->poll_status, EP_POLL_PENDING,
+                              memory_order_relaxed);
+        atomic_store_explicit(&sock->state, EP_SOCK_POLLING,
+                              memory_order_relaxed);
+        port->pending_poll_count++;
+        return 0;
+    }
+
     if (sock->oneshot_fired) {
         /* No AFD request remains after a oneshot delivery.  Probe the
          * provider handle so a native closesocket() cannot leave a stale
@@ -871,7 +1017,8 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
     /* A deferred edge-triggered re-arm is eligible again once a wait is
      * preparing submissions. */
     sock->et_holdoff = 0;
-    if ((sock->user_flags & EPOLLET) != 0 &&
+    if (sock->kind == EP_REG_SOCKET &&
+        (sock->user_flags & EPOLLET) != 0 &&
         (sock->user_events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP)) != 0) {
         u_long available = 1;
         if (ioctlsocket(sock->fd, FIONREAD, &available) == 0 &&
@@ -908,6 +1055,16 @@ static int ep_sock_cancel_locked(ep_sock_t *sock)
         EP_POLL_PENDING) {
         return 0;
     }
+    if (sock->kind == EP_REG_WAITABLE) {
+        ep_waitable_unregister_locked(sock);
+        sock->pending_events = 0;
+        atomic_store_explicit(&sock->poll_status, EP_POLL_IDLE,
+                              memory_order_relaxed);
+        if (sock->port->pending_poll_count > 0) {
+            sock->port->pending_poll_count--;
+        }
+        return 0;
+    }
     if (ep_afd_cancel(sock) != 0) {
         return -1;
     }
@@ -938,6 +1095,10 @@ static void ep_sock_retire_stale_locked(ep_port_t *port, ep_sock_t *sock)
  * numeric-handle entry, and -1 for an identity-query failure. */
 static int ep_sock_validate_control_locked(ep_port_t *port, ep_sock_t *sock)
 {
+    if (sock->kind == EP_REG_WAITABLE) {
+        (void)port;
+        return 0;
+    }
 #ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     (void)port;
     (void)sock;
@@ -1111,6 +1272,19 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
 #endif
         delivered = ep_afd_to_epoll_events(
             sock->afd_info->Handles[0].Events);
+    } else if (sock->kind == EP_REG_WAITABLE) {
+        /* Wait callback posts STATUS_SUCCESS when the handle is signaled.
+         * Re-sample the object so a race with ResetEvent still produces a
+         * coherent level snapshot for edge filtering. */
+        DWORD wait_result = WaitForSingleObject((HANDLE)sock->fd, 0);
+        if (wait_result == WAIT_OBJECT_0) {
+            delivered = ep_waitable_level_events(sock);
+        } else if (wait_result == WAIT_FAILED) {
+            delivered = EPOLLERR | EPOLLHUP;
+        } else {
+            delivered = 0;
+        }
+        sock->wait_registration = NULL; /* one-shot wait already consumed */
     } else if (status < 0) {
         delivered = EPOLLERR;
     }
@@ -1740,9 +1914,22 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
     sock->user_ctx = ctx;
     sock->observed_events = 0;
     sock->et_holdoff = 0;
+    if (sock->kind == EP_REG_WAITABLE &&
+        (flags & EPOLLEXCLUSIVE) != 0) {
+        /* Exclusive wake is defined for AFD socket polls only. */
+        if (sock->afd_info != NULL) {
+            ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
+        }
+        free(sock);
+        pthread_mutex_unlock(&port->fd_table_lock);
+        ep_set_errno(EINVAL);
+        return -1;
+    }
 
     if (ep_fd_table_insert(port, sock) != 0) {
-        ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
+        if (sock->afd_info != NULL) {
+            ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
+        }
         free(sock);
         pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
@@ -2094,7 +2281,8 @@ static int ep_drain_to_buffer(ep_port_t *port,
                                       memory_order_relaxed);
                 atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
                                       memory_order_relaxed);
-                if ((sock->user_flags & EPOLLET) != 0 &&
+                if (sock->kind == EP_REG_SOCKET &&
+                    (sock->user_flags & EPOLLET) != 0 &&
                     (node->events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP)) != 0) {
                     u_long available = 1;
                     if (ioctlsocket(sock->fd, FIONREAD, &available) == 0 &&
@@ -2105,6 +2293,12 @@ static int ep_drain_to_buffer(ep_port_t *port,
                         if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
                             ep_exclusive_release(sock->base_socket);
                         }
+                    }
+                } else if (sock->kind == EP_REG_WAITABLE &&
+                           (sock->user_flags & EPOLLET) != 0) {
+                    if (WaitForSingleObject((HANDLE)sock->fd, 0) !=
+                        WAIT_OBJECT_0) {
+                        sock->observed_events = 0;
                     }
                 }
                 if (!sock->oneshot_fired) {

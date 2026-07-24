@@ -72,7 +72,9 @@ helpers, socket-lifetime policy and statistics queries, and `wepoll_close`.
 `epoll_ctl_batch` applies operations in order and best-effort rolls back ADDs;
 it is not transactional.
 
-On Windows, registrations are socket-only. `EPOLLONESHOT` is supported.
+On Windows, registrations accept Winsock sockets and waitable HANDLEs
+(events and other `WaitForSingleObject` objects). Ordinary files/pipes are
+not supported. `EPOLLONESHOT` is supported.
 `EPOLLET` is supported via observed-edge filtering over AFD level snapshots
 (with deferred re-arm on empty edges). `EPOLLEXCLUSIVE` is supported on ADD
 only and uses exclusive AFD polls; MOD with `EPOLLEXCLUSIVE` returns `EINVAL`,

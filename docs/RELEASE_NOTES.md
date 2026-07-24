@@ -43,6 +43,11 @@ queue, pool, rearm, stale-event, identity, asynchronous-error, drain-budget,
 quarantine, reaper, and close-timeout diagnostics. Linux reports its extension
 registration count and a not-applicable lifetime policy.
 
+Windows registrations now accept waitable HANDLEs in addition to
+Winsock sockets. Waitable objects use `RegisterWaitForSingleObject` and wake
+through the port IOCP; `EPOLLEXCLUSIVE` is rejected for them. Ordinary files
+and non-waitable pipes remain unsupported.
+
 Windows `epoll_pwait*` now accepts opaque non-null signal-mask pointers
 and ignores them. ADD rejects `EPOLLEXCLUSIVE` combined with `EPOLLONESHOT` or
 `EPOLLET` (`EINVAL`). `EPOLLWAKEUP` is accepted and ignored.

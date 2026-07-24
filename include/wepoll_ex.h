@@ -11,6 +11,8 @@
  *   - All EPOLL* event flag bits defined by Linux uapi are present.
  *   - Windows implements EPOLLET (observed-edge) and ADD-time
  *     EPOLLEXCLUSIVE; non-null wait signal masks are accepted and ignored.
+ *   - Windows also accepts waitable HANDLEs (events, etc.) in addition to
+ *     sockets; non-waitable files remain unsupported.
  *   - errno is set to the closest portable/Linux-style value on failure.
  *     See docs/DESIGN.md for the current platform limitations.
  *
