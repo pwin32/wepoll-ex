@@ -39,6 +39,8 @@ option(WEPOLL_EX_BUILD_TESTS    "Build test suite"
        ${PROJECT_IS_TOP_LEVEL})
 option(WEPOLL_EX_BUILD_BENCH    "Build microbenchmarks"     OFF)
 option(WEPOLL_EX_BUILD_NGINX    "Compile-check nginx adapter" OFF)
+option(WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK
+       "Force Linux epoll_pwait2_ex through the millisecond fallback" OFF)
 set(WEPOLL_EX_SOCKET_LIFETIME_MODE "best-effort" CACHE STRING
     "Windows socket lifetime policy: best-effort, strict, or synchronized")
 set_property(CACHE WEPOLL_EX_SOCKET_LIFETIME_MODE PROPERTY STRINGS
@@ -136,6 +138,10 @@ set(WEPOLL_EX_HEADERS
 
 set(WEPOLL_EX_PLATFORM_DEFINITIONS)
 if(WEPOLL_EX_PLATFORM_WINDOWS)
+    if(WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK)
+        message(FATAL_ERROR
+            "WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK is supported only on Linux")
+    endif()
     list(APPEND WEPOLL_EX_PLATFORM_DEFINITIONS
         _WIN32_WINNT=0x0602  # Win8 — required for AFD poll bits
         WIN32_LEAN_AND_MEAN
@@ -153,17 +159,27 @@ if(WEPOLL_EX_PLATFORM_WINDOWS)
     message(STATUS
         "wepoll-ex Windows socket lifetime policy: ${WEPOLL_EX_SOCKET_LIFETIME_MODE}")
 else()
-    set(_wepoll_ex_saved_required_definitions
-        "${CMAKE_REQUIRED_DEFINITIONS}")
-    list(APPEND CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
-    check_symbol_exists(epoll_pwait2 "sys/epoll.h"
-        WEPOLL_EX_HAVE_EPOLL_PWAIT2)
-    set(CMAKE_REQUIRED_DEFINITIONS
-        "${_wepoll_ex_saved_required_definitions}")
-    unset(_wepoll_ex_saved_required_definitions)
-    if(WEPOLL_EX_HAVE_EPOLL_PWAIT2)
-        list(APPEND WEPOLL_EX_PLATFORM_DEFINITIONS
-            WEPOLL_EX_HAVE_EPOLL_PWAIT2=1)
+    if(WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK)
+        message(STATUS
+            "wepoll-ex Linux epoll_pwait2 mode: forced millisecond fallback")
+    else()
+        set(_wepoll_ex_saved_required_definitions
+            "${CMAKE_REQUIRED_DEFINITIONS}")
+        list(APPEND CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
+        check_symbol_exists(epoll_pwait2 "sys/epoll.h"
+            WEPOLL_EX_HAVE_EPOLL_PWAIT2)
+        set(CMAKE_REQUIRED_DEFINITIONS
+            "${_wepoll_ex_saved_required_definitions}")
+        unset(_wepoll_ex_saved_required_definitions)
+        if(WEPOLL_EX_HAVE_EPOLL_PWAIT2)
+            list(APPEND WEPOLL_EX_PLATFORM_DEFINITIONS
+                WEPOLL_EX_HAVE_EPOLL_PWAIT2=1)
+            message(STATUS
+                "wepoll-ex Linux epoll_pwait2 mode: native with runtime fallback")
+        else()
+            message(STATUS
+                "wepoll-ex Linux epoll_pwait2 mode: millisecond fallback")
+        endif()
     endif()
 endif()
 

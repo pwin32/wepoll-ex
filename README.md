@@ -186,8 +186,16 @@ Equivalent presets and the release/sanitizer qualification script are:
 cmake --preset posix-release
 cmake --build --preset posix-release
 ctest --preset posix-release
+cmake --preset posix-pwait2-fallback
+cmake --build --preset posix-pwait2-fallback
+ctest --preset posix-pwait2-fallback
 ./scripts/qualify-posix.sh
 ```
+
+`WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK=ON` suppresses the native Linux
+`epoll_pwait2` path even when libc exports it. The dedicated preset and
+`qualify-posix.sh` use that switch to exercise the `epoll_pwait`/`epoll_wait`
+fallback with strict release flags.
 
 For MinGW, use the toolchain shell explicitly:
 
@@ -202,11 +210,12 @@ For MinGW, use the toolchain shell explicitly:
    ctest --test-dir build-mingw --output-on-failure'
 ```
 
-`scripts/qualify-mingw.sh` automates combined, static-only, shared-only,
-strict-identity, and synchronized-lifetime variants. The seeded Windows stress
-test has bounded defaults and accepts `--long` or `WEPOLL_EX_STRESS_*`
-overrides. `bench_windows` emits CSV percentiles for 1k/10k/50k registration
-points, ready batches, oneshot rearming, and armed control churn:
+`scripts/qualify-mingw.sh` automates combined, static-only, and shared-only
+best-effort variants plus combined and shared-only strict-identity and
+synchronized-lifetime variants. The seeded Windows stress test has bounded
+defaults and accepts `--long` or `WEPOLL_EX_STRESS_*` overrides.
+`bench_windows` emits CSV percentiles for 1k/10k/50k registration points,
+ready batches, oneshot rearming, and armed control churn:
 
 ```sh
 ./build-mingw/tests/test_wepoll_ex_windows_stress.exe --long
@@ -214,9 +223,10 @@ points, ready batches, oneshot rearming, and armed control churn:
 ```
 
 Linux qualification covers API contracts, close/wait/cancellation races,
-native `epoll_pwait2` and a separately forced fallback build, signal-mask waits,
-metadata changes, reused-fd identity, the pool, and package consumption. The
-MinGW suite covers TCP and UDP readiness, IPv6, provider-handle fallback,
+native `epoll_pwait2` where libc and the kernel provide it, plus a separately
+forced fallback build, signal-mask waits, metadata changes, reused-fd identity,
+the pool, and package consumption. The MinGW suite covers TCP and UDP
+readiness, IPv6, provider-handle fallback,
 multi-epfd waits, deferred ADD failure, pending MOD transitions, IOCP batch
 draining, timeout deadlines, fail-at-N injection, bounded close/quarantine
 cleanup, randomized lifecycle stress, and package consumers. MinGW

@@ -24,13 +24,14 @@ ulimit -n 65536  # required when the scaling run exceeds the shell soft limit
 ./build-release/bench/bench_wait_scaling 1024 20000
 ```
 
-`./scripts/qualify-posix.sh` runs strict release, repeated API/pool tests, and
-ASan/UBSan. Checked-in presets require CMake 3.21; ordinary builds require
-CMake 3.16.
+`./scripts/qualify-posix.sh` runs strict release, an explicitly forced
+`epoll_pwait2` fallback, repeated API/pool tests, and ASan/UBSan. Checked-in
+presets require CMake 3.21; ordinary builds require CMake 3.16.
 
 For Windows, use `/path/to/msys64/usr/bin/bash.exe`, put `/mingw64/bin:/usr/bin`
 first in `PATH`, configure with `-G "MinGW Makefiles"`, and run CTest. Validate
-combined, static-only, shared-only, strict, and synchronized builds through
+combined, static-only, and shared-only best-effort builds plus combined and
+shared-only strict and synchronized builds through
 `WEPOLL_EX_SOCKET_LIFETIME_MODE`; `scripts/qualify-mingw.sh` automates them.
 Synchronized mode requires DEL-before-`closesocket()` and skips native-reuse
 identity tests. Build nginx with an explicit

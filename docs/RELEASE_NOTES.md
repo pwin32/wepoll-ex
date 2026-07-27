@@ -47,14 +47,24 @@ Linux/WSL GCC 14.2 strict Release and ASan/UBSan CTest each passed 3/3; Clang
 19.1.7 strict Release passed 3/3.
 
 The later July 27, 2026 hardening follow-up used MinGW GCC 15.2 with
-`-O2 -Wall -Wextra -Wpedantic -Werror` plus Release optimization. CTest passed
-107 combined best-effort, 106 static-only, 54 shared-only, 107 strict-identity,
-and 107 synchronized-lifetime entries. Combined, static, and strict retained
-the one environment-dependent UDP/ICMP skip; synchronized mode retained that
-skip plus four expected native-reuse identity skips, while shared-only had no
-skips. Linux/WSL GCC 14.2 and Clang 19.1.7 strict Release each passed 3/3;
-the GCC API/pool lanes passed five repeats, and ASan/UBSan passed 3/3 through
-the qualification wrapper's loader-safe environment.
+`-O2 -Wall -Wextra -Wpedantic -Werror` plus Release optimization. The combined,
+static-only, shared-only, strict-identity, and synchronized-lifetime lanes
+contained 107, 106, 54, 107, and 107 CTest entries respectively. Their
+passed/skipped counts were 106/1, 105/1, 54/0, 106/1, and 102/5. Combined,
+static-only, strict, and synchronized each skipped the environment-dependent
+UDP/ICMP case, while synchronized mode also skipped four native-reuse identity
+cases. Linux/WSL GCC 14.2 and Clang 19.1.7 strict Release each passed 3/3; the
+explicitly forced `epoll_pwait2` fallback also passed 3/3 with GCC. The GCC
+API/pool lanes passed five repeats, and ASan/UBSan passed 3/3 through the
+qualification wrapper's loader-safe environment.
+
+The subsequent July 27, 2026 qualification-matrix run added shared-only DLL
+coverage for the strict and synchronized lifetime policies. Strict shared-only
+passed 54/54 entries. Synchronized shared-only passed 50/54 and skipped the
+four native-reuse identity cases required by its DEL-before-close contract.
+The full seven-variant MinGW wrapper completed successfully, including three
+repeats of every applicable API, backpressure, stress, and concurrent-control
+test.
 
 The current worktree limits the development wrapper to Linux instead of
 assuming every non-Windows platform provides `epoll` and `eventfd`. It also
@@ -186,8 +196,11 @@ extension-owned registrations; native `epoll_ctl()` additions are outside
 that view until an extension MOD adopts them. `epoll_pwait2_ex()` uses native
 `epoll_pwait2` when available and falls back after build-time absence or
 runtime `ENOSYS`, preserving atomic signal-mask application but rounding the
-fallback timeout up to milliseconds. Pthread cancellation cleanup releases
-the wait buffer and metadata reference before unwinding.
+fallback timeout up to milliseconds. The new
+`WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK` option, matching preset, and
+`qualify-posix.sh` lane make that fallback reproducible even on current libc
+and kernels. Pthread cancellation cleanup releases the wait buffer and
+metadata reference before unwinding.
 
 Windows finite waits now retry an early `WAIT_TIMEOUT` against their absolute
 deadline. When internal packets keep arriving, a zero-timeout wait processes
@@ -217,8 +230,9 @@ submit and cancel, endpoint identity/policy, provider resolution, IOCP create,
 post and dequeue, and ready-node allocation. A seeded public-API Windows stress
 test randomizes ADD/MOD/DEL, oneshot rearm, socket reuse, waits, and epfd
 rotation with bounded defaults and replay output. Qualification presets and
-scripts cover strict Linux release/sanitizers plus MinGW combined, static,
-shared, strict-identity, and synchronized variants.
+scripts cover strict Linux native/fallback release and sanitizers plus MinGW
+combined, static-only, and shared-only best-effort builds and combined/shared
+strict-identity and synchronized variants.
 
 The nginx addon now defaults to best-effort lifetime validation. Configure it
 with `WEPOLL_EX_NGINX_LIFETIME_MODE=strict` or `synchronized` only when that

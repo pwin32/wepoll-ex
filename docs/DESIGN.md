@@ -130,10 +130,12 @@ fingerprint and return `EOPNOTSUPP` when that fingerprint is ambiguous.
 waits use a 32-event stack buffer and allocate only for larger batches.
 `epoll_ctl_batch` is sequential and not transactional. `epoll_pwait2_ex`
 uses native `epoll_pwait2` when the libc symbol is present and the kernel
-supports it. A build-time absence or runtime `ENOSYS` falls back to
-`epoll_pwait` for a supplied mask, or `epoll_wait` otherwise, rounding a
-nonzero submillisecond timeout up. Pthread cancellation cleanup releases the
-optional heap event buffer and metadata reference before unwinding.
+supports it. A build-time absence, runtime `ENOSYS`, or
+`WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK=ON` falls back to `epoll_pwait` for a
+supplied mask, or `epoll_wait` otherwise, rounding a nonzero submillisecond
+timeout up. The forced mode has a dedicated strict preset and qualification
+build. Pthread cancellation cleanup releases the optional heap event buffer
+and metadata reference before unwinding.
 
 ## Supported semantics and boundaries
 
@@ -286,16 +288,22 @@ optional heap event buffer and metadata reference before unwinding.
 On July 27, 2026, strict MinGW GCC 15.2 with
 `-O2 -Wall -Wextra -Wpedantic -Werror` completed 107 combined best-effort, 106
 static-only, 54 shared-only, 107 strict-identity, and 107 synchronized-lifetime
-CTest entries. The combined/static/strict/synchronized lanes had the expected
-environment-dependent UDP/ICMP skip; synchronized mode also skipped the four
+CTest entries. Their passed/skipped counts were 106/1, 105/1, 54/0, 106/1,
+and 102/5. Combined, static-only, strict, and synchronized each skipped the
+environment-dependent UDP/ICMP case; synchronized mode also skipped the four
 native-reuse identity cases owned by its DEL-before-close contract. Repeated
 API, backpressure, stress, and concurrent-control lanes passed in every
 applicable variant.
+Strict shared-only passed 54/54 entries. Synchronized shared-only passed 50/54
+and skipped the same four contract-owned native-reuse cases. These explicit
+DLL lanes prevent the combined builds' static-preferred test linkage from
+standing in for lifetime-policy coverage of the shared library.
 
 The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 3/3, repeated
-API/pool runs, and ASan/UBSan CTest 3/3. Clang 19.1.7 strict Release also passed
-3/3. Coverage includes socket ET/exclusive read, write, mixed-class, and stale
-snapshot transitions; direction-aware pipe adapters; waitable terminal ET and
+API/pool runs, an explicitly forced `epoll_pwait2` fallback CTest 3/3, and
+ASan/UBSan CTest 3/3. Clang 19.1.7 strict Release also passed 3/3. Coverage
+includes socket ET/exclusive read, write, mixed-class, and stale snapshot
+transitions; direction-aware pipe adapters; waitable terminal ET and
 pending/queued MOD races; consumptive notification counts; auxiliary-disarm
 fault recovery and preserved consumptive retries; immediate auxiliary
 cancellation reclamation; IOCP post/close lease races and fatal-post wakeups;

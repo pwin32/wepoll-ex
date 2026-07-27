@@ -44,10 +44,24 @@ cmake -S "$repo_dir" -B "$release_dir" -G "$generator" \
     -DWEPOLL_EX_BUILD_SHARED=ON \
     -DWEPOLL_EX_BUILD_STATIC=ON \
     -DWEPOLL_EX_BUILD_TESTS=ON \
-    -DWEPOLL_EX_BUILD_BENCH=ON
+    -DWEPOLL_EX_BUILD_BENCH=ON \
+    -DWEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK=OFF
 cmake --build "$release_dir" --parallel "$jobs"
 ctest --test-dir "$release_dir" --output-on-failure
 "$script_dir/repeat-ctest.sh" "$release_dir" "$repeat_count" 'wepoll_ex_(api|pool_mpsc)$'
+
+fallback_dir=$build_root/pwait2-fallback
+cmake -S "$repo_dir" -B "$fallback_dir" -G "$generator" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_FLAGS="$strict_flags" \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DWEPOLL_EX_BUILD_SHARED=ON \
+    -DWEPOLL_EX_BUILD_STATIC=ON \
+    -DWEPOLL_EX_BUILD_TESTS=ON \
+    -DWEPOLL_EX_BUILD_BENCH=OFF \
+    -DWEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK=ON
+cmake --build "$fallback_dir" --parallel "$jobs"
+ctest --test-dir "$fallback_dir" --output-on-failure
 
 if [ "$run_sanitizers" = 1 ]; then
     sanitizer_dir=$build_root/asan-ubsan
@@ -60,7 +74,8 @@ if [ "$run_sanitizers" = 1 ]; then
         -DWEPOLL_EX_BUILD_SHARED=OFF \
         -DWEPOLL_EX_BUILD_STATIC=ON \
         -DWEPOLL_EX_BUILD_TESTS=ON \
-        -DWEPOLL_EX_BUILD_BENCH=OFF
+        -DWEPOLL_EX_BUILD_BENCH=OFF \
+        -DWEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK=OFF
     cmake --build "$sanitizer_dir" --parallel "$jobs"
     # Some environments (notably WSL with unrelated LD_PRELOAD hooks) put
     # libraries ahead of libasan.  Prepend the compiler's ASan runtime so

@@ -1,7 +1,6 @@
 #!/usr/bin/env sh
 #
-# MinGW qualification for combined, static-only, shared-only, and
-# synchronized-lifetime builds.
+# MinGW qualification across linkage forms and socket-lifetime policies.
 set -eu
 
 case $(uname -s) in
@@ -20,7 +19,7 @@ repo_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 build_root=${1:-"$repo_dir/build/qualification-mingw"}
 repeat_count=${WEPOLL_EX_REPEAT:-3}
 jobs=${WEPOLL_EX_JOBS:-4}
-variants=${WEPOLL_EX_MINGW_VARIANTS:-combined,static,shared,strict,synchronized}
+variants=${WEPOLL_EX_MINGW_VARIANTS:-combined,static,shared,strict,strict-shared,synchronized,synchronized-shared}
 strict_flags=${WEPOLL_EX_MINGW_C_FLAGS:--O2 -Wall -Wextra -Wpedantic -Werror}
 run_benchmark=${WEPOLL_EX_RUN_WINDOWS_BENCH:-0}
 
@@ -63,7 +62,8 @@ configure_and_test()
         -DWEPOLL_EX_BUILD_SHARED="$shared" \
         -DWEPOLL_EX_BUILD_STATIC="$static" \
         -DWEPOLL_EX_BUILD_TESTS=ON \
-        -DWEPOLL_EX_BUILD_BENCH=ON
+        -DWEPOLL_EX_BUILD_BENCH=ON \
+        -DWEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK=OFF
     cmake --build "$build_dir" --parallel "$jobs"
     ctest --test-dir "$build_dir" --output-on-failure
     "$script_dir/repeat-ctest.sh" "$build_dir" "$repeat_count" 'wepoll_ex_windows_(api|stress|backpressure|compat_concurrent_ctl)$'
@@ -81,8 +81,14 @@ fi
 if variant_enabled strict; then
     configure_and_test strict ON ON strict
 fi
+if variant_enabled strict-shared; then
+    configure_and_test strict-shared ON OFF strict
+fi
 if variant_enabled synchronized; then
     configure_and_test synchronized ON ON synchronized
+fi
+if variant_enabled synchronized-shared; then
+    configure_and_test synchronized-shared ON OFF synchronized
 fi
 
 if [ "$run_benchmark" = 1 ]; then

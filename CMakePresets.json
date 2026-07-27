@@ -12,7 +12,8 @@
       "binaryDir": "${sourceDir}/build/presets/${presetName}",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "WEPOLL_EX_BUILD_TESTS": "ON"
+        "WEPOLL_EX_BUILD_TESTS": "ON",
+        "WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK": "OFF"
       }
     },
     {
@@ -41,6 +42,15 @@
         "WEPOLL_EX_BUILD_BENCH": "OFF",
         "WEPOLL_EX_BUILD_SHARED": "OFF",
         "WEPOLL_EX_BUILD_STATIC": "ON"
+      }
+    },
+    {
+      "name": "posix-pwait2-fallback",
+      "displayName": "Linux forced epoll_pwait2 fallback",
+      "inherits": "posix-release",
+      "cacheVariables": {
+        "WEPOLL_EX_BUILD_BENCH": "OFF",
+        "WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK": "ON"
       }
     },
     {
@@ -90,9 +100,25 @@
       }
     },
     {
+      "name": "mingw-strict-shared",
+      "displayName": "MinGW strict socket identity, shared only",
+      "inherits": "mingw-shared",
+      "cacheVariables": {
+        "WEPOLL_EX_SOCKET_LIFETIME_MODE": "strict"
+      }
+    },
+    {
       "name": "mingw-synchronized",
       "displayName": "MinGW synchronized socket lifetime",
       "inherits": "mingw-combined",
+      "cacheVariables": {
+        "WEPOLL_EX_SOCKET_LIFETIME_MODE": "synchronized"
+      }
+    },
+    {
+      "name": "mingw-synchronized-shared",
+      "displayName": "MinGW synchronized socket lifetime, shared only",
+      "inherits": "mingw-shared",
       "cacheVariables": {
         "WEPOLL_EX_SOCKET_LIFETIME_MODE": "synchronized"
       }
@@ -107,6 +133,11 @@
     {
       "name": "posix-asan-ubsan",
       "configurePreset": "posix-asan-ubsan",
+      "jobs": 4
+    },
+    {
+      "name": "posix-pwait2-fallback",
+      "configurePreset": "posix-pwait2-fallback",
       "jobs": 4
     },
     {
@@ -130,8 +161,18 @@
       "jobs": 4
     },
     {
+      "name": "mingw-strict-shared",
+      "configurePreset": "mingw-strict-shared",
+      "jobs": 4
+    },
+    {
       "name": "mingw-synchronized",
       "configurePreset": "mingw-synchronized",
+      "jobs": 4
+    },
+    {
+      "name": "mingw-synchronized-shared",
+      "configurePreset": "mingw-synchronized-shared",
       "jobs": 4
     }
   ],
@@ -161,6 +202,16 @@
       }
     },
     {
+      "name": "posix-pwait2-fallback",
+      "configurePreset": "posix-pwait2-fallback",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
       "name": "mingw-combined",
       "configurePreset": "mingw-combined",
       "output": {
@@ -201,8 +252,28 @@
       }
     },
     {
+      "name": "mingw-strict-shared",
+      "configurePreset": "mingw-strict-shared",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
       "name": "mingw-synchronized",
       "configurePreset": "mingw-synchronized",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "mingw-synchronized-shared",
+      "configurePreset": "mingw-synchronized-shared",
       "output": {
         "outputOnFailure": true
       },
