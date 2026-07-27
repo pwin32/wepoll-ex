@@ -155,6 +155,31 @@ static SOCKET ep_socket_ioctl_handle(SOCKET socket, DWORD ioctl,
 
     return result;
 }
+
+#  ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+static int ep_socket_ioctl_endpoint_id(
+    SOCKET socket, DWORD ioctl, uint64_t *result_out, DWORD result_size,
+    DWORD *bytes_out, int *error_out, void *context)
+{
+    int result;
+
+    (void)context;
+
+    result = WSAIoctl(socket,
+                      ioctl,
+                      NULL,
+                      0,
+                      result_out,
+                      result_size,
+                      bytes_out,
+                      NULL,
+                      NULL);
+    if (error_out != NULL) {
+        *error_out = result == SOCKET_ERROR ? WSAGetLastError() : 0;
+    }
+    return result;
+}
+#  endif
 #endif
 
 #ifdef _WIN32
@@ -264,13 +289,16 @@ SOCKET ep_socket_get_base(SOCKET socket)
 }
 
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
-int ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id)
-{
 #ifdef _WIN32
+int ep_socket_get_endpoint_id_with_ioctl(
+    SOCKET socket, uint64_t *endpoint_id,
+    ep_socket_endpoint_ioctl_fn ioctl_fn, void *context)
+{
     uint64_t result = 0;
     DWORD bytes = 0;
+    int ioctl_error = WSAEINVAL;
 
-    if (socket == INVALID_SOCKET || endpoint_id == NULL) {
+    if (socket == INVALID_SOCKET || endpoint_id == NULL || ioctl_fn == NULL) {
         ep_set_errno(socket == INVALID_SOCKET ? ENOTSOCK : EFAULT);
         return -1;
     }
@@ -281,34 +309,38 @@ int ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id)
     if (ep_fault_hit(EP_FAULT_ENDPOINT_IDENTITY) != 0)
         return -1;
 
-    if (WSAIoctl(socket,
+    if (ioctl_fn(socket,
                  SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE,
-                 NULL,
-                 0,
                  &result,
                  (DWORD)sizeof(result),
                  &bytes,
-                 NULL,
-                 NULL) == SOCKET_ERROR) {
-        int error = WSAGetLastError();
-
+                 &ioctl_error,
+                 context) == SOCKET_ERROR) {
         /* Some non-TCP/IP providers do not expose a WFP ALE endpoint.  Keep
          * them usable with the legacy numeric-handle behavior rather than
          * rejecting an otherwise pollable Winsock socket. */
-        if (error == WSAEOPNOTSUPP || error == WSAENOPROTOOPT ||
-            error == WSAEINVAL) {
+        if (ioctl_error == WSAEOPNOTSUPP ||
+            ioctl_error == WSAENOPROTOOPT || ioctl_error == WSAEINVAL) {
             return 0;
         }
-        ep_set_errno(ep_winerr_to_errno((DWORD)error));
+        ep_set_errno(ep_winerr_to_errno((DWORD)ioctl_error));
         return -1;
     }
-    if (bytes != sizeof(result)) {
+    if (bytes != (DWORD)sizeof(result)) {
         ep_set_errno(EIO);
         return -1;
     }
 
     *endpoint_id = result;
     return 1;
+}
+#endif
+
+int ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id)
+{
+#ifdef _WIN32
+    return ep_socket_get_endpoint_id_with_ioctl(
+        socket, endpoint_id, ep_socket_ioctl_endpoint_id, NULL);
 #else
     (void)socket;
     (void)endpoint_id;

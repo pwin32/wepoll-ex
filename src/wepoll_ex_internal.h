@@ -640,6 +640,17 @@ typedef SOCKET (*ep_socket_ioctl_fn)(SOCKET socket, DWORD ioctl,
 SOCKET   ep_socket_get_base_with_ioctl(SOCKET socket,
                                        ep_socket_ioctl_fn ioctl_fn,
                                        void *context);
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+/* Endpoint tokens are always 64-bit, including on 32-bit Windows.  This
+ * callback form keeps provider response handling deterministic in tests
+ * without replacing WSAIoctl process-wide. */
+typedef int (*ep_socket_endpoint_ioctl_fn)(
+    SOCKET socket, DWORD ioctl, uint64_t *result_out, DWORD result_size,
+    DWORD *bytes_out, int *error_out, void *context);
+int      ep_socket_get_endpoint_id_with_ioctl(
+    SOCKET socket, uint64_t *endpoint_id,
+    ep_socket_endpoint_ioctl_fn ioctl_fn, void *context);
+#endif
 #endif
 SOCKET   ep_socket_get_base(SOCKET socket);
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME

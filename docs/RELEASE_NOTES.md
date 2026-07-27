@@ -262,6 +262,12 @@ scripts cover strict Linux native/fallback release and sanitizers plus MinGW
 combined, static-only, and shared-only best-effort builds and combined/shared
 strict-identity and synchronized variants.
 
+The endpoint-identity fault mode now drives the WFP endpoint `WSAIoctl`
+response through an internal callback seam. It verifies all supported
+unavailable-provider errors, mapped hard failures, exact eight-byte results,
+malformed byte counts, caller-output preservation, fault bypass, and tokens
+whose high 32 bits are set; the ordinary Winsock call remains a smoke test.
+
 The nginx addon now defaults to best-effort lifetime validation. Configure it
 with `WEPOLL_EX_NGINX_LIFETIME_MODE=strict` or `synchronized` only when that
 contract is intentional. `scripts/nginx-endurance.py` provides bounded,

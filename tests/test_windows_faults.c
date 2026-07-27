@@ -14,6 +14,9 @@
 #ifndef SIO_BASE_HANDLE
 #define SIO_BASE_HANDLE 0x48000022
 #endif
+#ifndef SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE
+#define SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE 0x580000CD
+#endif
 
 typedef struct fault_wait_context {
     int epfd;
@@ -430,6 +433,181 @@ cleanup:
     return result;
 }
 
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+typedef struct endpoint_ioctl_state {
+    int ioctl_result;
+    int wsa_error;
+    uint64_t result;
+    DWORD bytes;
+    int calls;
+    SOCKET seen_socket;
+    DWORD seen_ioctl;
+    DWORD seen_result_size;
+} endpoint_ioctl_state_t;
+
+static int endpoint_ioctl_stub(
+    SOCKET socket_fd, DWORD ioctl, uint64_t *result_out, DWORD result_size,
+    DWORD *bytes_out, int *error_out, void *context)
+{
+    endpoint_ioctl_state_t *state = (endpoint_ioctl_state_t *)context;
+
+    state->calls++;
+    state->seen_socket = socket_fd;
+    state->seen_ioctl = ioctl;
+    state->seen_result_size = result_size;
+    if (result_out != NULL)
+        *result_out = state->result;
+    if (bytes_out != NULL)
+        *bytes_out = state->bytes;
+    if (error_out != NULL)
+        *error_out = state->wsa_error;
+    return state->ioctl_result;
+}
+
+static int test_endpoint_ioctl_contract(void)
+{
+    static const int unsupported_errors[] = {
+        WSAEOPNOTSUPP,
+        WSAENOPROTOOPT,
+        WSAEINVAL
+    };
+    static const struct {
+        int wsa_error;
+        int expected_errno;
+    } hard_errors[] = {
+        { WSAENOTSOCK, ENOTSOCK },
+        { WSAEACCES, EACCES }
+    };
+    static const DWORD malformed_sizes[] = {
+        (DWORD)sizeof(uint64_t) - 1,
+        (DWORD)sizeof(uint64_t) + 1
+    };
+    const SOCKET fake_socket = (SOCKET)100;
+    const uint64_t sentinel = UINT64_C(0x1122334455667788);
+    const uint64_t token = UINT64_C(0xfedcba9876543210);
+    endpoint_ioctl_state_t state;
+    uint64_t endpoint_id;
+    int result = -1;
+
+    ep_fault_reset();
+
+    memset(&state, 0, sizeof(state));
+    state.result = token;
+    state.bytes = (DWORD)sizeof(state.result);
+    endpoint_id = sentinel;
+    if (ep_socket_get_endpoint_id_with_ioctl(
+            fake_socket, &endpoint_id, endpoint_ioctl_stub, &state) != 1 ||
+        endpoint_id != token || state.calls != 1 ||
+        state.seen_socket != fake_socket ||
+        state.seen_ioctl != SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE ||
+        state.seen_result_size != (DWORD)sizeof(uint64_t)) {
+        goto cleanup;
+    }
+
+    for (size_t i = 0;
+         i < sizeof(unsupported_errors) / sizeof(unsupported_errors[0]); i++) {
+        memset(&state, 0, sizeof(state));
+        state.ioctl_result = SOCKET_ERROR;
+        state.wsa_error = unsupported_errors[i];
+        state.result = token;
+        state.bytes = (DWORD)sizeof(state.result);
+        endpoint_id = sentinel;
+        errno = EINTR;
+        if (ep_socket_get_endpoint_id_with_ioctl(
+                fake_socket, &endpoint_id, endpoint_ioctl_stub, &state) != 0 ||
+            endpoint_id != sentinel || state.calls != 1) {
+            goto cleanup;
+        }
+    }
+
+    for (size_t i = 0;
+         i < sizeof(hard_errors) / sizeof(hard_errors[0]); i++) {
+        memset(&state, 0, sizeof(state));
+        state.ioctl_result = SOCKET_ERROR;
+        state.wsa_error = hard_errors[i].wsa_error;
+        state.result = token;
+        state.bytes = (DWORD)sizeof(state.result);
+        endpoint_id = sentinel;
+        errno = 0;
+        if (ep_socket_get_endpoint_id_with_ioctl(
+                fake_socket, &endpoint_id, endpoint_ioctl_stub, &state) != -1 ||
+            errno != hard_errors[i].expected_errno ||
+            endpoint_id != sentinel || state.calls != 1) {
+            goto cleanup;
+        }
+    }
+
+    for (size_t i = 0;
+         i < sizeof(malformed_sizes) / sizeof(malformed_sizes[0]); i++) {
+        memset(&state, 0, sizeof(state));
+        state.result = token;
+        state.bytes = malformed_sizes[i];
+        endpoint_id = sentinel;
+        errno = 0;
+        if (ep_socket_get_endpoint_id_with_ioctl(
+                fake_socket, &endpoint_id, endpoint_ioctl_stub, &state) != -1 ||
+            errno != EIO || endpoint_id != sentinel || state.calls != 1) {
+            goto cleanup;
+        }
+    }
+
+    memset(&state, 0, sizeof(state));
+    endpoint_id = sentinel;
+    errno = 0;
+    if (ep_socket_get_endpoint_id_with_ioctl(
+            INVALID_SOCKET, &endpoint_id, endpoint_ioctl_stub, &state) != -1 ||
+        errno != ENOTSOCK || endpoint_id != sentinel || state.calls != 0) {
+        goto cleanup;
+    }
+    errno = 0;
+    if (ep_socket_get_endpoint_id_with_ioctl(
+            fake_socket, NULL, endpoint_ioctl_stub, &state) != -1 ||
+        errno != EFAULT || state.calls != 0) {
+        goto cleanup;
+    }
+    errno = 0;
+    if (ep_socket_get_endpoint_id_with_ioctl(
+            fake_socket, &endpoint_id, NULL, &state) != -1 ||
+        errno != EFAULT || endpoint_id != sentinel || state.calls != 0) {
+        goto cleanup;
+    }
+
+    memset(&state, 0, sizeof(state));
+    state.result = token;
+    state.bytes = (DWORD)sizeof(state.result);
+    if (ep_fault_configure(EP_FAULT_ENDPOINT_UNAVAILABLE, 1,
+                           EOPNOTSUPP) != 0) {
+        goto cleanup;
+    }
+    endpoint_id = sentinel;
+    errno = EINTR;
+    if (ep_socket_get_endpoint_id_with_ioctl(
+            fake_socket, &endpoint_id, endpoint_ioctl_stub, &state) != 0 ||
+        errno != 0 || endpoint_id != sentinel || state.calls != 0 ||
+        ep_fault_hits(EP_FAULT_ENDPOINT_UNAVAILABLE) != 1) {
+        goto cleanup;
+    }
+
+    ep_fault_reset();
+    if (ep_fault_configure(EP_FAULT_ENDPOINT_IDENTITY, 1, EIO) != 0)
+        goto cleanup;
+    endpoint_id = sentinel;
+    errno = 0;
+    if (ep_socket_get_endpoint_id_with_ioctl(
+            fake_socket, &endpoint_id, endpoint_ioctl_stub, &state) != -1 ||
+        errno != EIO || endpoint_id != sentinel || state.calls != 0 ||
+        ep_fault_hits(EP_FAULT_ENDPOINT_IDENTITY) != 1) {
+        goto cleanup;
+    }
+
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    return result;
+}
+#endif
+
 static int test_endpoint_identity(void)
 {
 #ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
@@ -441,33 +619,21 @@ static int test_endpoint_identity(void)
     int query_result;
     int result = -1;
 
+    if (test_endpoint_ioctl_contract() != 0)
+        return -1;
+
     ep_fault_reset();
     if (ep_global_init() != 0)
         return -1;
     socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (socket_fd == INVALID_SOCKET ||
-        ep_fault_configure(EP_FAULT_ENDPOINT_IDENTITY, 2, EIO) != 0) {
+    if (socket_fd == INVALID_SOCKET) {
         goto cleanup;
     }
 
     query_result = ep_socket_get_endpoint_id(socket_fd, &endpoint_id);
-    if (query_result < 0)
+    if (query_result != 0 && query_result != 1)
         goto cleanup;
-
-    endpoint_id = UINT64_C(0x123456789abcdef0);
-    errno = 0;
-    if (ep_socket_get_endpoint_id(socket_fd, &endpoint_id) != -1 ||
-        errno != EIO || endpoint_id != UINT64_C(0x123456789abcdef0) ||
-        ep_fault_hits(EP_FAULT_ENDPOINT_IDENTITY) != 2) {
-        goto cleanup;
-    }
-
-    ep_fault_reset();
-    query_result = ep_socket_get_endpoint_id(socket_fd, &endpoint_id);
-    if (query_result >= 0 &&
-        ep_fault_hits(EP_FAULT_ENDPOINT_IDENTITY) == 0) {
-        result = 0;
-    }
+    result = 0;
 
 cleanup:
     if (socket_fd != INVALID_SOCKET)
