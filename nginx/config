@@ -48,6 +48,7 @@ ngx_module_srcs="$ngx_wepoll_addon/ngx_wepoll_module.c \
 ngx_module_deps="$ngx_wepoll_addon/ngx_wepoll_module.h \
                  $ngx_wepoll_root/include/wepoll_ex.h \
                  $ngx_wepoll_root/include/wepoll_ex_export.h \
+                 $ngx_wepoll_root/include/wepoll_ex_version.h \
                  $ngx_wepoll_root/src/wepoll_ex_internal.h"
 # MinGW's POSIX thread model injects -lpthread into the final link.  Force the
 # static archive here so a deployed nginx.exe does not require

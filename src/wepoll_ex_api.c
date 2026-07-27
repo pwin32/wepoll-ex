@@ -653,12 +653,13 @@ WEPOLL_EX_API int epoll_fd_count(int epfd)
 
 WEPOLL_EX_API uint32_t wepoll_ex_version(void)
 {
-    return UINT32_C(0x00000100);
+    return WEPOLL_EX_VERSION_NUMBER;
 }
 
 WEPOLL_EX_API const char *wepoll_ex_version_string(void)
 {
-    return "wepoll-ex 0.1.0 (experimental IOCP+AFD)";
+    return "wepoll-ex " WEPOLL_EX_VERSION_STRING
+           " (experimental IOCP+AFD)";
 }
 
 WEPOLL_EX_API int wepoll_ex_get_socket_lifetime_policy(void)

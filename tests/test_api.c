@@ -257,14 +257,24 @@ cleanup:
 
 static void test_extension_api(void)
 {
-    TEST("wepoll_ex_version_string returns non-null");
+    static const char version_prefix[] =
+        "wepoll-ex " WEPOLL_EX_VERSION_STRING " ";
+
+    TEST("wepoll_ex_version_string matches the public header");
     const char *v = wepoll_ex_version_string();
-    if (v == NULL || v[0] == '\0') { FAIL("null version"); return; }
+    if (v == NULL ||
+        strncmp(v, version_prefix, sizeof(version_prefix) - 1) != 0) {
+        FAIL("version string mismatch");
+        return;
+    }
     PASS();
 
-    TEST("wepoll_ex_version returns non-zero");
+    TEST("wepoll_ex_version matches the public header");
     uint32_t vn = wepoll_ex_version();
-    if (vn == 0) { FAIL("zero version"); return; }
+    if (vn != WEPOLL_EX_VERSION_NUMBER) {
+        FAIL("version number mismatch");
+        return;
+    }
     PASS();
 
     TEST("versioned operational statistics report the POSIX contract");

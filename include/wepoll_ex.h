@@ -29,6 +29,7 @@
 #include <time.h>     /* struct timespec for epoll_pwait2 */
 
 #include "wepoll_ex_export.h"
+#include "wepoll_ex_version.h"
 
 /* On POSIX we delegate the basic epoll_create / epoll_ctl / epoll_wait
  * family to the host libc (which already provides them via
@@ -267,7 +268,8 @@ WEPOLL_EX_API int  epoll_rearm(int epfd, epoll_fd_t fd);
  * required. */
 WEPOLL_EX_API int  epoll_fd_count(int epfd);
 
-/* Return library version: 0x00MMmmpp (major, minor, patch). */
+/* Return WEPOLL_EX_VERSION_NUMBER (0x00MMmmpp: major, minor, patch) or a
+ * descriptive string beginning with "wepoll-ex " WEPOLL_EX_VERSION_STRING. */
 WEPOLL_EX_API uint32_t wepoll_ex_version(void);
 WEPOLL_EX_API const char *wepoll_ex_version_string(void);
 WEPOLL_EX_API int wepoll_ex_get_socket_lifetime_policy(void);

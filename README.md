@@ -255,7 +255,15 @@ the public symbol list and ELF SONAME contract.
 
 Version 0.1.0 is an experimental preview and does not promise a stable ABI.
 Each preview release therefore uses exact CMake package compatibility and an
-exact-version ELF SONAME. Install it to an isolated prefix while evaluating it:
+exact-version ELF SONAME.
+
+The installed `wepoll_ex_version.h` header is the canonical version source.
+`WEPOLL_EX_VERSION_MAJOR`, `WEPOLL_EX_VERSION_MINOR`,
+`WEPOLL_EX_VERSION_PATCH`, `WEPOLL_EX_VERSION_NUMBER`, and
+`WEPOLL_EX_VERSION_STRING` match the CMake package, shared-library identity,
+and `wepoll_ex_version*()` runtime results.
+
+Install it to an isolated prefix while evaluating it:
 
 ```sh
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \

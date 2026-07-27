@@ -35,6 +35,10 @@ Until the ABI is frozen, installed CMake packages use `ExactVersion`
 compatibility and ELF shared libraries use the full project version as their
 SONAME. The package consumer rejects an older non-exact 0.x request, while an
 export allowlist rejects accidental public symbols on both Linux and MinGW.
+The tracked public `wepoll_ex_version.h` definitions are canonical: CMake
+parses their three decimal components before `project()`, and both backends
+derive their runtime number and string from the same macros. This also keeps
+the nginx-embedded source build independent of a generated CMake header.
 
 ## Windows data flow and lifetime
 

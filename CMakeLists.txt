@@ -1,9 +1,41 @@
 cmake_minimum_required(VERSION 3.16)
 
+set(_wepoll_ex_version_header
+    "${CMAKE_CURRENT_LIST_DIR}/include/wepoll_ex_version.h")
+foreach(_wepoll_ex_version_component IN ITEMS MAJOR MINOR PATCH)
+    file(STRINGS "${_wepoll_ex_version_header}"
+        _wepoll_ex_version_line
+        REGEX "^#define WEPOLL_EX_VERSION_${_wepoll_ex_version_component} (0|[1-9][0-9]*)$")
+    list(LENGTH _wepoll_ex_version_line _wepoll_ex_version_line_count)
+    if(NOT _wepoll_ex_version_line_count EQUAL 1)
+        message(FATAL_ERROR
+            "Expected exactly one plain decimal WEPOLL_EX_VERSION_${_wepoll_ex_version_component} definition in ${_wepoll_ex_version_header}")
+    endif()
+    string(REGEX REPLACE
+        "^#define WEPOLL_EX_VERSION_${_wepoll_ex_version_component} (0|[1-9][0-9]*)$"
+        "\\1" _wepoll_ex_version_${_wepoll_ex_version_component}
+        "${_wepoll_ex_version_line}")
+    if(_wepoll_ex_version_${_wepoll_ex_version_component} GREATER 255)
+        message(FATAL_ERROR
+            "WEPOLL_EX_VERSION_${_wepoll_ex_version_component} must be in the range 0..255")
+    endif()
+endforeach()
+set(_wepoll_ex_project_version
+    "${_wepoll_ex_version_MAJOR}.${_wepoll_ex_version_MINOR}.${_wepoll_ex_version_PATCH}")
+
 project(wepoll-ex
-    VERSION 0.1.0
+    VERSION "${_wepoll_ex_project_version}"
     DESCRIPTION "Experimental extended epoll compatibility layer for Windows"
     LANGUAGES C)
+
+unset(_wepoll_ex_project_version)
+unset(_wepoll_ex_version_MAJOR)
+unset(_wepoll_ex_version_MINOR)
+unset(_wepoll_ex_version_PATCH)
+unset(_wepoll_ex_version_component)
+unset(_wepoll_ex_version_line)
+unset(_wepoll_ex_version_line_count)
+unset(_wepoll_ex_version_header)
 
 # PROJECT_IS_TOP_LEVEL was added in CMake 3.21.  Keep the declared 3.16
 # minimum while providing the same subproject distinction to older CMake
@@ -130,6 +162,7 @@ endif()
 set(WEPOLL_EX_HEADERS
     include/wepoll_ex.h
     include/wepoll_ex_export.h
+    include/wepoll_ex_version.h
     src/wepoll_ex_internal.h)
 
 # --------------------------------------------------------------------- #

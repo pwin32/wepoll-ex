@@ -7,6 +7,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+if(NOT DEFINED WEPOLL_EX_EXPECTED_VERSION OR
+   "${WEPOLL_EX_EXPECTED_VERSION}" STREQUAL "")
+    message(FATAL_ERROR "WEPOLL_EX_EXPECTED_VERSION is required")
+endif()
+
 set(_wepoll_ex_components)
 if(WEPOLL_EX_EXPECT_SHARED)
     list(APPEND _wepoll_ex_components shared)
@@ -18,24 +23,29 @@ endif()
 set(_wepoll_ex_package_dir "${wepoll_ex_DIR}")
 unset(wepoll_ex_DIR CACHE)
 
-# Deliberately omit EXACT.  SameMajorVersion would incorrectly allow the
-# installed 0.1.0 preview to satisfy this older 0.x request.
-find_package(wepoll_ex 0.0.0 CONFIG QUIET
+# Deliberately omit EXACT.  A looser compatibility policy would incorrectly
+# allow the installed preview to satisfy a different version request.
+set(_wepoll_ex_incompatible_version 0.0.0)
+if("${WEPOLL_EX_EXPECTED_VERSION}" STREQUAL
+   "${_wepoll_ex_incompatible_version}")
+    set(_wepoll_ex_incompatible_version 0.0.1)
+endif()
+find_package(wepoll_ex ${_wepoll_ex_incompatible_version} CONFIG QUIET
     PATHS "${_wepoll_ex_package_dir}"
     NO_DEFAULT_PATH)
 if(wepoll_ex_FOUND)
     message(FATAL_ERROR
-        "Preview package 0.1.0 accepted the incompatible 0.0.0 request")
+        "Preview package ${WEPOLL_EX_EXPECTED_VERSION} accepted the incompatible ${_wepoll_ex_incompatible_version} request")
 endif()
 
 unset(wepoll_ex_DIR CACHE)
-find_package(wepoll_ex 0.1.0 EXACT CONFIG REQUIRED
+find_package(wepoll_ex ${WEPOLL_EX_EXPECTED_VERSION} EXACT CONFIG REQUIRED
     COMPONENTS ${_wepoll_ex_components}
     PATHS "${_wepoll_ex_package_dir}"
     NO_DEFAULT_PATH)
 
-if(NOT wepoll_ex_VERSION STREQUAL "0.1.0" OR
-   NOT WEPOLL_EX_VERSION STREQUAL "0.1.0")
+if(NOT "${wepoll_ex_VERSION}" STREQUAL "${WEPOLL_EX_EXPECTED_VERSION}" OR
+   NOT "${WEPOLL_EX_VERSION}" STREQUAL "${WEPOLL_EX_EXPECTED_VERSION}")
     message(FATAL_ERROR "Installed package reports an unexpected version")
 endif()
 

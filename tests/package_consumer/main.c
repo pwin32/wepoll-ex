@@ -4,9 +4,10 @@
 
 int main(void)
 {
-    static const char version_prefix[] = "wepoll-ex 0.1.0 ";
+    static const char version_prefix[] =
+        "wepoll-ex " WEPOLL_EX_VERSION_STRING " ";
     const char *version = wepoll_ex_version_string();
-    if (wepoll_ex_version() != UINT32_C(0x00000100) || version == 0 ||
+    if (wepoll_ex_version() != WEPOLL_EX_VERSION_NUMBER || version == 0 ||
         strncmp(version, version_prefix, sizeof(version_prefix) - 1) != 0) {
         return 1;
     }

@@ -92,6 +92,13 @@ still supports CMake 3.16; checked-in presets require CMake 3.21. Preview
 packages now use exact-version CMake compatibility and the ELF SONAME
 `libwepoll_ex.so.0.1.0`; package tests reject an older non-exact 0.x request,
 and shared-library allowlists pin the 14 Linux and 20 Windows public exports.
+The installed `wepoll_ex_version.h` header now supplies the canonical version
+components used by CMake package metadata, the shared-library identity, both
+runtime backends, nginx's embedded build, and installed-consumer checks.
+A fresh strict build on Linux/WSL with GCC 14.2 passed CTest 4/4, and MinGW
+GCC 15.2 on Windows 10.0.19044 passed 107/108 with only the documented
+UDP/ICMP environment skip; both used `-Werror` and passed package/export
+contract checks.
 
 Windows socket lifetime is now an explicit CMake policy:
 `WEPOLL_EX_SOCKET_LIFETIME_MODE=best-effort|strict|synchronized`.
