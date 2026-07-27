@@ -203,6 +203,20 @@ typedef NTSTATUS (NTAPI *PNtCancelIoFileEx)(
     PIO_STATUS_BLOCK IoRequestToCancel,
     PIO_STATUS_BLOCK IoStatusBlock);
 
+typedef NTSTATUS (NTAPI *PNtQueryObjectFn)(
+    HANDLE Handle,
+    ULONG ObjectInformationClass,
+    PVOID ObjectInformation,
+    ULONG ObjectInformationLength,
+    ULONG *ReturnLength);
+
+typedef NTSTATUS (NTAPI *PNtQueryEventFn)(
+    HANDLE EventHandle,
+    ULONG EventInformationClass,
+    PVOID EventInformation,
+    ULONG EventInformationLength,
+    ULONG *ReturnLength);
+
 #ifdef _WIN32
 /* Indirect the completion dequeue primitive so fault-injection tests can
  * model a timer-granularity WAIT_TIMEOUT without intercepting kernel32.  The
@@ -253,8 +267,23 @@ typedef enum ep_socket_identity_state {
 
 typedef enum ep_reg_kind {
     EP_REG_SOCKET = 0,
-    EP_REG_WAITABLE = 1
+    EP_REG_WAITABLE = 1,
+    EP_REG_PIPE = 2
 } ep_reg_kind_t;
+
+typedef enum ep_waitable_semantics {
+    EP_WAITABLE_NONE = 0,
+    EP_WAITABLE_PERSISTENT = 1,
+    EP_WAITABLE_TERMINAL = 2,
+    EP_WAITABLE_CONSUMPTIVE = 3,
+    EP_WAITABLE_ET_UNSUPPORTED = 4
+} ep_waitable_semantics_t;
+
+typedef enum ep_pipe_access {
+    EP_PIPE_ACCESS_NONE = 0,
+    EP_PIPE_ACCESS_READ = 1,
+    EP_PIPE_ACCESS_WRITE = 2
+} ep_pipe_access_t;
 
 struct ep_sock {
     /* Pool linkage (all live sockets on this port). */
@@ -263,10 +292,13 @@ struct ep_sock {
 
     /* The descriptor supplied by the caller and the unwrapped provider
      * socket used in AFD_POLL.  Waitable registrations store the same
-     * HANDLE value in fd/base_socket and set kind=EP_REG_WAITABLE. */
+     * HANDLE value in fd/base_socket and set kind=EP_REG_WAITABLE or
+     * EP_REG_PIPE. */
     SOCKET fd;
     SOCKET base_socket;
     uint8_t kind; /* ep_reg_kind_t */
+    uint8_t waitable_semantics; /* ep_waitable_semantics_t */
+    uint8_t pipe_access; /* ep_pipe_access_t */
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     uint64_t endpoint_id;
     uint8_t endpoint_id_state;
@@ -300,11 +332,16 @@ struct ep_sock {
     _Atomic uint32_t poll_status;
     _Atomic uint32_t delete_pending;
     _Atomic uint32_t ready_queued;
+    /* Non-socket callbacks post the embedded IO_STATUS_BLOCK to IOCP.  These
+     * atomics keep the registration alive until the callback has returned and
+     * ensure cancellation produces exactly one completion packet. */
+    _Atomic uint32_t callback_active;
+    _Atomic uint32_t completion_posted;
     uint8_t oneshot_fired;
     uint8_t needs_rearm;
-    /* When EPOLLET produces an empty edge from a still-true level, defer
-     * re-submission until the next wait arm pass so completion handling
-     * cannot busy-loop on a permanently readable/writable socket. */
+    /* Empty ET observations and losing exclusive claims defer re-submission.
+     * The wait loop clears this latch on the next API wait or after a short
+     * internal retry interval, avoiding a tight immediate-completion loop. */
     uint8_t et_holdoff;
 
     /* Exactly-once membership in the per-port deferred-work lists.  These
@@ -323,8 +360,8 @@ struct ep_sock {
      * waitable-HANDLE registrations. */
     AFD_POLL_INFO *afd_info;
 
-    /* RegisterWaitForSingleObject cookie for waitable HANDLE registrations.
-     * NULL when no kernel wait is outstanding. */
+    /* RegisterWaitForSingleObject cookie for waitable HANDLE registrations,
+     * or a timer-queue timer for pipe polling.  NULL when idle. */
     HANDLE wait_registration;
 
     /* Back-pointer to owning port (for IOCP callback lookup). */
@@ -472,6 +509,8 @@ typedef struct ep_ntdll {
     PNtDeviceIoControlFile  NtDeviceIoControlFile;
     PNtCreateFile           NtCreateFile;
     PNtCancelIoFileEx       NtCancelIoFileEx;
+    PNtQueryObjectFn        NtQueryObject;
+    PNtQueryEventFn         NtQueryEvent;
     int                     initialized;
     int                     wsa_initialized;
 } ep_ntdll_t;
@@ -500,6 +539,7 @@ typedef enum ep_fault_point {
     EP_FAULT_IOCP_CREATE,
     EP_FAULT_IOCP_POST,
     EP_FAULT_IOCP_DEQUEUE,
+    EP_FAULT_AUX_DISARM,
     EP_FAULT_POINT_COUNT
 } ep_fault_point_t;
 
@@ -561,7 +601,8 @@ DWORD ep_ntstatus_to_winerr(NTSTATUS status);
 
 /* AFD/NT helpers implemented in wepoll_ex_afd.c. */
 int      ep_afd_open(HANDLE iocp, HANDLE *out);
-int      ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events);
+int      ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events,
+                            int *pending_out);
 int      ep_afd_cancel(ep_sock_t *sock);
 uint32_t ep_afd_to_epoll_events(ULONG afd_events);
 uint32_t ep_epoll_to_afd_events(uint32_t epoll_events);

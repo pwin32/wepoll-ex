@@ -294,7 +294,7 @@ static int test_afd_submit(void)
     if (ep_fault_configure(EP_FAULT_AFD_SUBMIT, 2, EAGAIN) != 0)
         goto cleanup;
 
-    if (ep_afd_poll_submit(&first, AFD_POLL_RECEIVE) != 0 ||
+    if (ep_afd_poll_submit(&first, AFD_POLL_RECEIVE, NULL) != 0 ||
         atomic_load_explicit(&first.poll_status,
                              memory_order_relaxed) != EP_POLL_PENDING ||
         g_submit_calls != 1) {
@@ -302,7 +302,7 @@ static int test_afd_submit(void)
     }
 
     errno = 0;
-    if (ep_afd_poll_submit(&second, AFD_POLL_SEND) != -1 ||
+    if (ep_afd_poll_submit(&second, AFD_POLL_SEND, NULL) != -1 ||
         errno != EAGAIN ||
         atomic_load_explicit(&second.poll_status,
                              memory_order_relaxed) != EP_POLL_IDLE ||
@@ -312,7 +312,7 @@ static int test_afd_submit(void)
     }
 
     ep_fault_reset();
-    if (ep_afd_poll_submit(&second, AFD_POLL_SEND) != 0 ||
+    if (ep_afd_poll_submit(&second, AFD_POLL_SEND, NULL) != 0 ||
         atomic_load_explicit(&second.poll_status,
                              memory_order_relaxed) != EP_POLL_PENDING ||
         second.submitted_afd_events != AFD_POLL_SEND ||
@@ -676,6 +676,151 @@ cleanup:
     return result;
 }
 
+static int test_aux_waitable_disarm(void)
+{
+    HANDLE event_handle = NULL;
+    struct epoll_event event;
+    wepoll_ex_stats stats;
+    int epfd = -1;
+    int result = -1;
+
+    ep_fault_reset();
+    event_handle = CreateEventW(NULL, TRUE, FALSE, NULL);
+    epfd = epoll_create1(0);
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (event_handle == NULL || epfd < 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)event_handle, &event) != 0 ||
+        epoll_wait(epfd, &event, 1, 0) != 0 ||
+        ep_fault_configure(EP_FAULT_AUX_DISARM, 1, EBUSY) != 0 ||
+        !SetEvent(event_handle)) {
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (epoll_wait(epfd, &event, 1, 1000) != -1 || errno != EBUSY ||
+        ep_fault_hits(EP_FAULT_AUX_DISARM) != 1 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.active_registrations != 1 || stats.pending_polls != 1 ||
+        stats.rearm_queue_depth != 1 || stats.asynchronous_errors == 0) {
+        goto cleanup;
+    }
+
+    if (epoll_wait(epfd, &event, 1, 1000) != 1 ||
+        (event.events & EPOLLIN) == 0 ||
+        ep_fault_hits(EP_FAULT_AUX_DISARM) != 2) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (epfd >= 0 && wepoll_close(epfd) != 0) result = -1;
+    if (event_handle != NULL) CloseHandle(event_handle);
+    return result;
+}
+
+static int test_aux_waitable_disarm_repeat(void)
+{
+    HANDLE event_handle = NULL;
+    struct epoll_event event;
+    wepoll_ex_stats stats;
+    int epfd = -1;
+    int result = -1;
+
+    ep_fault_reset();
+    event_handle = CreateEventW(NULL, TRUE, FALSE, NULL);
+    epfd = epoll_create1(0);
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (event_handle == NULL || epfd < 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)event_handle, &event) != 0 ||
+        epoll_wait(epfd, &event, 1, 0) != 0 ||
+        ep_fault_configure(EP_FAULT_AUX_DISARM, 1, EBUSY) != 0 ||
+        !SetEvent(event_handle)) {
+        goto cleanup;
+    }
+    errno = 0;
+    if (epoll_wait(epfd, &event, 1, 1000) != -1 || errno != EBUSY ||
+        ep_fault_configure(EP_FAULT_AUX_DISARM, 1, EBUSY) != 0) {
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (epoll_wait(epfd, &event, 1, 1000) != -1 || errno != EBUSY ||
+        ep_fault_hits(EP_FAULT_AUX_DISARM) != 1 ||
+        epoll_fd_count(epfd) != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.active_registrations != 0 || stats.pending_polls != 1 ||
+        stats.rearm_queue_depth != 0) {
+        goto cleanup;
+    }
+
+    ep_fault_reset();
+    if (wepoll_close(epfd) != 0)
+        goto cleanup;
+    epfd = -1;
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (epfd >= 0 && wepoll_close(epfd) != 0) result = -1;
+    if (event_handle != NULL) CloseHandle(event_handle);
+    return result;
+}
+
+static int test_aux_pipe_disarm(void)
+{
+    HANDLE read_handle = NULL;
+    HANDLE write_handle = NULL;
+    struct epoll_event event;
+    wepoll_ex_stats stats;
+    DWORD transferred = 0;
+    char byte = 'p';
+    int epfd = -1;
+    int result = -1;
+
+    ep_fault_reset();
+    epfd = epoll_create1(0);
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (epfd < 0 || !CreatePipe(&read_handle, &write_handle, NULL, 0) ||
+        epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)read_handle, &event) != 0 ||
+        epoll_wait(epfd, &event, 1, 0) != 0 ||
+        ep_fault_configure(EP_FAULT_AUX_DISARM, 1, EBUSY) != 0 ||
+        !WriteFile(write_handle, &byte, 1, &transferred, NULL) ||
+        transferred != 1) {
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (epoll_wait(epfd, &event, 1, 1000) != -1 || errno != EBUSY ||
+        ep_fault_hits(EP_FAULT_AUX_DISARM) != 1 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.active_registrations != 1 || stats.pending_polls != 1 ||
+        stats.rearm_queue_depth != 1) {
+        goto cleanup;
+    }
+    if (epoll_wait(epfd, &event, 1, 1000) != 1 ||
+        (event.events & EPOLLIN) == 0 ||
+        ep_fault_hits(EP_FAULT_AUX_DISARM) != 2 ||
+        !ReadFile(read_handle, &byte, 1, &transferred, NULL) ||
+        transferred != 1) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (epfd >= 0 && wepoll_close(epfd) != 0) result = -1;
+    if (write_handle != NULL) CloseHandle(write_handle);
+    if (read_handle != NULL) CloseHandle(read_handle);
+    return result;
+}
+
 typedef int (*fault_test_fn)(void);
 
 typedef struct fault_test_case {
@@ -696,7 +841,10 @@ static const fault_test_case_t g_tests[] = {
     { "iocp-create", test_iocp_create },
     { "iocp-post", test_iocp_post },
     { "iocp-dequeue", test_iocp_dequeue },
-    { "ready-node-alloc", test_ready_node_alloc }
+    { "ready-node-alloc", test_ready_node_alloc },
+    { "aux-waitable-disarm", test_aux_waitable_disarm },
+    { "aux-waitable-disarm-repeat", test_aux_waitable_disarm_repeat },
+    { "aux-pipe-disarm", test_aux_pipe_disarm }
 };
 
 static int run_test(const fault_test_case_t *test)
@@ -733,7 +881,8 @@ int main(int argc, char **argv)
             "usage: %s [all|framework|pool-init|pool-grow|provider-base|"
             "afd-open|afd-submit|afd-cancel|endpoint-identity|"
             "endpoint-policy|iocp-create|iocp-post|iocp-dequeue|"
-            "ready-node-alloc]\n",
+            "ready-node-alloc|aux-waitable-disarm|"
+            "aux-waitable-disarm-repeat|aux-pipe-disarm]\n",
             argv[0]);
     return 2;
 }

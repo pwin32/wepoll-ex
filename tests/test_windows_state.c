@@ -369,7 +369,7 @@ static int test_cached_base_submit(void)
     g_ntdll.NtDeviceIoControlFile = submit_capture_base_stub;
     cached_base_capture = INVALID_SOCKET;
     cached_base_capture_calls = 0;
-    if (ep_afd_poll_submit(&sock, AFD_POLL_RECEIVE) == 0 &&
+    if (ep_afd_poll_submit(&sock, AFD_POLL_RECEIVE, NULL) == 0 &&
         cached_base_capture_calls == 1 &&
         cached_base_capture == expected_base) {
         result = 0;

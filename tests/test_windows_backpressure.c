@@ -431,6 +431,120 @@ cleanup:
     return result;
 }
 
+static int wait_for_exclusive_writable(int epfd_a, int epfd_b, SOCKET server,
+                                       int *winner_out,
+                                       size_t *drained_bytes,
+                                       const char *label)
+{
+    struct epoll_event output;
+    uint64_t deadline = GetTickCount64() + TEST_PROGRESS_WAIT_MS;
+    int winner = 0;
+    int loser_checks = 0;
+
+    while (GetTickCount64() < deadline && loser_checks < 6) {
+        int count;
+
+        if (drain_peer(server, drained_bytes) != 0)
+            return -1;
+        if (winner != 1) {
+            count = epoll_wait(epfd_a, &output, 1, 25);
+            if (count < 0)
+                return -1;
+            if (count == 1 && (output.events & EPOLLOUT) != 0) {
+                if (winner == 2) {
+                    fprintf(stderr, "%s: both instances woke\n", label);
+                    return -1;
+                }
+                winner = 1;
+            }
+        }
+        if (winner != 2) {
+            count = epoll_wait(epfd_b, &output, 1, 25);
+            if (count < 0)
+                return -1;
+            if (count == 1 && (output.events & EPOLLOUT) != 0) {
+                if (winner == 1) {
+                    fprintf(stderr, "%s: both instances woke\n", label);
+                    return -1;
+                }
+                winner = 2;
+            }
+        }
+        if (winner != 0)
+            loser_checks++;
+    }
+    if (winner == 0) {
+        fprintf(stderr, "%s: no writable recipient\n", label);
+        return -1;
+    }
+    *winner_out = winner;
+    return 0;
+}
+
+static int test_exclusive_edge_backpressure(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    size_t queued_bytes = 0;
+    size_t drained_bytes = 0;
+    int first_winner = 0;
+    int second_winner = 0;
+    int epfd_a = -1;
+    int epfd_b = -1;
+    int result = -1;
+
+    if (make_tcp_pair(&pair) != 0)
+        return -1;
+    if (settle_full(pair.client, &queued_bytes) != 0)
+        goto cleanup;
+
+    epfd_a = epoll_create1(0);
+    epfd_b = epoll_create1(0);
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLOUT | EPOLLET | EPOLLEXCLUSIVE;
+    if (epfd_a < 0 || epfd_b < 0 ||
+        epoll_ctl(epfd_a, EPOLL_CTL_ADD, pair.client, &event) != 0 ||
+        epoll_ctl(epfd_b, EPOLL_CTL_ADD, pair.client, &event) != 0 ||
+        check_not_writable_while_full(epfd_a, pair.client,
+                                      &queued_bytes) != 0 ||
+        check_not_writable_while_full(epfd_b, pair.client,
+                                      &queued_bytes) != 0) {
+        goto cleanup;
+    }
+
+    if (wait_for_exclusive_writable(epfd_a, epfd_b, pair.server,
+                                    &first_winner, &drained_bytes,
+                                    "exclusive-out first") != 0) {
+        goto cleanup;
+    }
+
+    queued_bytes = 0;
+    if (settle_full(pair.client, &queued_bytes) != 0 ||
+        check_not_writable_while_full(epfd_a, pair.client,
+                                      &queued_bytes) != 0 ||
+        check_not_writable_while_full(epfd_b, pair.client,
+                                      &queued_bytes) != 0) {
+        goto cleanup;
+    }
+    drained_bytes = 0;
+    if (wait_for_exclusive_writable(epfd_a, epfd_b, pair.server,
+                                    &second_winner, &drained_bytes,
+                                    "exclusive-out second") != 0) {
+        goto cleanup;
+    }
+
+    printf("exclusive-out: first=%c second=%c OK\n",
+           first_winner == 1 ? 'A' : 'B',
+           second_winner == 1 ? 'A' : 'B');
+    result = 0;
+
+cleanup:
+    if (epfd_a >= 0 && wepoll_close(epfd_a) != 0) result = -1;
+    if (epfd_b >= 0 && wepoll_close(epfd_b) != 0) result = -1;
+    tcp_pair_close(&pair);
+    return result;
+}
+
 int main(void)
 {
     WSADATA wsa_data;
@@ -441,6 +555,8 @@ int main(void)
         return 2;
     }
     result = test_backpressure();
+    if (result == 0)
+        result = test_exclusive_edge_backpressure();
     WSACleanup();
     return result == 0 ? 0 : 1;
 }

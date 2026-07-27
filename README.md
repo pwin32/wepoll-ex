@@ -72,17 +72,45 @@ helpers, socket-lifetime policy and statistics queries, and `wepoll_close`.
 `epoll_ctl_batch` applies operations in order and best-effort rolls back ADDs;
 it is not transactional.
 
-On Windows, registrations accept Winsock sockets and waitable HANDLEs
-(events and other `WaitForSingleObject` objects). Ordinary files/pipes are
-not supported. `EPOLLONESHOT` is supported.
-`EPOLLET` is supported via observed-edge filtering over AFD level snapshots
-(with deferred re-arm on empty edges). `EPOLLEXCLUSIVE` is supported on ADD
-only and uses exclusive AFD polls; MOD with `EPOLLEXCLUSIVE` returns `EINVAL`,
-matching Linux. Windows `epoll_pwait*` accepts a non-null signal-mask pointer and ignores
-it (there is no POSIX process signal mask). Linux `epoll_pwait2_ex` applies a
-supplied mask atomically through the native wait. `EPOLLWAKEUP` is accepted
-and ignored on Windows. Call `wepoll_close()` for the virtual Windows epoll
-descriptor and for prompt Linux extended-wait wakeup.
+On Windows, registrations accept Winsock sockets, anonymous/named pipes, and
+selected waitable HANDLEs (events, semaphores, waitable timers, processes,
+and threads). Waitable HANDLEs must grant `SYNCHRONIZE`; otherwise ADD returns
+`EACCES`. Mutexes, jobs, ordinary disk files, and other unsupported object
+types are rejected with Linux-compatible `EPERM`. Pipe readiness uses short
+`PeekNamedPipe` timer polls and respects the HANDLE's granted read/write access;
+writable readiness on a write-capable handle is advisory, so high-throughput
+pipe users should still use overlapped I/O. Issue `EPOLL_CTL_DEL` before
+`CloseHandle()` for every registered non-socket object. `EPOLLONESHOT` is
+supported. Manual-reset events use ordinary observed-level ET filtering;
+auto-reset events and semaphores deliver one ET notification per consumed
+signal/count. Terminated process/thread handles deliver their terminal ET edge
+once and then stay idle instead of entering the reset-detection retry loop.
+MOD preserves an in-flight waitable/pipe operation and applies the latest
+mask/data when it completes. A queued notification from a known-consumptive or
+mode-unknown waitable is replaced with an equivalent current-generation
+snapshot so MOD cannot discard a signal or timer expiration that the
+underlying wait may already have consumed. ET is rejected for waitable timers
+because an arbitrary timer HANDLE does not expose its reset mode.
+
+`EPOLLET` uses observed-readiness filtering with throttled re-sampling of an
+already-seen level. `EPOLLEXCLUSIVE` applies only to socket registrations and
+may be combined with `EPOLLET`, but not with `EPOLLONESHOT`, `EPOLLRDHUP`, or
+unsupported event bits. Every MOD of a registration added exclusive returns
+`EINVAL`, even when the MOD mask omits `EPOLLEXCLUSIVE`. A bounded
+process-wide filter tracks read, write, and terminal readiness independently,
+so a continuously writable exclusive owner does not suppress a disjoint read
+wake. Windows
+`epoll_pwait*` accepts a non-null signal-mask pointer and ignores it (there is
+no POSIX process signal mask). Linux `epoll_pwait2_ex` applies a supplied mask
+atomically through the native wait. `EPOLLWAKEUP` is accepted and ignored on
+Windows. Call `wepoll_close()` for the virtual Windows epoll descriptor and for
+prompt Linux extended-wait wakeup.
+
+Remaining platform limits are explicit: Windows signal masks and
+`EPOLLWAKEUP` have no native effect, `epoll_pwait2*` has millisecond timeout
+resolution, edge delivery is observed-level rather than Linux kernel queue
+semantics, the secondary process-wide exclusive-claim table is bounded and
+fails open if exhausted, and virtual epoll descriptors cannot be nested.
 
 On Linux, `epoll_fd_count()` reports registrations owned by the extension
 metadata, including successful `epoll_ctl_batch` operations. Native

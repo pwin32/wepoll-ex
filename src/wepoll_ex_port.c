@@ -19,17 +19,25 @@
 #define EP_CLOSE_DRAIN_SLICE_MS   100U
 #define EP_ZERO_TIMEOUT_DRAIN_BUDGET_MS 10U
 #define EP_ZERO_TIMEOUT_MIN_DEQUEUES     16U
+#define EP_DEFERRED_REARM_RETRY_MS       1U
 #define EP_MAX_ACTIVE_QUARANTINES        4U
 
 static _Atomic uint64_t g_quarantined_ports;
 
 /* EPOLLEXCLUSIVE wake uniqueness among wepoll-ex instances.  AFD Exclusive
  * cancels peer polls when it can, but already-queued completions can still
- * race.  Claim the provider base handle for one exclusive delivery at a time
- * and release it after that registration is drained or deleted. */
+ * race.  Claim each provider base/readiness class for one exclusive owner
+ * while its reported AFD level remains active.  A later STATUS_PENDING
+ * submission that covers a claimed class proves quiescence and releases it. */
 #define EP_EXCLUSIVE_CLAIM_SLOTS 128
+#define EP_EXCLUSIVE_CLASS_READ      UINT8_C(0x01)
+#define EP_EXCLUSIVE_CLASS_WRITE     UINT8_C(0x02)
+#define EP_EXCLUSIVE_CLASS_TERMINAL  UINT8_C(0x04)
 typedef struct ep_exclusive_claim {
     SOCKET base;
+    ep_sock_t *owner;
+    uint32_t afd_events;
+    uint8_t readiness_class;
     uint8_t held;
 } ep_exclusive_claim_t;
 static ep_exclusive_claim_t g_exclusive_claims[EP_EXCLUSIVE_CLAIM_SLOTS];
@@ -43,95 +51,420 @@ static unsigned ep_exclusive_slot(SOCKET base)
     return (unsigned)(value % EP_EXCLUSIVE_CLAIM_SLOTS);
 }
 
-static int ep_exclusive_try_claim(SOCKET base)
+static uint8_t ep_exclusive_classes(uint32_t delivered)
 {
+    uint8_t classes = 0;
+
+    if ((delivered & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP |
+                      EPOLLPRI | EPOLLRDBAND)) != 0) {
+        classes |= EP_EXCLUSIVE_CLASS_READ;
+    }
+    if ((delivered & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) != 0) {
+        classes |= EP_EXCLUSIVE_CLASS_WRITE;
+    }
+    if ((delivered & (EPOLLERR | EPOLLHUP)) != 0) {
+        classes |= EP_EXCLUSIVE_CLASS_TERMINAL;
+    }
+    return classes;
+}
+
+static uint32_t ep_exclusive_class_afd_events(uint8_t readiness_class)
+{
+    switch (readiness_class) {
+    case EP_EXCLUSIVE_CLASS_READ:
+        return AFD_POLL_RECEIVE | AFD_POLL_ACCEPT | AFD_POLL_DISCONNECT;
+    case EP_EXCLUSIVE_CLASS_WRITE:
+        return AFD_POLL_SEND;
+    case EP_EXCLUSIVE_CLASS_TERMINAL:
+        return AFD_POLL_ABORT | AFD_POLL_CONNECT_FAIL | AFD_POLL_LOCAL_CLOSE;
+    default:
+        return 0;
+    }
+}
+
+static void ep_exclusive_filter_classes(uint32_t *delivered,
+                                        uint8_t denied_classes)
+{
+    if ((denied_classes & EP_EXCLUSIVE_CLASS_READ) != 0) {
+        *delivered &= ~(EPOLLIN | EPOLLRDNORM | EPOLLRDHUP |
+                        EPOLLPRI | EPOLLRDBAND);
+    }
+    if ((denied_classes & EP_EXCLUSIVE_CLASS_WRITE) != 0) {
+        *delivered &= ~(EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND);
+    }
+    if ((denied_classes & EP_EXCLUSIVE_CLASS_TERMINAL) != 0) {
+        *delivered &= ~(EPOLLERR | EPOLLHUP);
+    }
+}
+
+static void ep_exclusive_claim_clear(ep_exclusive_claim_t *claim)
+{
+    claim->held = 0;
+    claim->base = INVALID_SOCKET;
+    claim->owner = NULL;
+    claim->afd_events = 0;
+    claim->readiness_class = 0;
+}
+
+static int ep_exclusive_try_claim(ep_sock_t *sock, uint32_t *delivered)
+{
+    SOCKET base = sock->base_socket;
+    uint8_t requested_classes = ep_exclusive_classes(*delivered);
+    uint8_t denied_classes = 0;
+    uint8_t owned_classes = 0;
+    uint8_t granted_classes;
+    uint8_t missing_classes;
+    int owner_terminal = 0;
+    int peer_terminal = 0;
     unsigned start = ep_exclusive_slot(base);
     unsigned i;
-    int free_idx = -1;
+    int free_idx[3];
+    unsigned free_count = 0;
+    unsigned missing_count = 0;
 
     pthread_mutex_lock(&g_exclusive_lock);
     for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
         unsigned idx = (start + i) % EP_EXCLUSIVE_CLAIM_SLOTS;
         ep_exclusive_claim_t *claim = &g_exclusive_claims[idx];
-        if (claim->held && claim->base == base) {
-            pthread_mutex_unlock(&g_exclusive_lock);
-            return 0;
+
+        if (!claim->held) {
+            continue;
         }
-        if (!claim->held && free_idx < 0) {
-            free_idx = (int)idx;
+        if (claim->owner == sock && claim->base != base) {
+            ep_exclusive_claim_clear(claim);
+            continue;
+        }
+        if (claim->base != base) {
+            continue;
+        }
+        if (claim->owner == sock) {
+            owned_classes |= claim->readiness_class;
+            if (claim->readiness_class == EP_EXCLUSIVE_CLASS_TERMINAL) {
+                owner_terminal = 1;
+            }
+        } else if (claim->readiness_class == EP_EXCLUSIVE_CLASS_TERMINAL) {
+            peer_terminal = 1;
+        } else if ((requested_classes & EP_EXCLUSIVE_CLASS_TERMINAL) == 0) {
+            denied_classes |= claim->readiness_class & requested_classes;
         }
     }
-    if (free_idx >= 0) {
-        g_exclusive_claims[free_idx].base = base;
-        g_exclusive_claims[free_idx].held = 1;
+
+    if ((requested_classes & EP_EXCLUSIVE_CLASS_TERMINAL) != 0) {
+        if (peer_terminal) {
+            denied_classes = requested_classes;
+        } else {
+            /* The first terminal completion supersedes directional claims.
+             * Clearing them under the global lock lets one owner win without
+             * deadlocking read and write owners against each other. */
+            for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
+                ep_exclusive_claim_t *claim = &g_exclusive_claims[i];
+
+                if (claim->held && claim->base == base &&
+                    claim->readiness_class != EP_EXCLUSIVE_CLASS_TERMINAL) {
+                    ep_exclusive_claim_clear(claim);
+                }
+            }
+        }
+    } else if (peer_terminal) {
+        denied_classes = requested_classes;
+    }
+
+    for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
+        if (!g_exclusive_claims[i].held &&
+            free_count < sizeof(free_idx) / sizeof(free_idx[0])) {
+            free_idx[free_count++] = (int)i;
+        }
+    }
+
+    granted_classes = requested_classes & (uint8_t)~denied_classes;
+    if (granted_classes == 0 && requested_classes != 0) {
         pthread_mutex_unlock(&g_exclusive_lock);
+        return 0;
+    }
+    if (owner_terminal) {
+        missing_classes = 0;
+    } else if ((granted_classes & EP_EXCLUSIVE_CLASS_TERMINAL) != 0) {
+        /* One terminal claim covers every bit in this delivered snapshot. */
+        missing_classes = EP_EXCLUSIVE_CLASS_TERMINAL;
+    } else {
+        missing_classes = granted_classes & (uint8_t)~owned_classes;
+    }
+
+    for (uint8_t bit = EP_EXCLUSIVE_CLASS_READ;
+         bit <= EP_EXCLUSIVE_CLASS_TERMINAL; bit <<= 1) {
+        if ((missing_classes & bit) != 0) {
+            missing_count++;
+        }
+    }
+    if (missing_count > free_count) {
+        ep_exclusive_filter_classes(delivered, denied_classes);
+        pthread_mutex_unlock(&g_exclusive_lock);
+        /* Table full: fail open and deliver rather than drop readiness. */
         return 1;
     }
+    missing_count = 0;
+    for (uint8_t bit = EP_EXCLUSIVE_CLASS_READ;
+         bit <= EP_EXCLUSIVE_CLASS_TERMINAL; bit <<= 1) {
+        ep_exclusive_claim_t *claim;
+
+        if ((missing_classes & bit) == 0) {
+            continue;
+        }
+        claim = &g_exclusive_claims[free_idx[missing_count++]];
+        claim->base = base;
+        claim->owner = sock;
+        claim->afd_events = ep_exclusive_class_afd_events(bit);
+        claim->readiness_class = bit;
+        claim->held = 1;
+    }
+    ep_exclusive_filter_classes(delivered, denied_classes);
     pthread_mutex_unlock(&g_exclusive_lock);
-    /* Table full: fail open and deliver rather than drop readiness. */
     return 1;
 }
 
-static void ep_exclusive_release(SOCKET base)
+/*
+ * Keep the owner-release and quiescent-release paths separate: logical detach
+ * owns the former, while only a genuinely pending covering AFD request may
+ * release another registration's class claim for the same provider socket.
+ */
+static void ep_exclusive_release_owner(ep_sock_t *sock)
 {
-    unsigned start = ep_exclusive_slot(base);
     unsigned i;
 
     pthread_mutex_lock(&g_exclusive_lock);
     for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
-        unsigned idx = (start + i) % EP_EXCLUSIVE_CLAIM_SLOTS;
-        ep_exclusive_claim_t *claim = &g_exclusive_claims[idx];
-        if (claim->held && claim->base == base) {
-            claim->held = 0;
-            claim->base = INVALID_SOCKET;
-            break;
+        ep_exclusive_claim_t *claim = &g_exclusive_claims[i];
+        if (claim->held && claim->owner == sock) {
+            ep_exclusive_claim_clear(claim);
+        }
+    }
+    pthread_mutex_unlock(&g_exclusive_lock);
+}
+
+static void ep_exclusive_release_quiescent(ep_sock_t *sock,
+                                           uint32_t submitted_afd_events)
+{
+    unsigned i;
+
+    pthread_mutex_lock(&g_exclusive_lock);
+    for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
+        ep_exclusive_claim_t *claim = &g_exclusive_claims[i];
+
+        if (claim->held &&
+            (claim->owner == sock || claim->base == sock->base_socket) &&
+            (claim->afd_events & ~submitted_afd_events) == 0) {
+            ep_exclusive_claim_clear(claim);
+        }
+    }
+    pthread_mutex_unlock(&g_exclusive_lock);
+}
+
+static void ep_exclusive_release_inactive(ep_sock_t *sock,
+                                          uint8_t inactive_classes)
+{
+    unsigned i;
+
+    pthread_mutex_lock(&g_exclusive_lock);
+    for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
+        ep_exclusive_claim_t *claim = &g_exclusive_claims[i];
+
+        if (claim->held && claim->base == sock->base_socket &&
+            (claim->readiness_class & inactive_classes) != 0) {
+            ep_exclusive_claim_clear(claim);
         }
     }
     pthread_mutex_unlock(&g_exclusive_lock);
 }
 
 #ifdef _WIN32
+static int ep_aux_post_completion(ep_sock_t *sock, NTSTATUS status)
+{
+    sock->io_status_block.Status = status;
+    sock->io_status_block.Information = 0;
+    atomic_store_explicit(&sock->completion_posted, 1,
+                          memory_order_release);
+    if (!PostQueuedCompletionStatus(sock->port->iocp, 0, 0,
+                                    (LPOVERLAPPED)&sock->io_status_block)) {
+        atomic_store_explicit(&sock->completion_posted, 0,
+                              memory_order_release);
+        return 0;
+    }
+    return 1;
+}
+
+static void ep_aux_wait_callback_idle(ep_sock_t *sock)
+{
+    while (atomic_load_explicit(&sock->callback_active,
+                                memory_order_acquire) != 0) {
+        Sleep(0);
+    }
+}
+
 static VOID CALLBACK ep_waitable_callback(PVOID parameter, BOOLEAN timer_or_wait_fired)
 {
     ep_sock_t *sock = (ep_sock_t *)parameter;
-    ep_port_t *port;
 
     (void)timer_or_wait_fired;
     if (sock == NULL || sock->port == NULL) {
         return;
     }
-    port = sock->port;
-    sock->io_status_block.Status = STATUS_SUCCESS;
-    sock->io_status_block.Information = 0;
-    if (!PostQueuedCompletionStatus(port->iocp, 0, 0,
-                                    (LPOVERLAPPED)&sock->io_status_block)) {
+    atomic_store_explicit(&sock->callback_active, 1, memory_order_release);
+    if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
         /* Best-effort wake; close/drain paths recover outstanding state. */
     }
+    atomic_store_explicit(&sock->callback_active, 0, memory_order_release);
 }
 
-static int ep_handle_is_waitable(HANDLE handle)
+static int ep_object_type_equals(const UNICODE_STRING *type_name,
+                                 const wchar_t *expected,
+                                 size_t expected_bytes)
 {
-    DWORD wait_result;
+    return type_name->Buffer != NULL &&
+        type_name->Length == expected_bytes &&
+        memcmp(type_name->Buffer, expected, expected_bytes) == 0;
+}
+
+typedef struct ep_event_basic_information {
+    ULONG event_type;
+    LONG event_state;
+} ep_event_basic_information_t;
+
+static uint8_t ep_event_waitable_semantics(HANDLE handle)
+{
+    ep_event_basic_information_t info;
+    ULONG return_length = 0;
+    NTSTATUS status;
+
+    if (g_ntdll.NtQueryEvent == NULL) {
+        return EP_WAITABLE_ET_UNSUPPORTED;
+    }
+    memset(&info, 0, sizeof(info));
+    status = g_ntdll.NtQueryEvent(handle, 0, &info, (ULONG)sizeof(info),
+                                  &return_length);
+    if (status < 0) {
+        return EP_WAITABLE_ET_UNSUPPORTED;
+    }
+    if (info.event_type == 0) {
+        return EP_WAITABLE_PERSISTENT; /* manual-reset notification event */
+    }
+    if (info.event_type == 1) {
+        return EP_WAITABLE_CONSUMPTIVE; /* auto-reset synchronization event */
+    }
+    return EP_WAITABLE_ET_UNSUPPORTED;
+}
+
+/* Return 1 when a HANDLE may be passed to the Windows wait APIs, 0 when its
+ * access mask cannot be queried, and -2 when it lacks SYNCHRONIZE. */
+static int ep_handle_wait_access(HANDLE handle)
+{
+    PUBLIC_OBJECT_BASIC_INFORMATION info;
+    ULONG return_length = 0;
+    NTSTATUS status;
+
+    memset(&info, 0, sizeof(info));
+    status = g_ntdll.NtQueryObject(
+        handle, (ULONG)ObjectBasicInformation, &info, (ULONG)sizeof(info),
+        &return_length);
+    if (status < 0) {
+        return 0;
+    }
+    return (info.GrantedAccess & SYNCHRONIZE) != 0 ? 1 : -2;
+}
+
+/* Return 1 for a supported waitable object, 0 for an invalid/unrecognized
+ * handle, -1 for a valid object type whose wait semantics are unsafe or
+ * unsupported (for example a mutex, which a wait would acquire), and -2 for
+ * a supported object whose HANDLE lacks SYNCHRONIZE access. */
+static int ep_handle_waitability(HANDLE handle, DWORD file_type,
+                                 uint8_t *semantics_out)
+{
+    ULONG_PTR storage[128];
+    PUBLIC_OBJECT_TYPE_INFORMATION *type_info;
+    ULONG return_length = 0;
+    NTSTATUS status;
+
+    *semantics_out = EP_WAITABLE_ET_UNSUPPORTED;
 
     if (handle == NULL || handle == INVALID_HANDLE_VALUE) {
         return 0;
     }
-    wait_result = WaitForSingleObject(handle, 0);
-    if (wait_result == WAIT_OBJECT_0 || wait_result == WAIT_TIMEOUT) {
-        return 1;
+    if (file_type == FILE_TYPE_UNKNOWN) {
+        if (g_ntdll.NtQueryObject == NULL) {
+            return 0;
+        }
+        memset(storage, 0, sizeof(storage));
+        status = g_ntdll.NtQueryObject(
+            handle, (ULONG)ObjectTypeInformation, storage,
+            (ULONG)sizeof(storage), &return_length);
+        if (status < 0) {
+            return 0;
+        }
+        type_info = (PUBLIC_OBJECT_TYPE_INFORMATION *)storage;
+        if (ep_object_type_equals(&type_info->TypeName, L"Event",
+                                  sizeof(L"Event") - sizeof(wchar_t))) {
+            *semantics_out = ep_event_waitable_semantics(handle);
+            return ep_handle_wait_access(handle);
+        }
+        if (ep_object_type_equals(&type_info->TypeName, L"Semaphore",
+                                  sizeof(L"Semaphore") - sizeof(wchar_t))) {
+            *semantics_out = EP_WAITABLE_CONSUMPTIVE;
+            return ep_handle_wait_access(handle);
+        }
+        if (ep_object_type_equals(&type_info->TypeName, L"Timer",
+                                  sizeof(L"Timer") - sizeof(wchar_t))) {
+            /* The native query surface does not expose manual-reset versus
+             * synchronization-timer mode, so ET cannot be sampled safely. */
+            *semantics_out = EP_WAITABLE_ET_UNSUPPORTED;
+            return ep_handle_wait_access(handle);
+        }
+        if (ep_object_type_equals(&type_info->TypeName, L"Process",
+                                  sizeof(L"Process") - sizeof(wchar_t)) ||
+            ep_object_type_equals(&type_info->TypeName, L"Thread",
+                                  sizeof(L"Thread") - sizeof(wchar_t))) {
+            *semantics_out = EP_WAITABLE_TERMINAL;
+            return ep_handle_wait_access(handle);
+        }
+        return -1;
     }
-    return 0;
+    /* Pipes and disk files are classified before this helper.  Do not probe
+     * other file-like handles with a wait that may consume object state or
+     * admit types outside RegisterWaitForSingleObject's contract. */
+    return -1;
 }
 
-static uint32_t ep_waitable_level_events(const ep_sock_t *sock)
+static uint32_t ep_waitable_interest_events(uint32_t user_events)
 {
-    uint32_t interest = sock->user_events &
+    uint32_t interest = user_events &
         (EPOLLIN | EPOLLOUT | EPOLLPRI | EPOLLRDNORM | EPOLLWRNORM |
          EPOLLRDBAND | EPOLLWRBAND | EPOLLRDHUP);
     if (interest == 0) {
         interest = EPOLLIN;
     }
     return interest;
+}
+
+static uint32_t ep_waitable_level_events(const ep_sock_t *sock)
+{
+    return ep_waitable_interest_events(sock->user_events);
+}
+
+static int ep_socket_select_ready(SOCKET fd, int writable)
+{
+    fd_set descriptors;
+    struct timeval timeout;
+    int result;
+
+    FD_ZERO(&descriptors);
+    FD_SET(fd, &descriptors);
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+    result = writable
+        ? select(0, NULL, &descriptors, NULL, &timeout)
+        : select(0, &descriptors, NULL, NULL, &timeout);
+    if (result == SOCKET_ERROR) {
+        return -1;
+    }
+    return result > 0 && FD_ISSET(fd, &descriptors);
 }
 
 static int ep_waitable_register_locked(ep_sock_t *sock)
@@ -155,15 +488,175 @@ static int ep_waitable_register_locked(ep_sock_t *sock)
     return 0;
 }
 
-static void ep_waitable_unregister_locked(ep_sock_t *sock)
+static int ep_waitable_unregister_locked(ep_sock_t *sock)
 {
     HANDLE registration = sock->wait_registration;
 
     if (registration == NULL) {
+        ep_aux_wait_callback_idle(sock);
+        return 0;
+    }
+    if (ep_fault_hit(EP_FAULT_AUX_DISARM) != 0) {
+        int error = ep_last_err();
+
+        ep_aux_wait_callback_idle(sock);
+        ep_set_errno(error);
+        return -1;
+    }
+    if (!UnregisterWaitEx(registration, INVALID_HANDLE_VALUE)) {
+        DWORD error = GetLastError();
+        if (error != ERROR_INVALID_HANDLE) {
+            ep_aux_wait_callback_idle(sock);
+            ep_set_errno(ep_winerr_to_errno(error));
+            return -1;
+        }
+    }
+    ep_aux_wait_callback_idle(sock);
+    sock->wait_registration = NULL;
+    return 0;
+}
+
+static int ep_pipe_query_access(HANDLE handle, uint8_t *access_out)
+{
+    PUBLIC_OBJECT_BASIC_INFORMATION info;
+    ULONG return_length = 0;
+    NTSTATUS status;
+    uint8_t access = EP_PIPE_ACCESS_NONE;
+
+    memset(&info, 0, sizeof(info));
+    status = g_ntdll.NtQueryObject(
+        handle, (ULONG)ObjectBasicInformation, &info, (ULONG)sizeof(info),
+        &return_length);
+    if (status < 0) {
+        ep_set_errno(ep_winerr_to_errno(ep_ntstatus_to_winerr(status)));
+        return -1;
+    }
+    if ((info.GrantedAccess &
+         (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL)) != 0) {
+        access |= EP_PIPE_ACCESS_READ;
+    }
+    if ((info.GrantedAccess &
+         (FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL)) != 0) {
+        access |= EP_PIPE_ACCESS_WRITE;
+    }
+    if (access == EP_PIPE_ACCESS_NONE) {
+        ep_set_errno(EACCES);
+        return -1;
+    }
+    *access_out = access;
+    return 0;
+}
+
+static uint32_t ep_pipe_level_events(const ep_sock_t *sock)
+{
+    DWORD available = 0;
+    DWORD left = 0;
+    uint32_t out = 0;
+    uint32_t interest = sock->user_events | EPOLLERR | EPOLLHUP;
+
+    if (!PeekNamedPipe((HANDLE)sock->fd, NULL, 0, NULL, &available, &left)) {
+        DWORD error = GetLastError();
+        if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED ||
+            error == ERROR_INVALID_HANDLE || error == ERROR_BAD_PIPE) {
+            out = EPOLLHUP | EPOLLERR;
+            if ((sock->pipe_access & EP_PIPE_ACCESS_READ) != 0) {
+                out |= EPOLLIN | EPOLLRDNORM;
+            }
+            if ((sock->pipe_access & EP_PIPE_ACCESS_WRITE) != 0) {
+                out |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
+            }
+            return out & interest;
+        }
+        /* Write ends often reject PeekNamedPipe; treat as writable unless
+         * the handle is known dead. */
+        if ((sock->pipe_access & EP_PIPE_ACCESS_WRITE) != 0 &&
+            (sock->user_events &
+             (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) != 0) {
+            out |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
+        }
+        return out & interest;
+    }
+
+    if ((sock->pipe_access & EP_PIPE_ACCESS_READ) != 0 && available > 0 &&
+        (sock->user_events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP)) != 0) {
+        out |= EPOLLIN | EPOLLRDNORM;
+    }
+    if ((sock->pipe_access & EP_PIPE_ACCESS_WRITE) != 0 &&
+        (sock->user_events &
+         (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) != 0) {
+        out |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
+    }
+    return out & interest;
+}
+
+static VOID CALLBACK ep_pipe_timer_callback(PVOID parameter, BOOLEAN fired)
+{
+    ep_sock_t *sock = (ep_sock_t *)parameter;
+
+    (void)fired;
+    if (sock == NULL || sock->port == NULL) {
         return;
     }
+    atomic_store_explicit(&sock->callback_active, 1, memory_order_release);
+    if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
+        /* Best-effort; cancel/close recover outstanding poll state. */
+    }
+    atomic_store_explicit(&sock->callback_active, 0, memory_order_release);
+}
+
+static int ep_pipe_delete_timer_locked(ep_sock_t *sock)
+{
+    HANDLE timer = sock->wait_registration;
+
+    if (timer == NULL) {
+        ep_aux_wait_callback_idle(sock);
+        return 0;
+    }
+    if (ep_fault_hit(EP_FAULT_AUX_DISARM) != 0) {
+        int error = ep_last_err();
+
+        ep_aux_wait_callback_idle(sock);
+        ep_set_errno(error);
+        return -1;
+    }
+    if (!DeleteTimerQueueTimer(NULL, timer, INVALID_HANDLE_VALUE)) {
+        DWORD error = GetLastError();
+        if (error != ERROR_INVALID_HANDLE) {
+            ep_aux_wait_callback_idle(sock);
+            ep_set_errno(ep_winerr_to_errno(error));
+            return -1;
+        }
+    }
+    ep_aux_wait_callback_idle(sock);
     sock->wait_registration = NULL;
-    (void)UnregisterWaitEx(registration, INVALID_HANDLE_VALUE);
+    return 0;
+}
+
+static int ep_pipe_schedule_locked(ep_sock_t *sock)
+{
+    HANDLE timer = NULL;
+    uint32_t level;
+
+    if (sock->wait_registration != NULL) {
+        return 0;
+    }
+    level = ep_pipe_level_events(sock);
+    if (level != 0) {
+        if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
+            ep_set_errno(ep_winerr_to_errno(GetLastError()));
+            return -1;
+        }
+        return 0;
+    }
+    /* Anonymous pipes are not waitable.  Poll with a short one-shot timer
+     * while armed; completion re-evaluates readiness. */
+    if (!CreateTimerQueueTimer(&timer, NULL, ep_pipe_timer_callback, sock,
+                              1, 0, WT_EXECUTEONLYONCE)) {
+        ep_set_errno(ep_winerr_to_errno(GetLastError()));
+        return -1;
+    }
+    sock->wait_registration = timer;
+    return 0;
 }
 #endif
 
@@ -469,6 +962,27 @@ static void ep_rearm_list_rotate_locked(ep_port_t *port, ep_sock_t *sock)
     sock->rearm_prev = port->rearm_tail;
     port->rearm_tail->rearm_next = sock;
     port->rearm_tail = sock;
+}
+
+static int ep_port_has_deferred_rearm_locked(const ep_port_t *port)
+{
+    const ep_sock_t *sock;
+
+    for (sock = port->rearm_head; sock != NULL; sock = sock->rearm_next) {
+        if (sock->et_holdoff) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void ep_port_release_deferred_rearms_locked(ep_port_t *port)
+{
+    ep_sock_t *sock;
+
+    for (sock = port->rearm_head; sock != NULL; sock = sock->rearm_next) {
+        sock->et_holdoff = 0;
+    }
 }
 
 static void ep_oneshot_list_append_locked(ep_port_t *port, ep_sock_t *sock)
@@ -781,10 +1295,42 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
     sock->wait_registration = NULL;
     sock->base_socket = ep_socket_get_base(fd);
     if (sock->base_socket == INVALID_SOCKET) {
+        DWORD file_type;
+        int waitability;
+        int handle_candidate;
+        uint8_t waitable_semantics = EP_WAITABLE_ET_UNSUPPORTED;
+
         base_error = ep_last_err();
-        if ((base_error == ENOTSOCK || base_error == EBADF || base_error == 0) &&
-            ep_handle_is_waitable((HANDLE)fd)) {
+        file_type = GetFileType((HANDLE)fd);
+        handle_candidate = base_error == ENOTSOCK || base_error == EBADF ||
+            base_error == 0;
+        waitability = file_type == FILE_TYPE_PIPE ||
+            file_type == FILE_TYPE_DISK ? 0 :
+            ep_handle_waitability((HANDLE)fd, file_type,
+                                  &waitable_semantics);
+        if (handle_candidate && file_type == FILE_TYPE_PIPE) {
+            if (ep_pipe_query_access((HANDLE)fd, &sock->pipe_access) != 0) {
+                free(sock);
+                return NULL;
+            }
+            sock->kind = EP_REG_PIPE;
+            sock->base_socket = fd;
+            sock->afd_info = NULL;
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+            sock->endpoint_id = 0;
+            sock->endpoint_id_state = EP_SOCKET_ID_UNAVAILABLE;
+#endif
+        } else if (file_type == FILE_TYPE_DISK) {
+            free(sock);
+            ep_set_errno(EPERM);
+            return NULL;
+        } else if (handle_candidate && waitability == -2) {
+            free(sock);
+            ep_set_errno(EACCES);
+            return NULL;
+        } else if (handle_candidate && waitability > 0) {
             sock->kind = EP_REG_WAITABLE;
+            sock->waitable_semantics = waitable_semantics;
             sock->base_socket = fd;
             sock->afd_info = NULL;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
@@ -793,8 +1339,12 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
 #endif
         } else {
             free(sock);
-            if (base_error != 0) {
+            if (handle_candidate && waitability < 0) {
+                ep_set_errno(EPERM);
+            } else if (base_error != 0) {
                 ep_set_errno(base_error);
+            } else {
+                ep_set_errno(ENOTSOCK);
             }
             return NULL;
         }
@@ -839,6 +1389,8 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
     atomic_init(&sock->poll_status, EP_POLL_IDLE);
     atomic_init(&sock->delete_pending, 0);
     atomic_init(&sock->ready_queued, 0);
+    atomic_init(&sock->callback_active, 0);
+    atomic_init(&sock->completion_posted, 0);
     return sock;
 }
 
@@ -847,12 +1399,16 @@ static void ep_sock_free_locked(ep_port_t *port, ep_sock_t *sock)
     ep_sock_set_needs_rearm_locked(sock, 0);
     ep_sock_set_oneshot_fired_locked(sock, 0);
     if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
-        ep_exclusive_release(sock->base_socket);
+        ep_exclusive_release_owner(sock);
     }
     sock->observed_events = 0;
     sock->et_holdoff = 0;
-    if (sock->kind == EP_REG_WAITABLE) {
-        ep_waitable_unregister_locked(sock);
+    if (sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) {
+        assert(sock->wait_registration == NULL);
+        assert(atomic_load_explicit(&sock->callback_active,
+                                    memory_order_relaxed) == 0);
+        assert(atomic_load_explicit(&sock->completion_posted,
+                                    memory_order_relaxed) == 0);
     }
     ep_sock_list_remove_locked(port, sock);
     if (sock->afd_info != NULL) {
@@ -870,6 +1426,9 @@ static void ep_sock_drop_closed_locked(ep_port_t *port, ep_sock_t *sock)
 {
     if (ep_fd_table_lookup(port, sock->fd) == sock) {
         ep_fd_table_remove(port, sock);
+    }
+    if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
+        ep_exclusive_release_owner(sock);
     }
     atomic_store_explicit(&sock->delete_pending, 1, memory_order_relaxed);
     atomic_store_explicit(&sock->state, EP_SOCK_DELETED,
@@ -908,10 +1467,12 @@ static uint32_t ep_sock_afd_events_locked(ep_sock_t *sock,
 #ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 #define EP_SOCK_SUBMIT_LOCKED(sock, identity_validated) \
     ep_sock_submit_locked(sock)
+static int ep_sock_cancel_locked(ep_sock_t *sock);
 static int ep_sock_submit_locked(ep_sock_t *sock)
 #else
 #define EP_SOCK_SUBMIT_LOCKED(sock, identity_validated) \
     ep_sock_submit_locked((sock), (identity_validated))
+static int ep_sock_cancel_locked(ep_sock_t *sock);
 static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
 #endif
 {
@@ -924,8 +1485,30 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
 
     if (atomic_load_explicit(&port->closing, memory_order_acquire) ||
         atomic_load_explicit(&sock->delete_pending, memory_order_relaxed) ||
-        atomic_load_explicit(&sock->ready_queued, memory_order_relaxed) ||
-        poll_status != EP_POLL_IDLE) {
+        atomic_load_explicit(&sock->ready_queued, memory_order_relaxed)) {
+        return 0;
+    }
+    if ((sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) &&
+        poll_status == EP_POLL_PENDING && sock->needs_rearm) {
+        int error;
+
+        if (ep_sock_cancel_locked(sock) == 0) {
+            /* The synthetic cancellation completion transitions to IDLE and
+             * invokes the ordinary rearm path. */
+            return 0;
+        }
+        error = ep_last_err();
+        /* A repeated retirement failure makes this registration unusable.
+         * Detach it publicly but preserve storage and pending accounting for
+         * DEL/close-time recovery or quarantine. */
+        ep_sock_drop_closed_locked(port, sock);
+        ep_set_errno(error);
+        return -1;
+    }
+    if (poll_status != EP_POLL_IDLE) {
+        return 0;
+    }
+    if (sock->et_holdoff) {
         return 0;
     }
 
@@ -950,12 +1533,8 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
         DWORD wait_result;
 
         if (sock->oneshot_fired) {
-            wait_result = WaitForSingleObject((HANDLE)sock->fd, 0);
-            if (wait_result == WAIT_FAILED) {
-                ep_sock_drop_closed_locked(port, sock);
-                ep_set_errno(EBADF);
-                return 1;
-            }
+            /* Do not probe while oneshot is disabled: a zero-time wait would
+             * consume an auto-reset event or semaphore count before rearm. */
             return 0;
         }
         if (!sock->needs_rearm) {
@@ -964,9 +1543,15 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
         sock->et_holdoff = 0;
         wait_result = WaitForSingleObject((HANDLE)sock->fd, 0);
         if (wait_result == WAIT_FAILED) {
-            ep_sock_drop_closed_locked(port, sock);
-            ep_set_errno(EBADF);
-            return 1;
+            DWORD error = GetLastError();
+
+            if (error == ERROR_INVALID_HANDLE) {
+                ep_sock_drop_closed_locked(port, sock);
+                ep_set_errno(EBADF);
+                return 1;
+            }
+            ep_set_errno(ep_winerr_to_errno(error));
+            return -1;
         }
         if (wait_result != WAIT_OBJECT_0 &&
             (sock->user_flags & EPOLLET) != 0) {
@@ -974,15 +1559,42 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
             sock->observed_events = 0;
         }
         if (wait_result == WAIT_OBJECT_0) {
-            sock->io_status_block.Status = STATUS_SUCCESS;
-            sock->io_status_block.Information = 0;
-            if (!PostQueuedCompletionStatus(
-                    port->iocp, 0, 0,
-                    (LPOVERLAPPED)&sock->io_status_block)) {
+            if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
                 ep_set_errno(ep_winerr_to_errno(GetLastError()));
                 return -1;
             }
         } else if (ep_waitable_register_locked(sock) != 0) {
+            return -1;
+        }
+        ep_sock_set_needs_rearm_locked(sock, 0);
+        atomic_store_explicit(&sock->poll_status, EP_POLL_PENDING,
+                              memory_order_relaxed);
+        atomic_store_explicit(&sock->state, EP_SOCK_POLLING,
+                              memory_order_relaxed);
+        port->pending_poll_count++;
+        return 0;
+    }
+
+    if (sock->kind == EP_REG_PIPE) {
+        if (sock->oneshot_fired) {
+            uint32_t level = ep_pipe_level_events(sock);
+            if (level != 0 &&
+                (level & ~(EPOLLHUP | EPOLLERR)) == 0) {
+                ep_sock_drop_closed_locked(port, sock);
+                ep_set_errno(EPIPE);
+                return 1;
+            }
+            return 0;
+        }
+        if (!sock->needs_rearm) {
+            return 0;
+        }
+        sock->et_holdoff = 0;
+        if (ep_pipe_level_events(sock) == 0 &&
+            (sock->user_flags & EPOLLET) != 0) {
+            sock->observed_events = 0;
+        }
+        if (ep_pipe_schedule_locked(sock) != 0) {
             return -1;
         }
         ep_sock_set_needs_rearm_locked(sock, 0);
@@ -1017,27 +1629,18 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
     /* A deferred edge-triggered re-arm is eligible again once a wait is
      * preparing submissions. */
     sock->et_holdoff = 0;
-    if (sock->kind == EP_REG_SOCKET &&
-        (sock->user_flags & EPOLLET) != 0 &&
-        (sock->user_events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP)) != 0) {
-        u_long available = 1;
-        if (ioctlsocket(sock->fd, FIONREAD, &available) == 0 &&
-            available == 0) {
-            sock->observed_events &= ~(EPOLLIN | EPOLLRDNORM | EPOLLRDHUP |
-                                      EPOLLHUP | EPOLLERR);
-            if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
-                ep_exclusive_release(sock->base_socket);
-            }
-        }
-    }
     uint32_t afd_events = ep_sock_afd_events_locked(sock, sock->user_events);
-    if (ep_afd_poll_submit(sock, afd_events) != 0) {
+    int poll_pending = 0;
+    if (ep_afd_poll_submit(sock, afd_events, &poll_pending) != 0) {
         if (ep_last_err() == ENOTSOCK || ep_last_err() == EBADF) {
             ep_sock_drop_closed_locked(port, sock);
             ep_set_errno(ENOTSOCK);
             return 1;
         }
         return -1;
+    }
+    if (poll_pending) {
+        ep_exclusive_release_quiescent(sock, afd_events);
     }
 
     ep_sock_set_needs_rearm_locked(sock, 0);
@@ -1055,14 +1658,23 @@ static int ep_sock_cancel_locked(ep_sock_t *sock)
         EP_POLL_PENDING) {
         return 0;
     }
-    if (sock->kind == EP_REG_WAITABLE) {
-        ep_waitable_unregister_locked(sock);
-        sock->pending_events = 0;
-        atomic_store_explicit(&sock->poll_status, EP_POLL_IDLE,
-                              memory_order_relaxed);
-        if (sock->port->pending_poll_count > 0) {
-            sock->port->pending_poll_count--;
+    if (sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) {
+        int disarm_result = sock->kind == EP_REG_WAITABLE
+            ? ep_waitable_unregister_locked(sock)
+            : ep_pipe_delete_timer_locked(sock);
+
+        if (disarm_result != 0) {
+            return -1;
         }
+        if (atomic_load_explicit(&sock->completion_posted,
+                                 memory_order_acquire) == 0 &&
+            !ep_aux_post_completion(sock, STATUS_CANCELLED)) {
+            ep_set_errno(ep_winerr_to_errno(GetLastError()));
+            return -1;
+        }
+        sock->pending_events = 0;
+        atomic_store_explicit(&sock->poll_status, EP_POLL_CANCELLED,
+                              memory_order_relaxed);
         return 0;
     }
     if (ep_afd_cancel(sock) != 0) {
@@ -1095,7 +1707,7 @@ static void ep_sock_retire_stale_locked(ep_port_t *port, ep_sock_t *sock)
  * numeric-handle entry, and -1 for an identity-query failure. */
 static int ep_sock_validate_control_locked(ep_port_t *port, ep_sock_t *sock)
 {
-    if (sock->kind == EP_REG_WAITABLE) {
+    if (sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) {
         (void)port;
         return 0;
     }
@@ -1208,6 +1820,35 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
         pthread_mutex_unlock(&port->fd_table_lock);
         return;
     }
+    if (sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) {
+        int disarm_result = sock->kind == EP_REG_WAITABLE
+            ? ep_waitable_unregister_locked(sock)
+            : ep_pipe_delete_timer_locked(sock);
+
+        if (disarm_result != 0) {
+            int error = ep_last_err();
+
+            /* The dequeued packet is consumed, but the logical pending slot
+             * stays pinned until retirement succeeds and a synthetic
+             * cancellation completion completes the normal accounting
+             * transition. */
+            atomic_store_explicit(&sock->completion_posted, 0,
+                                  memory_order_release);
+            ep_port_record_async_error_locked(port, error);
+            if (atomic_load_explicit(&sock->delete_pending,
+                                     memory_order_relaxed) ||
+                atomic_load_explicit(&port->closing,
+                                     memory_order_acquire)) {
+                (void)ep_sock_cancel_locked(sock);
+            } else {
+                ep_sock_set_needs_rearm_locked(sock, 1);
+            }
+            pthread_mutex_unlock(&port->fd_table_lock);
+            return;
+        }
+        atomic_store_explicit(&sock->completion_posted, 0,
+                              memory_order_release);
+    }
     atomic_store_explicit(&sock->poll_status, EP_POLL_IDLE,
                           memory_order_relaxed);
     if (port->pending_poll_count > 0) {
@@ -1273,20 +1914,56 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
         delivered = ep_afd_to_epoll_events(
             sock->afd_info->Handles[0].Events);
     } else if (sock->kind == EP_REG_WAITABLE) {
-        /* Wait callback posts STATUS_SUCCESS when the handle is signaled.
-         * Re-sample the object so a race with ResetEvent still produces a
-         * coherent level snapshot for edge filtering. */
-        DWORD wait_result = WaitForSingleObject((HANDLE)sock->fd, 0);
-        if (wait_result == WAIT_OBJECT_0) {
+        /* Consumptive waits use the callback/immediate wait itself as the
+         * readiness observation.  Persistent objects can be sampled safely;
+         * doing so discards a stale queued callback after ResetEvent and
+         * reopens the ET latch before a later signal. */
+        if (status >= 0 &&
+            (sock->waitable_semantics == EP_WAITABLE_PERSISTENT ||
+             sock->waitable_semantics == EP_WAITABLE_TERMINAL)) {
+            DWORD wait_result = WaitForSingleObject((HANDLE)sock->fd, 0);
+
+            if (wait_result == WAIT_OBJECT_0) {
+                delivered = ep_waitable_level_events(sock);
+            } else if (wait_result == WAIT_FAILED) {
+                delivered = EPOLLERR | EPOLLHUP;
+            }
+        } else if (status >= 0) {
             delivered = ep_waitable_level_events(sock);
-        } else if (wait_result == WAIT_FAILED) {
-            delivered = EPOLLERR | EPOLLHUP;
         } else {
-            delivered = 0;
+            delivered = EPOLLERR | EPOLLHUP;
         }
-        sock->wait_registration = NULL; /* one-shot wait already consumed */
+    } else if (sock->kind == EP_REG_PIPE) {
+        delivered = ep_pipe_level_events(sock);
     } else if (status < 0) {
         delivered = EPOLLERR;
+    }
+    if (sock->kind == EP_REG_SOCKET &&
+        (sock->user_flags & (EPOLLET | EPOLLEXCLUSIVE)) != 0) {
+        int sample_all = (sock->user_flags & EPOLLEXCLUSIVE) != 0;
+        int read_ready = -1;
+        int write_ready = -1;
+        uint8_t inactive_classes = 0;
+
+        if (sample_all ||
+            (delivered & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP)) != 0) {
+            read_ready = ep_socket_select_ready(sock->fd, 0);
+        }
+        if (sample_all ||
+            (delivered & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) != 0) {
+            write_ready = ep_socket_select_ready(sock->fd, 1);
+        }
+        if (read_ready == 0) {
+            delivered &= ~(EPOLLIN | EPOLLRDNORM | EPOLLRDHUP);
+            inactive_classes |= EP_EXCLUSIVE_CLASS_READ;
+        }
+        if (write_ready == 0) {
+            delivered &= ~(EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND);
+            inactive_classes |= EP_EXCLUSIVE_CLASS_WRITE;
+        }
+        if (sample_all && inactive_classes != 0) {
+            ep_exclusive_release_inactive(sock, inactive_classes);
+        }
     }
     delivered &= sock->user_events | EPOLLERR | EPOLLHUP;
 
@@ -1311,15 +1988,8 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     if (delivered == 0) {
         /* Level-triggered empty reports re-arm immediately.  Edge-triggered
          * empty reports mean the level is still true but already observed;
-         * defer re-arming to the next wait so permanently ready sockets do
-         * not spin inside completion handling. */
-        if ((sock->user_flags & EPOLLEXCLUSIVE) != 0 &&
-            (sock->user_flags & EPOLLET) == 0) {
-            /* Level exclusive: an empty completion means this instance saw no
-             * reportable readiness; keep the claim only around a delivered
-             * exclusive wake. */
-            ep_exclusive_release(sock->base_socket);
-        }
+         * defer and throttle re-arming so permanently ready sockets do not
+         * spin inside completion handling. */
         sock->et_holdoff = (sock->user_flags & EPOLLET) != 0;
         ep_sock_set_needs_rearm_locked(sock, 1);
         if ((sock->user_flags & EPOLLET) == 0) {
@@ -1360,14 +2030,15 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     node->timestamp = ep_now_ns();
 
     if ((sock->user_flags & EPOLLEXCLUSIVE) != 0 &&
-        !ep_exclusive_try_claim(sock->base_socket)) {
+        !ep_exclusive_try_claim(sock, &delivered)) {
         /* Another exclusive registration already owns this wake. */
         ep_ready_node_free(port, node);
-        sock->et_holdoff = 0;
+        sock->et_holdoff = 1;
         ep_sock_set_needs_rearm_locked(sock, 1);
         pthread_mutex_unlock(&port->fd_table_lock);
         return;
     }
+    node->events = delivered;
 
     sock->pending_events = delivered;
     sock->et_holdoff = 0;
@@ -1811,6 +2482,9 @@ int ep_port_destroy(ep_port_t *port)
     for (ep_sock_t *sock = port->sock_list_head;
          sock != NULL;
          sock = sock->next) {
+        if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
+            ep_exclusive_release_owner(sock);
+        }
         atomic_store_explicit(&sock->delete_pending, 1, memory_order_relaxed);
         atomic_store_explicit(&sock->state, EP_SOCK_DELETED,
                               memory_order_relaxed);
@@ -1914,12 +2588,20 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
     sock->user_ctx = ctx;
     sock->observed_events = 0;
     sock->et_holdoff = 0;
-    if (sock->kind == EP_REG_WAITABLE &&
+    if ((sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) &&
         (flags & EPOLLEXCLUSIVE) != 0) {
         /* Exclusive wake is defined for AFD socket polls only. */
         if (sock->afd_info != NULL) {
             ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
         }
+        free(sock);
+        pthread_mutex_unlock(&port->fd_table_lock);
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+    if (sock->kind == EP_REG_WAITABLE &&
+        (flags & EPOLLET) != 0 &&
+        sock->waitable_semantics == EP_WAITABLE_ET_UNSUPPORTED) {
         free(sock);
         pthread_mutex_unlock(&port->fd_table_lock);
         ep_set_errno(EINVAL);
@@ -2000,12 +2682,31 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
         pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
     }
+    if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+    if (sock->kind == EP_REG_WAITABLE &&
+        (flags & EPOLLET) != 0 &&
+        sock->waitable_semantics == EP_WAITABLE_ET_UNSUPPORTED) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        ep_set_errno(EINVAL);
+        return -1;
+    }
 
     new_afd_events = ep_sock_afd_events_locked(sock, events);
     poll_status = atomic_load_explicit(&sock->poll_status,
                                        memory_order_relaxed);
     if (poll_status == EP_POLL_PENDING) {
-        if ((new_afd_events & ~sock->submitted_afd_events) == 0) {
+        if (sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) {
+            /* Auxiliary waits observe generic HANDLE/pipe readiness and
+             * translate it only after completion.  Their in-flight operation
+             * therefore covers every MOD mask.  Keeping it alive is also
+             * required for consumptive waits: a successful callback may have
+             * consumed a signal/count and posted its completion already. */
+            pending_poll_covers_request = 1;
+        } else if ((new_afd_events & ~sock->submitted_afd_events) == 0) {
             /* The in-flight request already covers this mask.  Keep it alive
              * and let completion snapshot the latest data/context/generation.
              * Narrowing is filtered against user_events at delivery time. */
@@ -2035,26 +2736,75 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
                                              memory_order_relaxed);
     old_state = atomic_load_explicit(&sock->state, memory_order_relaxed);
 
+    ep_ready_node_t *replacement_node = NULL;
+    uint32_t replacement_events = 0;
+    int preserve_waitable_ready = 0;
+
+    if (old_ready_queued && sock->kind == EP_REG_WAITABLE &&
+        sock->waitable_semantics != EP_WAITABLE_PERSISTENT &&
+        sock->waitable_semantics != EP_WAITABLE_TERMINAL &&
+        (old_pending_events & ~(EPOLLERR | EPOLLHUP)) != 0) {
+        replacement_events = ep_waitable_interest_events(events) &
+            (events | EPOLLERR | EPOLLHUP);
+        if (replacement_events != 0) {
+            replacement_node = ep_ready_node_alloc(port);
+            if (replacement_node == NULL) {
+                pthread_mutex_unlock(&port->fd_table_lock);
+                return -1;
+            }
+            preserve_waitable_ready = 1;
+        }
+    }
+
     sock->user_events = events;
-    /* Preserve ADD-time EPOLLEXCLUSIVE across MOD, matching Linux. */
-    sock->user_flags = (flags & ~EPOLLEXCLUSIVE) |
-                       (sock->user_flags & EPOLLEXCLUSIVE);
+    sock->user_flags = flags;
     sock->user_data = data;
     sock->user_ctx = ctx;
-    sock->pending_events = 0;
+    sock->pending_events = preserve_waitable_ready ? replacement_events : 0;
     /* MOD resets edge observation so a newly requested interest can form a
      * fresh edge against the current level. */
     sock->observed_events = 0;
     sock->et_holdoff = 0;
     ep_sock_set_oneshot_fired_locked(sock, 0);
-    if (!pending_poll_covers_request) {
+    if (preserve_waitable_ready) {
+        ep_sock_set_needs_rearm_locked(sock, 0);
+    } else if (!pending_poll_covers_request) {
         ep_sock_set_needs_rearm_locked(sock, 1);
     }
-    atomic_store_explicit(&sock->ready_queued, 0, memory_order_relaxed);
+    atomic_store_explicit(&sock->ready_queued,
+                          preserve_waitable_ready ? 1U : 0U,
+                          memory_order_relaxed);
     sock->generation = ++port->next_sock_generation;
     if (port->next_sock_generation == 0) {
         port->next_sock_generation = 1;
         sock->generation = 1;
+    }
+
+    if (preserve_waitable_ready) {
+        if ((flags & EPOLLET) != 0) {
+            sock->observed_events = replacement_events;
+        }
+        if ((flags & EPOLLONESHOT) != 0) {
+            ep_sock_set_oneshot_fired_locked(sock, 1);
+        }
+        atomic_store_explicit(&sock->state, EP_SOCK_READY,
+                              memory_order_relaxed);
+
+        replacement_node->data = data;
+        replacement_node->user_ctx = ctx;
+        replacement_node->fd = sock->fd;
+        replacement_node->sock_generation = sock->generation;
+        replacement_node->events = replacement_events;
+        replacement_node->flags = 0;
+        if ((flags & EPOLLET) != 0) {
+            replacement_node->flags |=
+                WEPOLL_FLAG_ET_DELIVERED | WEPOLL_FLAG_EDGE_ARMED;
+        }
+        if ((flags & EPOLLONESHOT) != 0) {
+            replacement_node->flags |= WEPOLL_FLAG_ONESHOT_FIRED;
+        }
+        replacement_node->timestamp = ep_now_ns();
+        ep_ready_push(&port->ready_queue, replacement_node);
     }
 
     if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
@@ -2110,6 +2860,10 @@ int ep_port_unregister(ep_port_t *port, SOCKET fd)
     if (ep_sock_validate_control_locked(port, sock) != 0) {
         pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
+    }
+
+    if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
+        ep_exclusive_release_owner(sock);
     }
 
     if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
@@ -2281,30 +3035,29 @@ static int ep_drain_to_buffer(ep_port_t *port,
                                       memory_order_relaxed);
                 atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
                                       memory_order_relaxed);
-                if (sock->kind == EP_REG_SOCKET &&
+                if (sock->kind == EP_REG_WAITABLE &&
                     (sock->user_flags & EPOLLET) != 0 &&
-                    (node->events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP)) != 0) {
-                    u_long available = 1;
-                    if (ioctlsocket(sock->fd, FIONREAD, &available) == 0 &&
-                        available == 0) {
-                        sock->observed_events &=
-                            ~(EPOLLIN | EPOLLRDNORM | EPOLLRDHUP |
-                              EPOLLHUP | EPOLLERR);
-                        if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
-                            ep_exclusive_release(sock->base_socket);
-                        }
-                    }
-                } else if (sock->kind == EP_REG_WAITABLE &&
+                    sock->waitable_semantics == EP_WAITABLE_CONSUMPTIVE) {
+                    /* The wait that produced this notification consumed one
+                     * signal/count.  Reopen the latch without another wait,
+                     * which could silently consume the next notification. */
+                    sock->observed_events = 0;
+                } else if (sock->kind == EP_REG_PIPE &&
                            (sock->user_flags & EPOLLET) != 0) {
-                    if (WaitForSingleObject((HANDLE)sock->fd, 0) !=
-                        WAIT_OBJECT_0) {
+                    if (ep_pipe_level_events(sock) == 0) {
                         sock->observed_events = 0;
                     }
                 }
-                if (!sock->oneshot_fired) {
+                if (!sock->oneshot_fired &&
+                    !(sock->kind == EP_REG_WAITABLE &&
+                      (sock->user_flags & EPOLLET) != 0 &&
+                      sock->waitable_semantics == EP_WAITABLE_TERMINAL)) {
                     /* Level and edge registrations both re-arm after a
                      * delivered snapshot.  Edge filtering above suppresses
-                     * duplicates while the observed level remains true. */
+                     * duplicates while the observed level remains true.
+                     * Process and thread objects cannot become unsignaled,
+                     * so their delivered ET registration stays idle until a
+                     * later MOD explicitly starts a fresh observation. */
                     sock->et_holdoff = 0;
                     ep_sock_set_needs_rearm_locked(sock, 1);
                 }
@@ -2424,6 +3177,7 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
     }
     pthread_mutex_lock(&port->fd_table_lock);
     {
+        ep_port_release_deferred_rearms_locked(port);
         int deferred_error = ep_port_take_async_error_locked(port);
         pthread_mutex_unlock(&port->fd_table_lock);
         if (deferred_error != 0) {
@@ -2481,6 +3235,12 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
         }
 
         DWORD wait_ms;
+        int deferred_rearm;
+        int deferred_rearm_wait = 0;
+
+        pthread_mutex_lock(&port->fd_table_lock);
+        deferred_rearm = ep_port_has_deferred_rearm_locked(port);
+        pthread_mutex_unlock(&port->fd_table_lock);
         if (timeout_ms < 0) {
             wait_ms = INFINITE;
         } else if (timeout_ms == 0) {
@@ -2492,6 +3252,11 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
                 break;
             }
             wait_ms = (DWORD)(deadline - now);
+        }
+        if (deferred_rearm && timeout_ms != 0 &&
+            (wait_ms == INFINITE || wait_ms > EP_DEFERRED_REARM_RETRY_MS)) {
+            wait_ms = EP_DEFERRED_REARM_RETRY_MS;
+            deferred_rearm_wait = 1;
         }
 
         ULONG removed = 0;
@@ -2505,6 +3270,12 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
         if (!ok) {
             DWORD error = GetLastError();
             if (error == WAIT_TIMEOUT) {
+                if (deferred_rearm_wait) {
+                    pthread_mutex_lock(&port->fd_table_lock);
+                    ep_port_release_deferred_rearms_locked(port);
+                    pthread_mutex_unlock(&port->fd_table_lock);
+                    continue;
+                }
                 if (timeout_ms > 0) {
                     uint64_t now = GetTickCount64();
                     if (now < deadline) {

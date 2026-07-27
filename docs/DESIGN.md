@@ -3,10 +3,10 @@
 ## Status
 
 This document describes an experimental prototype, not a compatibility or
-performance specification. The Windows path depends on undocumented AFD
-interfaces and is socket-only. The development wrapper is Linux-specific and
-uses native `epoll` and `eventfd`; passing its tests does not validate the
-IOCP/AFD engine.
+performance specification. The Windows socket path depends on undocumented AFD
+interfaces; waitable kernel objects and pipes use separate IOCP/thread-pool
+adapters. The development wrapper is Linux-specific and uses native `epoll`
+and `eventfd`; passing its tests does not validate the Windows engine.
 
 ## Build-time split
 
@@ -130,12 +130,49 @@ optional heap event buffer and metadata reference before unwinding.
 
 ## Supported semantics and boundaries
 
-- Windows registrations accept Winsock sockets and waitable HANDLEs
-  (`WaitForSingleObject`-compatible objects such as events).  Non-waitable
-  files and pipes remain unsupported.  Waitable registrations use
-  `RegisterWaitForSingleObject` + IOCP wakeups rather than AFD, reject
-  `EPOLLEXCLUSIVE`, and map a signaled object to the requested
-  `EPOLLIN`/`EPOLLOUT` interest bits.
+- Windows registrations accept Winsock sockets, anonymous/named pipes, and
+  selected waitable kernel objects: events, semaphores, waitable timers,
+  processes, and threads. Object types are identified without a
+  destructive zero-time wait, so an initially signaled auto-reset event or
+  semaphore is not consumed by ADD. Mutexes and other unsupported kernel
+  objects, including jobs, ordinary disk files, and character handles, return
+  `EPERM` (the Linux
+  `epoll_ctl` error for a target that cannot be monitored).
+- Waitable registrations use `RegisterWaitForSingleObject` and post at most
+  one IOCP packet per arm. Successful delivery and cancellation synchronously
+  retire the one-shot wait before registration storage can be reclaimed. If
+  retirement fails, the registration and pending count remain pinned, the
+  error is surfaced asynchronously, and a later wait/DEL/close retries; a
+  persistent close-time failure follows the existing quarantine path.
+  Manual-reset events and process/thread termination provide persistent
+  level behavior. Manual-reset event ET uses throttled reset detection;
+  process/thread termination is monotonic, so its delivered ET registration
+  stays idle until a later MOD rather than polling a level that cannot clear.
+  Auto-reset events and semaphore counts are consumed once per delivered
+  readiness notification, including one ET notification per consumed
+  signal/count. A pending waitable or pipe operation covers every MOD mask and
+  completes against the latest metadata. If MOD races a ready notification
+  from a known-consumptive or mode-unknown waitable, the old queued generation
+  is replaced before rearming so a consumed signal/count/timer expiration is
+  still delivered with current metadata. The conservative mode-unknown case
+  covers synchronization timers and events whose reset mode could not be
+  queried. Queued pipe readiness need not be preserved this way: it consumes
+  no state and is re-evaluated from the current level after the stale snapshot
+  is discarded.
+  Waitable-timer ET and ET on an event whose reset mode cannot be queried are
+  rejected with `EINVAL`; LT remains supported.
+- Pipes use short timer-queue polls with `PeekNamedPipe` because anonymous pipe
+  handles are not reliably waitable. This supports read readiness, EOF/HUP,
+  level, observed-edge, oneshot, pending MOD, and both anonymous and named pipe
+  handles. Read/write readiness is filtered through the HANDLE's granted data
+  access, so a read-only endpoint cannot report writable and a write-only
+  endpoint cannot report readable. Writable readiness is still advisory on
+  Windows because `PeekNamedPipe` does not expose exact remaining write quota.
+  Polling is a compatibility path, not a high-scale substitute for overlapped
+  application I/O. Pipe and waitable registrations reject `EPOLLEXCLUSIVE`.
+- Applications must issue DEL before `CloseHandle()` for a registered pipe or
+  waitable object. The socket identity policies do not extend to arbitrary
+  HANDLE reuse.
 - Linux `fstat` fingerprints are a conservative metadata aid, not a formal
   open-file-description identifier. Multiple matching registrations reject
   MOD/DEL/rearm with `EOPNOTSUPP`; a single stale fingerprint collision and a
@@ -167,13 +204,22 @@ optional heap event buffer and metadata reference before unwinding.
 - `EPOLLONESHOT`, context delivery, RDHUP mapping, zero-timeout waits, native
   socket close cleanup and stable numeric reuse, and concurrent epoll close
   have regression coverage.
-- `EPOLLET` is implemented as an observed-edge filter over AFD level
+- Socket `EPOLLET` is implemented as an observed-edge filter over AFD level
   snapshots: each interest bit is delivered once while continuously true, then
   suppressed until it drops out of the latest level and reappears. Empty edge
-  completions defer re-arming to the next wait so permanently ready sockets do
-  not spin. `EPOLLEXCLUSIVE` may be set only at ADD (MOD with the flag returns
-  `EINVAL`) and submits AFD polls with `Exclusive=TRUE` so peer wepoll-ex
-  instances watching the same provider handle are cancelled on wake.
+  observations and losing exclusive claims use a short deferred retry instead
+  of a tight immediate-completion loop. Pipe and waitable ET use the adapter-
+  specific readiness observations described above.
+- `EPOLLEXCLUSIVE` applies only to socket registrations and may be set only by
+  ADD. It may be combined with `EPOLLET`, but not with `EPOLLONESHOT`,
+  `EPOLLRDHUP`, or unsupported event bits. Every MOD of a registration added
+  exclusive fails with `EINVAL`, even if the MOD mask omits `EPOLLEXCLUSIVE`.
+  AFD requests use `Exclusive=TRUE`; a process-wide claim filter tracks read,
+  write, and terminal readiness classes independently and removes only the
+  conflicting classes from mixed snapshots. A covering AFD submission that
+  returns `STATUS_PENDING`, or a zero-time sample proving one direction
+  inactive, releases the corresponding class claims. The secondary claim table
+  is bounded and fails open rather than dropping readiness if exhausted.
 - The nginx adapter leaves `ngx_event_actions.notify` unset. nginx 1.31.3
   rejects `--with-threads` on Win32 and its thread-pool sources are POSIX-only,
   so thread-pool integration is outside this prototype's supported boundary.
@@ -181,8 +227,11 @@ optional heap event buffer and metadata reference before unwinding.
   accepted and ignored so portable `epoll_pwait*` call sites run; Windows has
   no POSIX process signal mask to apply. Linux extended waits pass masks
   atomically to native `epoll_pwait2` or the `epoll_pwait` fallback.
-- `EPOLLEXCLUSIVE` cannot be combined with `EPOLLONESHOT` or `EPOLLET` on
-  ADD (`EINVAL`), matching Linux. `EPOLLWAKEUP` is accepted and ignored.
+- Windows `epoll_pwait2*` rounds a positive submillisecond timeout up to one
+  millisecond because the IOCP dequeue API accepts millisecond timeouts.
+  Windows virtual epoll descriptors also cannot be nested as monitored objects
+  inside another epoll instance.
+- `EPOLLWAKEUP` is accepted and ignored on Windows.
 - `epoll_ctl_batch` best-effort rolls back successful ADDs after a later
   failure. Earlier MOD and DEL operations remain applied.
 - Fail-at-N hooks are internal, process-global test symbols. They are absent
@@ -218,29 +267,24 @@ optional heap event buffer and metadata reference before unwinding.
 
 ## Verification baseline
 
-The July 23, 2026 strict GCC and Clang Linux builds each passed all 3 CTest
-entries. The API executable passes 42 behavior checks, and ASan/UBSan passes
-the API and 5 pool/MPSC checks. Coverage includes duplicate-data and reused-fd
-metadata, ambiguous identity rejection, signal masks, multi-waiter close wake,
-and the installed-package consumer.
+On July 27, 2026, strict MinGW GCC 15.2 with
+`-O2 -Wall -Wextra -Wpedantic -Werror` completed 99 combined best-effort, 98
+static-only, 52 shared-only, 99 strict-identity, and 99 synchronized-lifetime
+CTest entries. The combined/static/strict/synchronized lanes had the expected
+environment-dependent UDP/ICMP skip; synchronized mode also skipped the four
+native-reuse identity cases owned by its DEL-before-close contract. Repeated
+API, backpressure, stress, and concurrent-control lanes passed in every
+applicable variant.
 
-Strict MinGW GCC 15.2 passed 40 combined, 39 static-only, and 12 shared-only
-CTest entries. The synchronized-lifetime combined build also passes all 40;
-the UDP ICMP-error mode and four native close/reuse modes are expected skips
-where their prerequisites do not apply. Coverage includes TCP/UDP/IPv6,
-provider-chain fallback, same-socket multi-epfd waits, lazy ADD failure,
-pending MOD narrowing/expansion, transitional connect continuity, lifecycle
-faults, a 513-packet IOCP burst, early `WAIT_TIMEOUT`, backpressure, packaging,
-and static-winpthread dependency checks.
-
-The July 24 worktree adds strict and best-effort endpoint-policy injection,
-fail-at-N allocation/AFD/IOCP/ready-node tests, a bounded public-reference
-close test, recoverable quarantine/reaper coverage, pthread-cancellation
-cleanup, native/fallback `epoll_pwait2` checks, and a replayable randomized
-Windows public-API stress test. `scripts/qualify-posix.sh`,
+The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 3/3, repeated
+API/pool runs, and ASan/UBSan CTest 3/3. Clang 19.1.7 strict Release also passed
+3/3. Coverage includes socket ET/exclusive read, write, mixed-class, and stale
+snapshot transitions; direction-aware pipe adapters; waitable terminal ET and
+pending/queued MOD races; consumptive notification counts; auxiliary-disarm
+fault recovery; provider identity modes; cancellation/close/quarantine;
+packaging; and static-winpthread dependency checks. `scripts/qualify-posix.sh`,
 `scripts/qualify-mingw.sh`, CMake presets, and `scripts/repeat-ctest.sh` make
-those lanes reproducible. A fresh all-variant result should replace the older
-counts above before a release tag.
+those lanes reproducible.
 
 The nginx 1.31.3 adapter passes a strict full Win32 link, dependency inspection,
 `nginx -t`, 100 loopback requests across a worker reload, and graceful quit

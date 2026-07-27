@@ -759,7 +759,9 @@ static void test_unsupported_event_modes(void)
         tcp_pair_close(&pair);
         return;
     }
-    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    /* Linux rejects every MOD of a registration added exclusive, even when
+     * the MOD event mask does not repeat EPOLLEXCLUSIVE. */
+    event.events = EPOLLIN;
     errno = 0;
     if (epoll_ctl(epfd, EPOLL_CTL_MOD, pair.server, &event) != -1 ||
         errno != EINVAL) {

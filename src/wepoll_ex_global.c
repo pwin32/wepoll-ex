@@ -54,6 +54,12 @@ static void ep_global_init_once(void)
     ep_store_proc(&g_ntdll.NtCancelIoFileEx,
                   sizeof(g_ntdll.NtCancelIoFileEx),
                   GetProcAddress(ntdll, "NtCancelIoFileEx"));
+    ep_store_proc(&g_ntdll.NtQueryObject,
+                  sizeof(g_ntdll.NtQueryObject),
+                  GetProcAddress(ntdll, "NtQueryObject"));
+    ep_store_proc(&g_ntdll.NtQueryEvent,
+                  sizeof(g_ntdll.NtQueryEvent),
+                  GetProcAddress(ntdll, "NtQueryEvent"));
     ep_store_proc(&p_RtlNtStatusToDosError,
                   sizeof(p_RtlNtStatusToDosError),
                   GetProcAddress(ntdll, "RtlNtStatusToDosError"));
@@ -66,6 +72,7 @@ static void ep_global_init_once(void)
         g_ntdll.NtDeviceIoControlFile != NULL &&
         g_ntdll.NtCreateFile != NULL &&
         g_ntdll.NtCancelIoFileEx != NULL &&
+        g_ntdll.NtQueryObject != NULL &&
         p_RtlNtStatusToDosError != NULL &&
         g_ntdll.wsa_initialized;
 #else

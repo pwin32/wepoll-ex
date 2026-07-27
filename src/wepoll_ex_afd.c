@@ -324,12 +324,15 @@ int ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id)
 /* the port.  The completion packet carries the embedded IO_STATUS_BLOCK. */
 /* --------------------------------------------------------------------- */
 
-int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
+int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
 {
 #ifdef _WIN32
     NTSTATUS status;
     uint32_t old_submitted_afd_events;
 
+    if (pending_out != NULL) {
+        *pending_out = 0;
+    }
     if (sock == NULL || sock->port == NULL || sock->port->afd == NULL ||
         g_ntdll.NtDeviceIoControlFile == NULL) {
         ep_set_errno(EINVAL);
@@ -421,9 +424,15 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events)
     if (status == STATUS_PENDING && (sock->user_flags & EPOLLET) != 0) {
         sock->observed_events = 0;
     }
+    if (pending_out != NULL && status == STATUS_PENDING) {
+        *pending_out = 1;
+    }
     return 0;
 #else
     (void)sock; (void)afd_events;
+    if (pending_out != NULL) {
+        *pending_out = 0;
+    }
     ep_set_errno(ENOSYS);
     return -1;
 #endif

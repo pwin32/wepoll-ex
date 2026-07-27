@@ -286,12 +286,17 @@ static int epoll_ctl_port(ep_port_t *port,
             ep_set_errno(EFAULT);
             return -1;
         }
-        /* EPOLLEXCLUSIVE may only be set at ADD time, matching Linux.
-         * Linux also rejects Exclusive with ONESHOT or ET (EINVAL). */
-        if ((event->events & EPOLLEXCLUSIVE) != 0 &&
-            (event->events & (EPOLLONESHOT | EPOLLET)) != 0) {
-            ep_set_errno(EINVAL);
-            return -1;
+        /* Linux permits only IN/OUT/WAKEUP/ET (plus ERR/HUP, which are always
+         * reported) alongside EPOLLEXCLUSIVE.  In particular, ET is valid but
+         * ONESHOT and RDHUP are not. */
+        if ((event->events & EPOLLEXCLUSIVE) != 0) {
+            uint32_t exclusive_allowed =
+                EPOLLIN | EPOLLOUT | EPOLLWAKEUP | EPOLLET |
+                EPOLLERR | EPOLLHUP | EPOLLEXCLUSIVE;
+            if ((event->events & ~exclusive_allowed) != 0) {
+                ep_set_errno(EINVAL);
+                return -1;
+            }
         }
         flags = event->events & (EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLET);
         return ep_port_register(port, (SOCKET)fd,

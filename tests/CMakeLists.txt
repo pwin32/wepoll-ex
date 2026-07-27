@@ -59,6 +59,12 @@ else()
         _WIN32_WINNT=0x0602
         WIN32_LEAN_AND_MEAN)
 
+    add_executable(test_wepoll_ex_windows_pipe
+        test_windows_pipe.c)
+    target_compile_definitions(test_wepoll_ex_windows_pipe PRIVATE
+        _WIN32_WINNT=0x0602
+        WIN32_LEAN_AND_MEAN)
+
     if(WEPOLL_EX_BUILD_STATIC)
         target_link_libraries(test_wepoll_ex_windows PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
@@ -73,6 +79,8 @@ else()
         target_link_libraries(test_wepoll_ex_windows_edge PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
         target_link_libraries(test_wepoll_ex_windows_waitable PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_pipe PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
         add_executable(test_wepoll_ex_pool test_pool.c)
@@ -235,6 +243,8 @@ else()
             wepoll_ex::wepoll_ex ws2_32)
         target_link_libraries(test_wepoll_ex_windows_waitable PRIVATE
             wepoll_ex::wepoll_ex ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_pipe PRIVATE
+            wepoll_ex::wepoll_ex ws2_32)
     endif()
 
     add_test(NAME wepoll_ex_windows_api COMMAND test_wepoll_ex_windows)
@@ -253,11 +263,19 @@ else()
         COMMAND test_wepoll_ex_windows_stress)
     set_tests_properties(wepoll_ex_windows_stress PROPERTIES TIMEOUT 30)
 
+    set(_wepoll_ex_shared_runtime_tests
+        wepoll_ex_windows_api
+        wepoll_ex_windows_ipv6
+        wepoll_ex_windows_backpressure
+        wepoll_ex_windows_stress)
+
     foreach(_edge_mode IN ITEMS
             readable
             writable
             exclusive-mod
             exclusive-wake
+            exclusive-et
+            exclusive-disjoint
             exclusive-invalid
             pwait-sigmask
             wakeup-flag)
@@ -266,17 +284,58 @@ else()
             COMMAND test_wepoll_ex_windows_edge ${_edge_mode})
         set_tests_properties(wepoll_ex_windows_edge_${_edge_name}
             PROPERTIES TIMEOUT 20)
+        list(APPEND _wepoll_ex_shared_runtime_tests
+            wepoll_ex_windows_edge_${_edge_name})
     endforeach()
 
     foreach(_waitable_mode IN ITEMS
             event
             event-et
-            exclusive)
+            auto-reset
+            auto-reset-et
+            semaphore
+            semaphore-et
+            pending-mod
+            ready-mod
+            timer-ready-mod
+            timer-et
+            job
+            access
+            process-thread
+            thread-et
+            exclusive
+            mutex
+            cleanup
+            cancel)
         string(REPLACE "-" "_" _waitable_name "${_waitable_mode}")
         add_test(NAME wepoll_ex_windows_waitable_${_waitable_name}
             COMMAND test_wepoll_ex_windows_waitable ${_waitable_mode})
         set_tests_properties(wepoll_ex_windows_waitable_${_waitable_name}
             PROPERTIES TIMEOUT 20)
+        list(APPEND _wepoll_ex_shared_runtime_tests
+            wepoll_ex_windows_waitable_${_waitable_name})
+    endforeach()
+
+    foreach(_pipe_mode IN ITEMS
+            readable
+            et
+            writable
+            direction
+            oneshot
+            named
+            hup
+            mod
+            exclusive
+            cancel
+            timer
+            disk)
+        string(REPLACE "-" "_" _pipe_name "${_pipe_mode}")
+        add_test(NAME wepoll_ex_windows_pipe_${_pipe_name}
+            COMMAND test_wepoll_ex_windows_pipe ${_pipe_mode})
+        set_tests_properties(wepoll_ex_windows_pipe_${_pipe_name}
+            PROPERTIES TIMEOUT 20)
+        list(APPEND _wepoll_ex_shared_runtime_tests
+            wepoll_ex_windows_pipe_${_pipe_name})
     endforeach()
 
     if(WEPOLL_EX_BUILD_STATIC)
@@ -327,7 +386,10 @@ else()
                 iocp-create
                 iocp-post
                 iocp-dequeue
-                ready-node-alloc)
+                ready-node-alloc
+                aux-waitable-disarm
+                aux-waitable-disarm-repeat
+                aux-pipe-disarm)
             string(REPLACE "-" "_" _fault_name "${_fault_mode}")
             add_test(NAME wepoll_ex_windows_fault_${_fault_name}
                 COMMAND test_wepoll_ex_windows_faults ${_fault_mode})
@@ -348,6 +410,8 @@ else()
             COMMAND test_wepoll_ex_windows_identity ${_identity_mode})
         set_tests_properties(wepoll_ex_windows_identity_${_identity_name}
             PROPERTIES TIMEOUT 15 SKIP_RETURN_CODE 77)
+        list(APPEND _wepoll_ex_shared_runtime_tests
+            wepoll_ex_windows_identity_${_identity_name})
     endforeach()
 
     if(MINGW)
@@ -370,21 +434,12 @@ else()
     endif()
 
     if(WEPOLL_EX_BUILD_SHARED AND NOT WEPOLL_EX_BUILD_STATIC)
-        set_tests_properties(
-            wepoll_ex_windows_api
-            wepoll_ex_windows_ipv6
-            wepoll_ex_windows_backpressure
-            wepoll_ex_windows_stress
-            wepoll_ex_windows_identity_pending_add
-            wepoll_ex_windows_identity_oneshot_rearm
-            wepoll_ex_windows_identity_queued_ready
-            wepoll_ex_windows_identity_transitional_connect
-            wepoll_ex_windows_identity_transitional_mod_before_connect
-            wepoll_ex_windows_identity_transitional_reuse
+        set_tests_properties(${_wepoll_ex_shared_runtime_tests}
             PROPERTIES
             ENVIRONMENT
                 "PATH=$<TARGET_FILE_DIR:wepoll_ex_shared>\;$ENV{PATH}")
     endif()
+    unset(_wepoll_ex_shared_runtime_tests)
 endif()
 
 set(_package_test_prefix ${CMAKE_CURRENT_BINARY_DIR}/package-consumer-install)

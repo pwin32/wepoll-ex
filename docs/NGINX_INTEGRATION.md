@@ -11,8 +11,10 @@ outside this repository for experiments.
 
 The adapter follows nginx's level-triggered poll action layout and uses the
 connection instance bit to reject stale queued events. The Windows backend
-rejects `EPOLLET`, so the adapter intentionally does not request it. The
-`nginx/config` hook compiles the static wepoll-ex sources into an nginx build;
+supports observed-readiness `EPOLLET`, but this adapter intentionally does not
+request it because it has no separately tested nginx drain/rearm state machine.
+The `nginx/config` hook compiles the static wepoll-ex sources into an nginx
+build;
 the opt-in CMake target only checks the adapter object against generated nginx
 headers.
 

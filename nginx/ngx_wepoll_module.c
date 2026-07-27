@@ -2,11 +2,12 @@
  * ngx_wepoll_module.c — experimental nginx 1.31.3 event-module adapter.
  *
  * This adapter deliberately follows nginx's level-triggered poll module
- * contract.  The Windows wepoll-ex backend rejects EPOLLET, so copying the
- * Linux epoll module's edge-triggered mask would be incorrect.  One virtual
- * epoll registration is maintained per connection; read/write actions merge
- * their masks with ADD/MOD and use nginx's instance bit to reject stale
- * queued events.
+ * contract.  The Windows wepoll-ex backend supports observed-readiness
+ * EPOLLET, but this adapter has no separately tested nginx drain/rearm state
+ * machine, so copying the Linux epoll module's edge-triggered mask would be
+ * incorrect.  One virtual epoll registration is maintained per connection;
+ * read/write actions merge their masks with ADD/MOD and use nginx's instance
+ * bit to reject stale queued events.
  *
  * The tracked nginx/config hook builds this file and the static wepoll-ex
  * sources into a Win32 nginx tree.  The integration remains experimental.

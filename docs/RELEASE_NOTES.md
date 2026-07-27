@@ -27,6 +27,25 @@ ICMP/UDP error skip and synchronized-mode native-reuse identity skips. The
 bounded close-reference regression tolerates coarse Windows timer resolution
 while still requiring a non-zero, sub-second wait and `ETIMEDOUT`.
 
+The later July 24, 2026 non-socket parity matrix used MinGW GCC 15.2 with
+`-O2 -Wall -Wextra -Wpedantic -Werror`. CTest passed 83 combined
+best-effort, 82 static-only, 39 shared-only, 83 strict-identity, and 83
+synchronized-lifetime entries. The combined/static/strict/synchronized lanes
+had the environment-dependent UDP/ICMP skip; synchronized mode also skipped
+the expected native-reuse identity cases. Repeated API, backpressure, stress,
+and concurrent-control tests passed in every applicable lane. Linux/WSL GCC
+14.2 strict Release and ASan/UBSan CTest each passed 3/3, and Clang 19.1.7
+strict Release passed 3/3.
+
+The July 27, 2026 parity follow-up used the same strict MinGW flags and
+completed 99 combined best-effort, 98 static-only, 52 shared-only, 99
+strict-identity, and 99 synchronized-lifetime CTest entries. The
+combined/static/strict/synchronized variants retained the expected UDP/ICMP
+environment skip, and synchronized mode retained its four native-reuse identity
+skips. Repeated API, backpressure, stress, and concurrent-control lanes passed.
+Linux/WSL GCC 14.2 strict Release and ASan/UBSan CTest each passed 3/3; Clang
+19.1.7 strict Release passed 3/3.
+
 The current worktree limits the development wrapper to Linux instead of
 assuming every non-Windows platform provides `epoll` and `eventfd`. It also
 behaves cleanly as a CMake subproject: it does not force the parent build type,
@@ -43,21 +62,50 @@ queue, pool, rearm, stale-event, identity, asynchronous-error, drain-budget,
 quarantine, reaper, and close-timeout diagnostics. Linux reports its extension
 registration count and a not-applicable lifetime policy.
 
+Windows registrations now also accept anonymous/named pipes via
+short timer-queue polls and `PeekNamedPipe`, plus waitable timers through the
+existing waitable-HANDLE path. Ordinary disk files return Linux-compatible
+`EPERM`. Pipe readiness honors the HANDLE's granted read/write data access, so
+opposite-direction interest is not synthesized on ordinary or terminal polls.
+Pipe regressions cover read/write direction and readiness, HUP, edge, oneshot,
+pending MOD, exclusive rejection, named pipes, and cancellation cleanup.
+
 Windows registrations now accept waitable HANDLEs in addition to
-Winsock sockets. Waitable objects use `RegisterWaitForSingleObject` and wake
-through the port IOCP; `EPOLLEXCLUSIVE` is rejected for them. Ordinary files
-and non-waitable pipes remain unsupported.
+Winsock sockets. Events, semaphores, waitable timers, processes, and threads
+use `RegisterWaitForSingleObject` and wake through the port IOCP. Object types
+are classified without a destructive wait; jobs and mutexes return `EPERM`,
+HANDLEs lacking `SYNCHRONIZE` return `EACCES`, and `EPOLLEXCLUSIVE` is rejected
+for non-socket registrations.
+Auto-reset events and semaphores consume exactly one signal/count per delivered
+notification, including ET delivery; waitable-timer ET is rejected because the
+reset mode cannot be recovered from an arbitrary HANDLE. Auxiliary callback
+retirement failures now keep storage and pending accounting pinned, surface an
+asynchronous error, and retry through wait/DEL/close rather than permitting a
+stale cookie or premature free.
+
+Process and thread HANDLEs now classify as monotonic terminal waitables: after
+their ET edge is delivered they remain idle instead of generating throttled
+empty completions forever. MOD keeps pending waitable and pipe operations alive
+so an already-posted callback uses the latest mask/data. MOD also replaces a
+queued known-consumptive or mode-unknown waitable notification with a
+current-generation snapshot, preserving any signal/count or timer expiration
+already consumed by the underlying wait. Queued pipe state is safe to discard
+and re-sample because pipe observation is non-consumptive.
 
 Windows `epoll_pwait*` now accepts opaque non-null signal-mask pointers
-and ignores them. ADD rejects `EPOLLEXCLUSIVE` combined with `EPOLLONESHOT` or
-`EPOLLET` (`EINVAL`). `EPOLLWAKEUP` is accepted and ignored.
+and ignores them. Exclusive ADD accepts `EPOLLET` but rejects `EPOLLONESHOT`,
+`EPOLLRDHUP`, and unsupported event bits. `EPOLLWAKEUP` is accepted and ignored.
 
 Windows `EPOLLET` and ADD-time `EPOLLEXCLUSIVE` are no longer rejected.
-Edge-triggered delivery latches observed interest bits from AFD level
+Socket edge-triggered delivery latches observed interest bits from AFD level
 snapshots and suppresses redelivery until those bits clear and reassert; empty
-edge completions defer re-arming to the next wait. Exclusive registrations
-submit AFD polls with `Exclusive=TRUE`, and MOD with `EPOLLEXCLUSIVE` returns
-`EINVAL` as on Linux.
+edge observations use throttled deferred re-sampling. Exclusive registrations
+submit AFD polls with `Exclusive=TRUE`; a process-wide claim filter tracks
+read, write, and terminal readiness independently, filters only conflicting
+classes from mixed snapshots, and releases a class after pending submission or
+an inactive directional sample proves it quiescent. Every MOD of an exclusive
+registration returns `EINVAL`, even when the MOD mask omits
+`EPOLLEXCLUSIVE`.
 
 Rearm and fired-oneshot tracking now use intrusive worklists. Wait preparation
 is proportional to pending work rather than all registrations; a regression
@@ -154,14 +202,18 @@ local noise, so this run does not demonstrate a throughput improvement.
 This validation is not a support matrix. MSVC and other Windows toolchains are
 not yet validated, and AFD is undocumented. `_WIN32_WINNT=0x0602` is the
 Windows 8-or-later compile/runtime assumption; Windows 8 itself was not tested.
-Windows now accepts `EPOLLET` and ADD-time `EPOLLEXCLUSIVE`. Edge delivery is
-an observed-bit filter over AFD level reports rather than a kernel edge
-queue, and exclusive wake uniqueness relies on AFD exclusive-poll cancellation
-among wepoll-ex instances. Non-null Windows signal-mask pointers are accepted and ignored for
-portable `epoll_pwait*` call sites. `EPOLLEXCLUSIVE` rejects combinations with
-`EPOLLONESHOT`/`EPOLLET`, and `EPOLLWAKEUP` is accepted as a no-op. Performance
-measurements are local loopback observations, not portable throughput
-guarantees.
+Windows now accepts `EPOLLET` and ADD-time `EPOLLEXCLUSIVE`. Socket edge
+delivery is an observed-bit filter over AFD level reports rather than a kernel
+edge queue, and exclusive wake uniqueness relies on AFD exclusive-poll
+cancellation plus a bounded, readiness-class-granular process-wide claim
+filter among wepoll-ex instances. Non-null
+Windows signal-mask pointers are accepted and ignored, `EPOLLWAKEUP` is a
+no-op, and `epoll_pwait2*` rounds positive submillisecond timeouts up to one
+millisecond. `EPOLLEXCLUSIVE` may combine with `EPOLLET`, but not with
+`EPOLLONESHOT`, `EPOLLRDHUP`, or unsupported event bits; virtual Windows epoll
+descriptors cannot be nested, and pipe writable readiness remains advisory.
+Performance measurements are local loopback observations, not portable
+throughput guarantees.
 
 See `README.md`, `docs/DESIGN.md`, and `docs/NGINX_INTEGRATION.md` for current
 contracts and integration constraints.

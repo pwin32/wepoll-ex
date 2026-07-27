@@ -237,12 +237,14 @@ static int test_exclusive_mod_rejected(void)
         goto fail;
 
     memset(&event, 0, sizeof(event));
-    event.events = EPOLLIN;
+    event.events = EPOLLIN | EPOLLEXCLUSIVE;
     event.data.u64 = 3;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0)
         goto fail;
 
-    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    /* Linux rejects every MOD of an exclusive registration, even when the
+     * MOD mask does not repeat EPOLLEXCLUSIVE. */
+    event.events = EPOLLIN;
     errno = 0;
     if (epoll_ctl(epfd, EPOLL_CTL_MOD, accepted, &event) != -1 ||
         errno != EINVAL) {
@@ -266,19 +268,87 @@ fail:
     return 1;
 }
 
-static int test_exclusive_single_wake(void)
+static int wait_for_exclusive_recipient(int epfd_a, int epfd_b,
+                                        int *winner_out, const char *label)
+{
+    struct epoll_event events[1];
+    int winner = 0;
+    int loser_checks = 0;
+    int i;
+
+    for (i = 0; i < 40 && loser_checks < 6; i++) {
+        int n;
+
+        if (winner != 1) {
+            n = epoll_wait(epfd_a, events, 1, 25);
+            if (n < 0)
+                return -1;
+            if (n == 1 && (events[0].events & EPOLLIN) != 0) {
+                if (winner == 2) {
+                    fprintf(stderr, "%s: both instances woke\n", label);
+                    return -1;
+                }
+                winner = 1;
+            }
+        }
+        if (winner != 2) {
+            n = epoll_wait(epfd_b, events, 1, 25);
+            if (n < 0)
+                return -1;
+            if (n == 1 && (events[0].events & EPOLLIN) != 0) {
+                if (winner == 1) {
+                    fprintf(stderr, "%s: both instances woke\n", label);
+                    return -1;
+                }
+                winner = 2;
+            }
+        }
+        if (winner != 0)
+            loser_checks++;
+    }
+    if (winner == 0) {
+        fprintf(stderr, "%s: neither instance woke\n", label);
+        return -1;
+    }
+    *winner_out = winner;
+    return 0;
+}
+
+static int arm_exclusive_after_drain(int epfd, const char *label)
+{
+    struct epoll_event events[1];
+    int n = epoll_wait(epfd, events, 1, 0);
+
+    /* A queued peer completion from the prior level must be re-sampled and
+     * discarded after the application has synchronously drained the socket. */
+    if (n < 0) {
+        fprintf(stderr, "%s: rearm failed errno=%d\n", label, errno);
+        return -1;
+    }
+    if (n != 0) {
+        fprintf(stderr, "%s: stale post-drain events=%u\n",
+                label, events[0].events);
+        return -1;
+    }
+    return 0;
+}
+
+static int test_exclusive_two_cycles(int edge_triggered)
 {
     SOCKET listener = INVALID_SOCKET;
     SOCKET client = INVALID_SOCKET;
     SOCKET accepted = INVALID_SOCKET;
     struct epoll_event event;
-    struct epoll_event events[2];
+    struct epoll_event events[1];
     int epfd_a = -1;
     int epfd_b = -1;
-    int got_a = 0;
-    int got_b = 0;
-    int n;
-    int i;
+    int first_winner = 0;
+    int second_winner = 0;
+    char byte;
+    uint32_t flags = EPOLLIN | EPOLLEXCLUSIVE;
+
+    if (edge_triggered)
+        flags |= EPOLLET;
 
     if (make_loopback_pair(&listener, &client, &accepted) != 0)
         return 1;
@@ -289,14 +359,14 @@ static int test_exclusive_single_wake(void)
         goto fail;
 
     memset(&event, 0, sizeof(event));
-    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    event.events = flags;
     event.data.u64 = 11;
     if (epoll_ctl(epfd_a, EPOLL_CTL_ADD, accepted, &event) != 0) {
         fprintf(stderr, "exclusive: ADD A failed errno=%d\n", errno);
         goto fail;
     }
 
-    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    event.events = flags;
     event.data.u64 = 22;
     if (epoll_ctl(epfd_b, EPOLL_CTL_ADD, accepted, &event) != 0) {
         fprintf(stderr, "exclusive: ADD B failed errno=%d\n", errno);
@@ -310,25 +380,34 @@ static int test_exclusive_single_wake(void)
     if (send(client, "x", 1, 0) != 1)
         goto fail;
 
-    for (i = 0; i < 40; i++) {
-        n = epoll_wait(epfd_a, events, 1, 25);
-        if (n < 0)
-            goto fail;
-        if (n == 1 && (events[0].events & EPOLLIN) != 0)
-            got_a++;
-        n = epoll_wait(epfd_b, events, 1, 25);
-        if (n < 0)
-            goto fail;
-        if (n == 1 && (events[0].events & EPOLLIN) != 0)
-            got_b++;
-        if ((got_a + got_b) > 0 && i > 8)
-            break;
+    if (wait_for_exclusive_recipient(epfd_a, epfd_b, &first_winner,
+                                     edge_triggered ? "exclusive-et first" :
+                                                      "exclusive first") != 0) {
+        goto fail;
+    }
+    if (recv(accepted, &byte, 1, 0) != 1) {
+        fprintf(stderr, "exclusive: first recv failed WSA=%d\n",
+                WSAGetLastError());
+        goto fail;
     }
 
-    if (!((got_a == 1 && got_b == 0) || (got_a == 0 && got_b == 1))) {
-        fprintf(stderr,
-                "exclusive: expected one instance once, got A=%d B=%d\n",
-                got_a, got_b);
+    /* A pending re-submit after the application drains the byte is the
+     * quiescent transition that releases the process-wide exclusive claim. */
+    if (arm_exclusive_after_drain(epfd_a, "exclusive rearm A") != 0 ||
+        arm_exclusive_after_drain(epfd_b, "exclusive rearm B") != 0) {
+        goto fail;
+    }
+
+    if (send(client, "y", 1, 0) != 1)
+        goto fail;
+    if (wait_for_exclusive_recipient(epfd_a, epfd_b, &second_winner,
+                                     edge_triggered ? "exclusive-et second" :
+                                                      "exclusive second") != 0) {
+        goto fail;
+    }
+    if (recv(accepted, &byte, 1, 0) != 1) {
+        fprintf(stderr, "exclusive: second recv failed WSA=%d\n",
+                WSAGetLastError());
         goto fail;
     }
 
@@ -337,12 +416,116 @@ static int test_exclusive_single_wake(void)
     closesocket(accepted);
     closesocket(client);
     closesocket(listener);
-    puts("exclusive-wake: OK");
+    printf("%s: first=%c second=%c OK\n",
+           edge_triggered ? "exclusive-et-wake" : "exclusive-wake",
+           first_winner == 1 ? 'A' : 'B',
+           second_winner == 1 ? 'A' : 'B');
     return 0;
 
 fail:
     if (epfd_a >= 0) (void)wepoll_close(epfd_a);
     if (epfd_b >= 0) (void)wepoll_close(epfd_b);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return 1;
+}
+
+static int test_exclusive_disjoint_classes(void)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    struct epoll_event output;
+    int epfd_read = -1;
+    int epfd_read_second = -1;
+    int epfd_write = -1;
+    char byte;
+
+    if (make_loopback_pair(&listener, &client, &accepted) != 0)
+        return 1;
+
+    epfd_read = epoll_create1(0);
+    epfd_write = epoll_create1(0);
+    if (epfd_read < 0 || epfd_write < 0)
+        goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLOUT | EPOLLEXCLUSIVE;
+    event.data.u64 = 32;
+    if (epoll_ctl(epfd_write, EPOLL_CTL_ADD, accepted, &event) != 0 ||
+        epoll_wait(epfd_write, &output, 1, 1000) != 1 ||
+        (output.events & EPOLLOUT) == 0 || output.data.u64 != 32) {
+        fprintf(stderr,
+                "exclusive-disjoint: initial OUT missing events=%u errno=%d\n",
+                output.events, errno);
+        goto fail;
+    }
+
+    event.events = EPOLLIN | EPOLLOUT | EPOLLEXCLUSIVE;
+    event.data.u64 = 31;
+    if (epoll_ctl(epfd_read, EPOLL_CTL_ADD, accepted, &event) != 0 ||
+        epoll_wait(epfd_read, &output, 1, 0) != 0) {
+        fprintf(stderr, "exclusive-disjoint: mixed arm failed errno=%d\n",
+                errno);
+        goto fail;
+    }
+
+    /* The writable registration now owns a continuously active OUT class.
+     * The mixed registration must filter that class without suppressing its
+     * independent IN class on the same base socket. */
+    if (send(client, "z", 1, 0) != 1 ||
+        epoll_wait(epfd_read, &output, 1, 1000) != 1 ||
+        (output.events & EPOLLIN) == 0 || (output.events & EPOLLOUT) != 0 ||
+        output.data.u64 != 31 ||
+        recv(accepted, &byte, 1, 0) != 1) {
+        fprintf(stderr,
+                "exclusive-disjoint: IN blocked by OUT owner events=%u "
+                "errno=%d WSA=%d\n",
+                output.events, errno, WSAGetLastError());
+        goto fail;
+    }
+
+    /* OUT remains true, so the mixed registration's next AFD request cannot
+     * become wholly pending.  Its read-side select sample must still release
+     * the now-inactive READ claim, allowing another IN-only owner to win. */
+    if (epoll_wait(epfd_read, &output, 1, 20) != 0) {
+        fprintf(stderr,
+                "exclusive-disjoint: mixed post-drain wait returned events=%u\n",
+                output.events);
+        goto fail;
+    }
+    epfd_read_second = epoll_create1(0);
+    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    event.data.u64 = 33;
+    if (epfd_read_second < 0 ||
+        epoll_ctl(epfd_read_second, EPOLL_CTL_ADD, accepted, &event) != 0 ||
+        epoll_wait(epfd_read_second, &output, 1, 0) != 0 ||
+        send(client, "q", 1, 0) != 1 ||
+        epoll_wait(epfd_read_second, &output, 1, 1000) != 1 ||
+        (output.events & EPOLLIN) == 0 || output.data.u64 != 33 ||
+        recv(accepted, &byte, 1, 0) != 1) {
+        fprintf(stderr,
+                "exclusive-disjoint: inactive READ claim was retained "
+                "events=%u errno=%d WSA=%d\n",
+                output.events, errno, WSAGetLastError());
+        goto fail;
+    }
+
+    (void)wepoll_close(epfd_read);
+    (void)wepoll_close(epfd_read_second);
+    (void)wepoll_close(epfd_write);
+    closesocket(accepted);
+    closesocket(client);
+    closesocket(listener);
+    puts("exclusive-disjoint: OK");
+    return 0;
+
+fail:
+    if (epfd_read >= 0) (void)wepoll_close(epfd_read);
+    if (epfd_read_second >= 0) (void)wepoll_close(epfd_read_second);
+    if (epfd_write >= 0) (void)wepoll_close(epfd_write);
     if (accepted != INVALID_SOCKET) closesocket(accepted);
     if (client != INVALID_SOCKET) closesocket(client);
     if (listener != INVALID_SOCKET) closesocket(listener);
@@ -373,16 +556,31 @@ static int test_exclusive_invalid_combos(void)
         goto fail;
     }
 
-    event.events = EPOLLIN | EPOLLEXCLUSIVE | EPOLLET;
+    event.events = EPOLLIN | EPOLLRDHUP | EPOLLEXCLUSIVE;
     errno = 0;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != -1 ||
         errno != EINVAL) {
-        fprintf(stderr, "exclusive+et: expected EINVAL errno=%d\n", errno);
+        fprintf(stderr, "exclusive+rdhup: expected EINVAL errno=%d\n", errno);
         goto fail;
     }
 
-    if (epoll_fd_count(epfd) != 0) {
-        fputs("exclusive invalid combos left a registration\n", stderr);
+    event.events = EPOLLPRI | EPOLLEXCLUSIVE;
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != -1 ||
+        errno != EINVAL) {
+        fprintf(stderr, "exclusive+pri: expected EINVAL errno=%d\n", errno);
+        goto fail;
+    }
+
+    event.events = EPOLLIN | EPOLLEXCLUSIVE | EPOLLET;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0) {
+        fprintf(stderr, "exclusive+et: ADD failed errno=%d\n", errno);
+        goto fail;
+    }
+    if (epoll_fd_count(epfd) != 1 ||
+        epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL) != 0 ||
+        epoll_fd_count(epfd) != 0) {
+        fputs("exclusive+et: registration lifecycle failed\n", stderr);
         goto fail;
     }
 
@@ -512,7 +710,11 @@ static int run_mode(const char *mode)
     if (strcmp(mode, "exclusive-mod") == 0)
         return test_exclusive_mod_rejected();
     if (strcmp(mode, "exclusive-wake") == 0)
-        return test_exclusive_single_wake();
+        return test_exclusive_two_cycles(0);
+    if (strcmp(mode, "exclusive-et") == 0)
+        return test_exclusive_two_cycles(1);
+    if (strcmp(mode, "exclusive-disjoint") == 0)
+        return test_exclusive_disjoint_classes();
     if (strcmp(mode, "exclusive-invalid") == 0)
         return test_exclusive_invalid_combos();
     if (strcmp(mode, "pwait-sigmask") == 0)
@@ -529,7 +731,8 @@ int main(int argc, char **argv)
     int failures = 0;
     const char *modes[] = {
         "readable", "writable", "exclusive-mod", "exclusive-wake",
-        "exclusive-invalid", "pwait-sigmask", "wakeup-flag"
+        "exclusive-et", "exclusive-disjoint", "exclusive-invalid",
+        "pwait-sigmask", "wakeup-flag"
     };
     size_t i;
 
