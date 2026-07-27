@@ -228,6 +228,11 @@ typedef BOOL (WINAPI *PGetQueuedCompletionStatusEx)(
     PULONG NumEntriesRemoved,
     DWORD Milliseconds,
     BOOL Alertable);
+typedef BOOL (WINAPI *PPostQueuedCompletionStatusFn)(
+    HANDLE CompletionPort,
+    DWORD NumberOfBytesTransferred,
+    ULONG_PTR CompletionKey,
+    LPOVERLAPPED Overlapped);
 #endif
 
 /* ----------------------------------------------------------------------- */
@@ -337,12 +342,23 @@ struct ep_sock {
      * ensure cancellation produces exactly one completion packet. */
     _Atomic uint32_t callback_active;
     _Atomic uint32_t completion_posted;
+    uint8_t aux_consumed_pending;
     uint8_t oneshot_fired;
     uint8_t needs_rearm;
     /* Empty ET observations and losing exclusive claims defer re-submission.
      * The wait loop clears this latch on the next API wait or after a short
      * internal retry interval, avoiding a tight immediate-completion loop. */
     uint8_t et_holdoff;
+
+    /* Intrusive membership in the process-wide EPOLLEXCLUSIVE claim index.
+     * A registration owns at most one node whose bitset represents its read,
+     * write, and terminal claims.  The global exclusive lock protects these
+     * links and fields; embedding the node avoids a fixed-capacity or
+     * allocation-failure path while readiness is being delivered. */
+    struct ep_sock *exclusive_next;
+    struct ep_sock *exclusive_prev;
+    SOCKET exclusive_claim_base;
+    uint8_t exclusive_claim_classes;
 
     /* Exactly-once membership in the per-port deferred-work lists.  These
      * links are protected by fd_table_lock and are independent of the live
@@ -434,6 +450,12 @@ struct ep_port {
     /* The IOCP handle that drives this epoll instance. */
     HANDLE iocp;
 
+    /* Short lease protecting auxiliary/control posts from IOCP revocation.
+     * `iocp` remains stable until final teardown; posts use the alias while
+     * holding this lock, and close paths revoke the alias before CloseHandle. */
+    HANDLE iocp_post_handle;
+    pthread_mutex_t iocp_post_lock;
+
     /* Handle to AFD, opened once per port. */
     HANDLE afd;
 
@@ -463,6 +485,7 @@ struct ep_port {
     ULONG              iocp_batch_size;
 #ifdef _WIN32
     PGetQueuedCompletionStatusEx get_queued_completion_status_ex;
+    PPostQueuedCompletionStatusFn post_queued_completion_status;
 #endif
 
     /* Configuration snapshot. */
@@ -474,6 +497,8 @@ struct ep_port {
     _Atomic int waiter_active;
     _Atomic int closing;
     _Atomic int iocp_closed;
+    _Atomic int iocp_post_error;
+    _Atomic uint64_t iocp_post_failures;
     size_t pending_poll_count;
 
     /* Deferred AFD submissions and fired-oneshot identity probes.  Counts
@@ -538,6 +563,7 @@ typedef enum ep_fault_point {
     EP_FAULT_READY_NODE_ALLOC,
     EP_FAULT_IOCP_CREATE,
     EP_FAULT_IOCP_POST,
+    EP_FAULT_AUX_POST,
     EP_FAULT_IOCP_DEQUEUE,
     EP_FAULT_AUX_DISARM,
     EP_FAULT_POINT_COUNT

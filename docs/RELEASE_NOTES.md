@@ -46,6 +46,16 @@ skips. Repeated API, backpressure, stress, and concurrent-control lanes passed.
 Linux/WSL GCC 14.2 strict Release and ASan/UBSan CTest each passed 3/3; Clang
 19.1.7 strict Release passed 3/3.
 
+The later July 27, 2026 hardening follow-up used MinGW GCC 15.2 with
+`-O2 -Wall -Wextra -Wpedantic -Werror` plus Release optimization. CTest passed
+107 combined best-effort, 106 static-only, 54 shared-only, 107 strict-identity,
+and 107 synchronized-lifetime entries. Combined, static, and strict retained
+the one environment-dependent UDP/ICMP skip; synchronized mode retained that
+skip plus four expected native-reuse identity skips, while shared-only had no
+skips. Linux/WSL GCC 14.2 and Clang 19.1.7 strict Release each passed 3/3;
+the GCC API/pool lanes passed five repeats, and ASan/UBSan passed 3/3 through
+the qualification wrapper's loader-safe environment.
+
 The current worktree limits the development wrapper to Linux instead of
 assuming every non-Windows platform provides `epoll` and `eventfd`. It also
 behaves cleanly as a CMake subproject: it does not force the parent build type,
@@ -83,6 +93,22 @@ retirement failures now keep storage and pending accounting pinned, surface an
 asynchronous error, and retry through wait/DEL/close rather than permitting a
 stale cookie or premature free.
 
+Auxiliary cancellation no longer manufactures an IOCP cancellation packet
+when blocking disarm proves that no callback or queued packet can reference the
+registration. Unsignaled waitables can therefore be DELed and reclaimed
+immediately without a later wait or close drain; already-posted packets remain
+pinned until dequeue. If a disarm failure follows a consumptive wait, the
+auto-reset event, semaphore count, or mode-unknown notification is preserved
+and replayed after cleanup succeeds.
+
+Auxiliary and control posts now hold a per-port IOCP HANDLE lease. Close
+revokes the posting alias before closing the completion port, eliminating the
+callback-versus-close stale-HANDLE reuse window. A fatal post failure closes
+the IOCP to wake an infinite waiter and reports the original error. Regressions
+cover a blocked post versus close, callback and immediate-post failures,
+already-posted cancellation pinning, closed-IOCP reclamation, and a 64-object
+no-wait cancellation batch.
+
 Process and thread HANDLEs now classify as monotonic terminal waitables: after
 their ET edge is delivered they remain idle instead of generating throttled
 empty completions forever. MOD keeps pending waitable and pipe operations alive
@@ -106,6 +132,13 @@ classes from mixed snapshots, and releases a class after pending submission or
 an inactive directional sample proves it quiescent. Every MOD of an exclusive
 registration returns `EINVAL`, even when the MOD mask omits
 `EPOLLEXCLUSIVE`.
+
+The exclusive claim filter now stores each owner's readiness-class bitset in
+an intrusive registration node indexed through process-wide hash buckets. This
+removes the fixed 128-entry table and its exhaustion fail-open path without
+allocating during completion delivery. A regression holds 129 distinct read
+claims concurrently, verifies that a peer port receives no duplicate wake,
+then exercises individual DEL and bulk port-close claim release.
 
 Rearm and fired-oneshot tracking now use intrusive worklists. Wait preparation
 is proportional to pending work rather than all registrations; a regression
@@ -205,8 +238,8 @@ Windows 8-or-later compile/runtime assumption; Windows 8 itself was not tested.
 Windows now accepts `EPOLLET` and ADD-time `EPOLLEXCLUSIVE`. Socket edge
 delivery is an observed-bit filter over AFD level reports rather than a kernel
 edge queue, and exclusive wake uniqueness relies on AFD exclusive-poll
-cancellation plus a bounded, readiness-class-granular process-wide claim
-filter among wepoll-ex instances. Non-null
+cancellation plus a readiness-class-granular process-wide claim index among
+wepoll-ex instances. Non-null
 Windows signal-mask pointers are accepted and ignored, `EPOLLWAKEUP` is a
 no-op, and `epoll_pwait2*` rounds positive submillisecond timeouts up to one
 millisecond. `EPOLLEXCLUSIVE` may combine with `EPOLLET`, but not with

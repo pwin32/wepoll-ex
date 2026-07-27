@@ -6,9 +6,12 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
+
+#define EXCLUSIVE_SCALE_REGISTRATIONS 129
 
 static int make_loopback_pair(SOCKET *listener_out, SOCKET *client_out,
                               SOCKET *accepted_out)
@@ -532,6 +535,271 @@ fail:
     return 1;
 }
 
+static int test_exclusive_scale(void)
+{
+    SOCKET *listeners = NULL;
+    SOCKET *clients = NULL;
+    SOCKET *accepted = NULL;
+    struct epoll_event *events = NULL;
+    unsigned char *seen = NULL;
+    struct epoll_event event;
+    int epfd_owner = -1;
+    int epfd_peer = -1;
+    ULONGLONG bulk_deadline = 0;
+    size_t pair_count = 0;
+    size_t released_index = EXCLUSIVE_SCALE_REGISTRATIONS / 2;
+    size_t seen_count = 0;
+    size_t i;
+    int result = 1;
+
+    listeners = (SOCKET *)malloc(
+        EXCLUSIVE_SCALE_REGISTRATIONS * sizeof(*listeners));
+    clients = (SOCKET *)malloc(
+        EXCLUSIVE_SCALE_REGISTRATIONS * sizeof(*clients));
+    accepted = (SOCKET *)malloc(
+        EXCLUSIVE_SCALE_REGISTRATIONS * sizeof(*accepted));
+    events = (struct epoll_event *)calloc(
+        EXCLUSIVE_SCALE_REGISTRATIONS, sizeof(*events));
+    seen = (unsigned char *)calloc(EXCLUSIVE_SCALE_REGISTRATIONS,
+                                   sizeof(*seen));
+    if (listeners == NULL || clients == NULL || accepted == NULL ||
+        events == NULL || seen == NULL) {
+        fputs("exclusive-scale: allocation failed\n", stderr);
+        goto done;
+    }
+    for (i = 0; i < EXCLUSIVE_SCALE_REGISTRATIONS; i++) {
+        listeners[i] = INVALID_SOCKET;
+        clients[i] = INVALID_SOCKET;
+        accepted[i] = INVALID_SOCKET;
+    }
+
+    epfd_owner = epoll_create1(0);
+    if (epfd_owner < 0) {
+        fprintf(stderr, "exclusive-scale: owner create failed errno=%d\n",
+                errno);
+        goto done;
+    }
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLET | EPOLLEXCLUSIVE;
+    for (i = 0; i < EXCLUSIVE_SCALE_REGISTRATIONS; i++) {
+        if (make_loopback_pair(&listeners[i], &clients[i], &accepted[i]) !=
+            0) {
+            fprintf(stderr, "exclusive-scale: pair %u setup failed WSA=%d\n",
+                    (unsigned)i, WSAGetLastError());
+            goto done;
+        }
+        pair_count = i + 1;
+        event.data.u64 = (uint64_t)i + 1;
+        if (epoll_ctl(epfd_owner, EPOLL_CTL_ADD, accepted[i], &event) != 0) {
+            fprintf(stderr, "exclusive-scale: owner ADD %u failed errno=%d\n",
+                    (unsigned)i, errno);
+            goto done;
+        }
+        if (send(clients[i], "x", 1, 0) != 1) {
+            fprintf(stderr, "exclusive-scale: send %u failed WSA=%d\n",
+                    (unsigned)i, WSAGetLastError());
+            goto done;
+        }
+    }
+
+    while (seen_count < EXCLUSIVE_SCALE_REGISTRATIONS) {
+        int n = epoll_wait(epfd_owner, events,
+                           EXCLUSIVE_SCALE_REGISTRATIONS, 2000);
+        int j;
+
+        if (n <= 0) {
+            fprintf(stderr,
+                    "exclusive-scale: owner drain stopped at %u n=%d "
+                    "errno=%d\n",
+                    (unsigned)seen_count, n, errno);
+            goto done;
+        }
+        for (j = 0; j < n; j++) {
+            uint64_t token = events[j].data.u64;
+            size_t index;
+
+            if (token == 0 || token > EXCLUSIVE_SCALE_REGISTRATIONS ||
+                (events[j].events & EPOLLIN) == 0) {
+                fprintf(stderr,
+                        "exclusive-scale: invalid owner event token=%llu "
+                        "events=%u\n",
+                        (unsigned long long)token, events[j].events);
+                goto done;
+            }
+            index = (size_t)(token - 1);
+            if (seen[index]) {
+                fprintf(stderr,
+                        "exclusive-scale: duplicate owner edge token=%llu\n",
+                        (unsigned long long)token);
+                goto done;
+            }
+            seen[index] = 1;
+            seen_count++;
+        }
+    }
+
+    /* Every unread socket now has an independently held read claim.  The old
+     * fixed 128-slot table failed open for at least one of these 129 bases,
+     * allowing a second port to report the same exclusive readiness. */
+    epfd_peer = epoll_create1(0);
+    if (epfd_peer < 0) {
+        fprintf(stderr, "exclusive-scale: peer create failed errno=%d\n",
+                errno);
+        goto done;
+    }
+    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    for (i = 0; i < EXCLUSIVE_SCALE_REGISTRATIONS; i++) {
+        event.data.u64 = (uint64_t)i + 1;
+        if (epoll_ctl(epfd_peer, EPOLL_CTL_ADD, accepted[i], &event) != 0) {
+            fprintf(stderr, "exclusive-scale: peer ADD %u failed errno=%d\n",
+                    (unsigned)i, errno);
+            goto done;
+        }
+    }
+    {
+        int n = epoll_wait(epfd_peer, events,
+                           EXCLUSIVE_SCALE_REGISTRATIONS, 500);
+
+        if (n != 0) {
+            fprintf(stderr,
+                    "exclusive-scale: peer observed duplicate readiness "
+                    "n=%d token=%llu events=%u errno=%d\n",
+                    n,
+                    n > 0 ? (unsigned long long)events[0].data.u64 : 0ULL,
+                    n > 0 ? events[0].events : 0U, errno);
+            goto done;
+        }
+    }
+
+    /* Releasing one owner must make exactly that still-readable base
+     * available to the peer.  Removing the peer registration afterward keeps
+     * the bulk-release check below free of level-triggered redelivery. */
+    if (epoll_ctl(epfd_owner, EPOLL_CTL_DEL, accepted[released_index], NULL) !=
+        0) {
+        fprintf(stderr, "exclusive-scale: owner DEL failed errno=%d\n",
+                errno);
+        goto done;
+    }
+    {
+        int n = epoll_wait(epfd_peer, events,
+                           EXCLUSIVE_SCALE_REGISTRATIONS, 1000);
+        uint64_t expected = (uint64_t)released_index + 1;
+
+        if (n != 1 || events[0].data.u64 != expected ||
+            (events[0].events & EPOLLIN) == 0) {
+            fprintf(stderr,
+                    "exclusive-scale: single release n=%d token=%llu "
+                    "expected=%llu events=%u errno=%d\n",
+                    n, n > 0 ? (unsigned long long)events[0].data.u64 : 0ULL,
+                    (unsigned long long)expected,
+                    n > 0 ? events[0].events : 0U, errno);
+            goto done;
+        }
+    }
+    if (epoll_ctl(epfd_peer, EPOLL_CTL_DEL, accepted[released_index], NULL) !=
+        0) {
+        fprintf(stderr, "exclusive-scale: peer DEL failed errno=%d\n",
+                errno);
+        goto done;
+    }
+
+    if (wepoll_close(epfd_owner) != 0) {
+        fprintf(stderr, "exclusive-scale: owner close failed errno=%d\n",
+                errno);
+        goto done;
+    }
+    epfd_owner = -1;
+    memset(seen, 0, EXCLUSIVE_SCALE_REGISTRATIONS * sizeof(*seen));
+    seen_count = 0;
+    bulk_deadline = GetTickCount64() + 5000;
+    while (seen_count + 1 < EXCLUSIVE_SCALE_REGISTRATIONS) {
+        ULONGLONG now = GetTickCount64();
+        int timeout_ms;
+
+        if (now >= bulk_deadline) {
+            break;
+        }
+        timeout_ms = (int)(bulk_deadline - now);
+        int n = epoll_wait(epfd_peer, events,
+                           EXCLUSIVE_SCALE_REGISTRATIONS, timeout_ms);
+        int j;
+
+        if (n <= 0) {
+            fprintf(stderr,
+                    "exclusive-scale: bulk release stopped at %u n=%d "
+                    "errno=%d\n",
+                    (unsigned)seen_count, n, errno);
+            goto done;
+        }
+        for (j = 0; j < n; j++) {
+            uint64_t token = events[j].data.u64;
+            size_t index;
+
+            if (token == 0 || token > EXCLUSIVE_SCALE_REGISTRATIONS ||
+                (events[j].events & EPOLLIN) == 0) {
+                fprintf(stderr,
+                        "exclusive-scale: invalid bulk event token=%llu "
+                        "events=%u\n",
+                        (unsigned long long)token, events[j].events);
+                goto done;
+            }
+            index = (size_t)(token - 1);
+            if (index == released_index) {
+                fprintf(stderr,
+                        "exclusive-scale: deleted peer token redelivered\n");
+                goto done;
+            }
+            if (!seen[index]) {
+                if (epoll_ctl(epfd_peer, EPOLL_CTL_DEL, accepted[index],
+                              NULL) != 0) {
+                    fprintf(stderr,
+                            "exclusive-scale: bulk peer DEL token=%llu "
+                            "failed errno=%d\n",
+                            (unsigned long long)token, errno);
+                    goto done;
+                }
+                seen[index] = 1;
+                seen_count++;
+            }
+        }
+    }
+    if (seen_count + 1 != EXCLUSIVE_SCALE_REGISTRATIONS) {
+        fprintf(stderr,
+                "exclusive-scale: bulk release delivered only %u bases\n",
+                (unsigned)seen_count);
+        goto done;
+    }
+
+    puts("exclusive-scale: 129 concurrent claims and release lifecycle OK");
+    result = 0;
+
+done:
+    if (epfd_peer >= 0) (void)wepoll_close(epfd_peer);
+    if (epfd_owner >= 0) (void)wepoll_close(epfd_owner);
+    if (accepted != NULL) {
+        for (i = 0; i < pair_count; i++) {
+            if (accepted[i] != INVALID_SOCKET) closesocket(accepted[i]);
+        }
+    }
+    if (clients != NULL) {
+        for (i = 0; i < pair_count; i++) {
+            if (clients[i] != INVALID_SOCKET) closesocket(clients[i]);
+        }
+    }
+    if (listeners != NULL) {
+        for (i = 0; i < pair_count; i++) {
+            if (listeners[i] != INVALID_SOCKET) closesocket(listeners[i]);
+        }
+    }
+    free(seen);
+    free(events);
+    free(accepted);
+    free(clients);
+    free(listeners);
+    return result;
+}
+
 static int test_exclusive_invalid_combos(void)
 {
     SOCKET listener = INVALID_SOCKET;
@@ -715,6 +983,8 @@ static int run_mode(const char *mode)
         return test_exclusive_two_cycles(1);
     if (strcmp(mode, "exclusive-disjoint") == 0)
         return test_exclusive_disjoint_classes();
+    if (strcmp(mode, "exclusive-scale") == 0)
+        return test_exclusive_scale();
     if (strcmp(mode, "exclusive-invalid") == 0)
         return test_exclusive_invalid_combos();
     if (strcmp(mode, "pwait-sigmask") == 0)
@@ -731,8 +1001,8 @@ int main(int argc, char **argv)
     int failures = 0;
     const char *modes[] = {
         "readable", "writable", "exclusive-mod", "exclusive-wake",
-        "exclusive-et", "exclusive-disjoint", "exclusive-invalid",
-        "pwait-sigmask", "wakeup-flag"
+        "exclusive-et", "exclusive-disjoint", "exclusive-scale",
+        "exclusive-invalid", "pwait-sigmask", "wakeup-flag"
     };
     size_t i;
 

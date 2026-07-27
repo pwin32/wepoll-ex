@@ -15,6 +15,26 @@
 #define SIO_BASE_HANDLE 0x48000022
 #endif
 
+typedef struct fault_wait_context {
+    int epfd;
+    HANDLE started;
+    int result;
+    int error;
+} fault_wait_context_t;
+
+static DWORD WINAPI fault_wait_thread(void *parameter)
+{
+    fault_wait_context_t *context = (fault_wait_context_t *)parameter;
+    struct epoll_event event;
+
+    memset(&event, 0, sizeof(event));
+    (void)SetEvent(context->started);
+    errno = 0;
+    context->result = epoll_wait(context->epfd, &event, 1, -1);
+    context->error = errno;
+    return 0;
+}
+
 static int test_framework(void)
 {
     ep_fault_reset();
@@ -620,6 +640,204 @@ cleanup:
     return result;
 }
 
+static int test_aux_closed_iocp_retire(void)
+{
+    HANDLE event_handle = NULL;
+    struct epoll_event event;
+    wepoll_ex_global_stats before = {0};
+    wepoll_ex_global_stats after = {0};
+    int epfd = -1;
+    int result = -1;
+
+    ep_fault_reset();
+    event_handle = CreateEventW(NULL, TRUE, FALSE, NULL);
+    epfd = epoll_create1(0);
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (event_handle == NULL || epfd < 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)event_handle, &event) != 0 ||
+        epoll_wait(epfd, &event, 1, 0) != 0 ||
+        wepoll_ex_get_global_stats(&before, sizeof(before)) != 0 ||
+        ep_fault_configure(EP_FAULT_IOCP_POST, 1, EIO) != 0) {
+        goto cleanup;
+    }
+
+    if (wepoll_close(epfd) != 0) {
+        epfd = -1;
+        goto cleanup;
+    }
+    epfd = -1;
+    if (ep_fault_hits(EP_FAULT_IOCP_POST) != 1 ||
+        wepoll_ex_get_global_stats(&after, sizeof(after)) != 0 ||
+        after.quarantined_ports != before.quarantined_ports ||
+        after.active_quarantines != before.active_quarantines ||
+        after.irrecoverable_ports != before.irrecoverable_ports) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (epfd >= 0 && wepoll_close(epfd) != 0) result = -1;
+    if (event_handle != NULL) CloseHandle(event_handle);
+    return result;
+}
+
+static int test_aux_post_failure(void)
+{
+    fault_wait_context_t context;
+    HANDLE event_handle = NULL;
+    HANDLE thread = NULL;
+    struct epoll_event event;
+    wepoll_ex_stats stats = {0};
+    ULONGLONG deadline;
+    int epfd = -1;
+    int result = -1;
+
+    memset(&context, 0, sizeof(context));
+    context.epfd = -1;
+    context.result = 1;
+    context.started = CreateEventW(NULL, TRUE, FALSE, NULL);
+    event_handle = CreateEventW(NULL, TRUE, FALSE, NULL);
+    epfd = epoll_create1(0);
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (context.started == NULL || event_handle == NULL || epfd < 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)event_handle, &event) != 0 ||
+        ep_fault_configure(EP_FAULT_AUX_POST, 1, EIO) != 0) {
+        goto cleanup;
+    }
+
+    context.epfd = epfd;
+    thread = CreateThread(NULL, 0, fault_wait_thread, &context, 0, NULL);
+    if (thread == NULL ||
+        WaitForSingleObject(context.started, 2000) != WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+    deadline = GetTickCount64() + 2000;
+    do {
+        if (wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0) {
+            goto cleanup;
+        }
+        if (stats.pending_polls == 1) break;
+        Sleep(1);
+    } while (GetTickCount64() < deadline);
+    if (stats.pending_polls != 1 || !SetEvent(event_handle) ||
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0 ||
+        context.result != -1 || context.error != EIO ||
+        ep_fault_hits(EP_FAULT_AUX_POST) != 1) {
+        goto cleanup;
+    }
+
+    ep_fault_reset();
+    if (wepoll_close(epfd) != 0) {
+        epfd = -1;
+        goto cleanup;
+    }
+    epfd = -1;
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (epfd >= 0) {
+        if (wepoll_close(epfd) != 0) result = -1;
+        epfd = -1;
+    }
+    if (thread != NULL &&
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0) {
+        (void)TerminateThread(thread, 1);
+        result = -1;
+    }
+    if (thread != NULL) CloseHandle(thread);
+    if (event_handle != NULL) CloseHandle(event_handle);
+    if (context.started != NULL) CloseHandle(context.started);
+    return result;
+}
+
+static int test_aux_post_immediate_failure(void)
+{
+    fault_wait_context_t context;
+    HANDLE pending_event = NULL;
+    HANDLE signaled_event = NULL;
+    HANDLE thread = NULL;
+    struct epoll_event event;
+    wepoll_ex_stats stats = {0};
+    ULONGLONG deadline;
+    int epfd = -1;
+    int result = -1;
+
+    memset(&context, 0, sizeof(context));
+    context.epfd = -1;
+    context.result = 1;
+    ep_fault_reset();
+    context.started = CreateEventW(NULL, TRUE, FALSE, NULL);
+    pending_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    signaled_event = CreateEventW(NULL, TRUE, TRUE, NULL);
+    epfd = epoll_create1(0);
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (context.started == NULL || pending_event == NULL ||
+        signaled_event == NULL || epfd < 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)pending_event, &event) != 0) {
+        goto cleanup;
+    }
+
+    context.epfd = epfd;
+    thread = CreateThread(NULL, 0, fault_wait_thread, &context, 0, NULL);
+    if (thread == NULL ||
+        WaitForSingleObject(context.started, 2000) != WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+    deadline = GetTickCount64() + 2000;
+    do {
+        if (wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0) {
+            goto cleanup;
+        }
+        if (stats.pending_polls == 1) break;
+        Sleep(1);
+    } while (GetTickCount64() < deadline);
+    if (stats.pending_polls != 1 ||
+        ep_fault_configure(EP_FAULT_AUX_POST, 1, EIO) != 0) {
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)signaled_event, &event) != -1 ||
+        errno != EIO || ep_fault_hits(EP_FAULT_AUX_POST) != 1 ||
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0 ||
+        context.result != -1 || context.error != EIO) {
+        goto cleanup;
+    }
+    ep_fault_reset();
+    if (wepoll_close(epfd) != 0) {
+        epfd = -1;
+        goto cleanup;
+    }
+    epfd = -1;
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (epfd >= 0) {
+        if (wepoll_close(epfd) != 0) result = -1;
+        epfd = -1;
+    }
+    if (thread != NULL &&
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0) {
+        (void)TerminateThread(thread, 1);
+        result = -1;
+    }
+    if (thread != NULL) CloseHandle(thread);
+    if (signaled_event != NULL) CloseHandle(signaled_event);
+    if (pending_event != NULL) CloseHandle(pending_event);
+    if (context.started != NULL) CloseHandle(context.started);
+    return result;
+}
+
 static int test_ready_node_alloc(void)
 {
     static const char first_byte = 'a';
@@ -771,6 +989,51 @@ cleanup:
     return result;
 }
 
+static int test_aux_consumptive_disarm(void)
+{
+    HANDLE event_handle = NULL;
+    struct epoll_event event;
+    wepoll_ex_stats stats = {0};
+    int epfd = -1;
+    int result = -1;
+
+    ep_fault_reset();
+    event_handle = CreateEventW(NULL, FALSE, FALSE, NULL);
+    epfd = epoll_create1(0);
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (event_handle == NULL || epfd < 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)event_handle, &event) != 0 ||
+        epoll_wait(epfd, &event, 1, 0) != 0 ||
+        ep_fault_configure(EP_FAULT_AUX_DISARM, 1, EBUSY) != 0 ||
+        !SetEvent(event_handle)) {
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (epoll_wait(epfd, &event, 1, 1000) != -1 || errno != EBUSY ||
+        ep_fault_hits(EP_FAULT_AUX_DISARM) != 1 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.active_registrations != 1 || stats.pending_polls != 1 ||
+        stats.rearm_queue_depth != 1) {
+        goto cleanup;
+    }
+    if (epoll_wait(epfd, &event, 1, 1000) != 1 ||
+        (event.events & EPOLLIN) == 0 ||
+        ep_fault_hits(EP_FAULT_AUX_DISARM) != 2 ||
+        epoll_wait(epfd, &event, 1, 50) != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (epfd >= 0 && wepoll_close(epfd) != 0) result = -1;
+    if (event_handle != NULL) CloseHandle(event_handle);
+    return result;
+}
+
 static int test_aux_pipe_disarm(void)
 {
     HANDLE read_handle = NULL;
@@ -841,9 +1104,13 @@ static const fault_test_case_t g_tests[] = {
     { "iocp-create", test_iocp_create },
     { "iocp-post", test_iocp_post },
     { "iocp-dequeue", test_iocp_dequeue },
+    { "aux-closed-iocp", test_aux_closed_iocp_retire },
+    { "aux-post", test_aux_post_failure },
+    { "aux-post-immediate", test_aux_post_immediate_failure },
     { "ready-node-alloc", test_ready_node_alloc },
     { "aux-waitable-disarm", test_aux_waitable_disarm },
     { "aux-waitable-disarm-repeat", test_aux_waitable_disarm_repeat },
+    { "aux-consumptive-disarm", test_aux_consumptive_disarm },
     { "aux-pipe-disarm", test_aux_pipe_disarm }
 };
 
@@ -881,8 +1148,10 @@ int main(int argc, char **argv)
             "usage: %s [all|framework|pool-init|pool-grow|provider-base|"
             "afd-open|afd-submit|afd-cancel|endpoint-identity|"
             "endpoint-policy|iocp-create|iocp-post|iocp-dequeue|"
-            "ready-node-alloc|aux-waitable-disarm|"
-            "aux-waitable-disarm-repeat|aux-pipe-disarm]\n",
+            "aux-closed-iocp|aux-post|aux-post-immediate|ready-node-alloc|"
+            "aux-waitable-disarm|"
+            "aux-waitable-disarm-repeat|aux-consumptive-disarm|"
+            "aux-pipe-disarm]\n",
             argv[0]);
     return 2;
 }

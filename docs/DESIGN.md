@@ -67,11 +67,14 @@ into that disposable nginx build.
    path. Ready snapshots already in the queue are returned first; the pending
    error is reported by the next wait. Only the first currently pending error
    is returned, while the statistics counter records every occurrence.
-5. DEL and close remove public lookup immediately, cancel pending AFD work,
-   and retain `ep_sock_t` storage until its cancellation completion is
-   consumed. Hardened submissions re-resolve the provider base before each
-   request. In synchronized lifetime mode, the base captured at ADD is reused
-   for rearms. When the provider exposes a stable
+5. DEL and close remove public lookup immediately. Pending AFD requests and
+   auxiliary registrations with an already-posted IOCP packet retain
+   `ep_sock_t` storage until completion is consumed. Blocking auxiliary disarm
+   retires immediately when no packet was posted, balancing pending accounting
+   without manufacturing a cancellation packet. Hardened submissions
+   re-resolve the provider base before each request. In synchronized lifetime
+   mode, the base captured at ADD is reused for rearms. When the provider
+   exposes a stable
    WFP ALE endpoint token, a native close followed by immediate numeric
    `SOCKET` reuse retires the old registration before ADD/MOD/rearm can attach
    stale data to the replacement.
@@ -83,8 +86,12 @@ into that disposable nginx build.
    usable, a detached reaper owns the quarantined port for up to 60 seconds.
    A successful late drain frees it. An unusable IOCP, reaper failure, or
    second drain failure closes reachable handles and intentionally leaves the
-   remaining storage unreachable rather than risking use-after-free. A failed
-   close has still consumed the epfd and must not be retried.
+   remaining storage unreachable rather than risking use-after-free. Callback
+   and control posts hold a per-port IOCP lease; close revokes the posting alias
+   before `CloseHandle`, preventing a late callback from targeting a reused
+   numeric HANDLE. An unexpected post failure closes the IOCP to wake blocked
+   waiters and latches the original error. A failed close has still consumed
+   the epfd and must not be retried.
 
 The ready queue is single-consumer MPSC. Producers append without a mutex; the
 consumer uses a sentinel before reclaiming nodes. Both AFD-buffer pools use a
@@ -143,7 +150,10 @@ optional heap event buffer and metadata reference before unwinding.
   retire the one-shot wait before registration storage can be reclaimed. If
   retirement fails, the registration and pending count remain pinned, the
   error is surfaced asynchronously, and a later wait/DEL/close retries; a
-  persistent close-time failure follows the existing quarantine path.
+  persistent close-time failure follows the existing quarantine path. A
+  consumed auto-reset event, semaphore count, or mode-unknown notification is
+  preserved across that retry. Successful retry re-posts the observation
+  rather than probing an object whose state may already have been consumed.
   Manual-reset events and process/thread termination provide persistent
   level behavior. Manual-reset event ET uses throttled reset detection;
   process/thread termination is monotonic, so its delivered ET registration
@@ -218,8 +228,11 @@ optional heap event buffer and metadata reference before unwinding.
   write, and terminal readiness classes independently and removes only the
   conflicting classes from mixed snapshots. A covering AFD submission that
   returns `STATUS_PENDING`, or a zero-time sample proving one direction
-  inactive, releases the corresponding class claims. The secondary claim table
-  is bounded and fails open rather than dropping readiness if exhausted.
+  inactive, releases the corresponding class claims. Each live registration
+  embeds one intrusive claim node whose class bitset is indexed through fixed
+  hash buckets. Claim capacity therefore grows with registrations and the
+  delivery path does not allocate or fail open, while one process-wide mutex
+  serializes cross-port ownership changes.
 - The nginx adapter leaves `ngx_event_actions.notify` unset. nginx 1.31.3
   rejects `--with-threads` on Win32 and its thread-pool sources are POSIX-only,
   so thread-pool integration is outside this prototype's supported boundary.
@@ -245,8 +258,11 @@ optional heap event buffer and metadata reference before unwinding.
   stopping once a 10 ms wall-clock budget expires. Readiness found during that
   drain is returned even at the budget boundary. The combined minimum and
   deadline avoid both shallow batch limits and an unbounded nonblocking loop.
-- Cancelled registrations remain internally allocated until a wait or close
-  drains their IOCP completion, although they are absent from public lookup.
+- Cancelled AFD registrations and auxiliary registrations with an already-
+  posted packet remain internally allocated until a wait or close drains their
+  IOCP completion, although they are absent from public lookup. An auxiliary
+  registration whose blocking disarm finds no posted packet retires and
+  balances its pending count immediately.
 - Concurrent finite waits include time spent waiting for the single-consumer
   drain lock. A zero-timeout call may return no events while another waiter is
   draining them.
@@ -268,8 +284,8 @@ optional heap event buffer and metadata reference before unwinding.
 ## Verification baseline
 
 On July 27, 2026, strict MinGW GCC 15.2 with
-`-O2 -Wall -Wextra -Wpedantic -Werror` completed 99 combined best-effort, 98
-static-only, 52 shared-only, 99 strict-identity, and 99 synchronized-lifetime
+`-O2 -Wall -Wextra -Wpedantic -Werror` completed 107 combined best-effort, 106
+static-only, 54 shared-only, 107 strict-identity, and 107 synchronized-lifetime
 CTest entries. The combined/static/strict/synchronized lanes had the expected
 environment-dependent UDP/ICMP skip; synchronized mode also skipped the four
 native-reuse identity cases owned by its DEL-before-close contract. Repeated
@@ -281,8 +297,10 @@ API/pool runs, and ASan/UBSan CTest 3/3. Clang 19.1.7 strict Release also passed
 3/3. Coverage includes socket ET/exclusive read, write, mixed-class, and stale
 snapshot transitions; direction-aware pipe adapters; waitable terminal ET and
 pending/queued MOD races; consumptive notification counts; auxiliary-disarm
-fault recovery; provider identity modes; cancellation/close/quarantine;
-packaging; and static-winpthread dependency checks. `scripts/qualify-posix.sh`,
+fault recovery and preserved consumptive retries; immediate auxiliary
+cancellation reclamation; IOCP post/close lease races and fatal-post wakeups;
+provider identity modes; cancellation/close/quarantine; packaging; and
+static-winpthread dependency checks. `scripts/qualify-posix.sh`,
 `scripts/qualify-mingw.sh`, CMake presets, and `scripts/repeat-ctest.sh` make
 those lanes reproducible.
 

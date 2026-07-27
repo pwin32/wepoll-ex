@@ -28,27 +28,26 @@ static _Atomic uint64_t g_quarantined_ports;
  * cancels peer polls when it can, but already-queued completions can still
  * race.  Claim each provider base/readiness class for one exclusive owner
  * while its reported AFD level remains active.  A later STATUS_PENDING
- * submission that covers a claimed class proves quiescence and releases it. */
-#define EP_EXCLUSIVE_CLAIM_SLOTS 128
+ * submission that covers a claimed class proves quiescence and releases it.
+ *
+ * Each live registration supplies its own intrusive claim node, so claim
+ * capacity grows with registrations and delivery never needs to allocate.
+ * Fixed hash buckets partition lookup work without bounding the number of
+ * claims; one process-wide mutex serializes ownership across independent
+ * ports. */
+#define EP_EXCLUSIVE_CLAIM_BUCKETS 128U
 #define EP_EXCLUSIVE_CLASS_READ      UINT8_C(0x01)
 #define EP_EXCLUSIVE_CLASS_WRITE     UINT8_C(0x02)
 #define EP_EXCLUSIVE_CLASS_TERMINAL  UINT8_C(0x04)
-typedef struct ep_exclusive_claim {
-    SOCKET base;
-    ep_sock_t *owner;
-    uint32_t afd_events;
-    uint8_t readiness_class;
-    uint8_t held;
-} ep_exclusive_claim_t;
-static ep_exclusive_claim_t g_exclusive_claims[EP_EXCLUSIVE_CLAIM_SLOTS];
+static ep_sock_t *g_exclusive_claim_buckets[EP_EXCLUSIVE_CLAIM_BUCKETS];
 static pthread_mutex_t g_exclusive_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static unsigned ep_exclusive_slot(SOCKET base)
+static unsigned ep_exclusive_bucket(SOCKET base)
 {
     uintptr_t value = (uintptr_t)base;
     value ^= value >> 17;
     value *= UINT64_C(0x9e3779b97f4a7c15);
-    return (unsigned)(value % EP_EXCLUSIVE_CLAIM_SLOTS);
+    return (unsigned)(value % EP_EXCLUSIVE_CLAIM_BUCKETS);
 }
 
 static uint8_t ep_exclusive_classes(uint32_t delivered)
@@ -97,13 +96,89 @@ static void ep_exclusive_filter_classes(uint32_t *delivered,
     }
 }
 
-static void ep_exclusive_claim_clear(ep_exclusive_claim_t *claim)
+static void ep_exclusive_unlink_locked(ep_sock_t *sock)
 {
-    claim->held = 0;
-    claim->base = INVALID_SOCKET;
-    claim->owner = NULL;
-    claim->afd_events = 0;
-    claim->readiness_class = 0;
+    unsigned bucket;
+
+    if (sock->exclusive_claim_classes == 0) {
+        assert(sock->exclusive_next == NULL);
+        assert(sock->exclusive_prev == NULL);
+        return;
+    }
+
+    bucket = ep_exclusive_bucket(sock->exclusive_claim_base);
+    if (sock->exclusive_prev != NULL) {
+        sock->exclusive_prev->exclusive_next = sock->exclusive_next;
+    } else {
+        assert(g_exclusive_claim_buckets[bucket] == sock);
+        g_exclusive_claim_buckets[bucket] = sock->exclusive_next;
+    }
+    if (sock->exclusive_next != NULL) {
+        sock->exclusive_next->exclusive_prev = sock->exclusive_prev;
+    }
+    sock->exclusive_next = NULL;
+    sock->exclusive_prev = NULL;
+    sock->exclusive_claim_base = INVALID_SOCKET;
+    sock->exclusive_claim_classes = 0;
+}
+
+static void ep_exclusive_remove_classes_locked(ep_sock_t *sock,
+                                                uint8_t classes)
+{
+    uint8_t remaining;
+
+    if ((sock->exclusive_claim_classes & classes) == 0) {
+        return;
+    }
+    remaining = sock->exclusive_claim_classes & (uint8_t)~classes;
+    if (remaining == 0) {
+        ep_exclusive_unlink_locked(sock);
+    } else {
+        sock->exclusive_claim_classes = remaining;
+    }
+}
+
+static void ep_exclusive_add_classes_locked(ep_sock_t *sock, SOCKET base,
+                                             uint8_t classes)
+{
+    unsigned bucket;
+
+    if (classes == 0) {
+        return;
+    }
+    if (sock->exclusive_claim_classes != 0 &&
+        sock->exclusive_claim_base != base) {
+        ep_exclusive_unlink_locked(sock);
+    }
+    if (sock->exclusive_claim_classes == 0) {
+        ep_sock_t *head;
+
+        bucket = ep_exclusive_bucket(base);
+        head = g_exclusive_claim_buckets[bucket];
+        sock->exclusive_claim_base = base;
+        sock->exclusive_prev = NULL;
+        sock->exclusive_next = head;
+        if (head != NULL) {
+            head->exclusive_prev = sock;
+        }
+        g_exclusive_claim_buckets[bucket] = sock;
+    }
+    sock->exclusive_claim_classes |= classes;
+}
+
+static uint8_t ep_exclusive_quiescent_classes(uint32_t submitted_afd_events)
+{
+    uint8_t classes = 0;
+
+    for (uint8_t bit = EP_EXCLUSIVE_CLASS_READ;
+         bit <= EP_EXCLUSIVE_CLASS_TERMINAL; bit <<= 1) {
+        uint32_t class_events = ep_exclusive_class_afd_events(bit);
+
+        if ((class_events & ~submitted_afd_events) == 0) {
+            classes |= bit;
+        }
+    }
+    return classes;
 }
 
 static int ep_exclusive_try_claim(ep_sock_t *sock, uint32_t *delivered)
@@ -116,36 +191,31 @@ static int ep_exclusive_try_claim(ep_sock_t *sock, uint32_t *delivered)
     uint8_t missing_classes;
     int owner_terminal = 0;
     int peer_terminal = 0;
-    unsigned start = ep_exclusive_slot(base);
-    unsigned i;
-    int free_idx[3];
-    unsigned free_count = 0;
-    unsigned missing_count = 0;
+    unsigned bucket = ep_exclusive_bucket(base);
+    ep_sock_t *claim;
 
     pthread_mutex_lock(&g_exclusive_lock);
-    for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
-        unsigned idx = (start + i) % EP_EXCLUSIVE_CLAIM_SLOTS;
-        ep_exclusive_claim_t *claim = &g_exclusive_claims[idx];
+    if (sock->exclusive_claim_classes != 0 &&
+        sock->exclusive_claim_base != base) {
+        ep_exclusive_unlink_locked(sock);
+    }
+    for (claim = g_exclusive_claim_buckets[bucket]; claim != NULL;
+         claim = claim->exclusive_next) {
+        uint8_t claim_classes;
 
-        if (!claim->held) {
+        if (claim->exclusive_claim_base != base) {
             continue;
         }
-        if (claim->owner == sock && claim->base != base) {
-            ep_exclusive_claim_clear(claim);
-            continue;
-        }
-        if (claim->base != base) {
-            continue;
-        }
-        if (claim->owner == sock) {
-            owned_classes |= claim->readiness_class;
-            if (claim->readiness_class == EP_EXCLUSIVE_CLASS_TERMINAL) {
+        claim_classes = claim->exclusive_claim_classes;
+        if (claim == sock) {
+            owned_classes |= claim_classes;
+            if ((claim_classes & EP_EXCLUSIVE_CLASS_TERMINAL) != 0) {
                 owner_terminal = 1;
             }
-        } else if (claim->readiness_class == EP_EXCLUSIVE_CLASS_TERMINAL) {
+        } else if ((claim_classes & EP_EXCLUSIVE_CLASS_TERMINAL) != 0) {
             peer_terminal = 1;
         } else if ((requested_classes & EP_EXCLUSIVE_CLASS_TERMINAL) == 0) {
-            denied_classes |= claim->readiness_class & requested_classes;
+            denied_classes |= claim_classes & requested_classes;
         }
     }
 
@@ -156,24 +226,20 @@ static int ep_exclusive_try_claim(ep_sock_t *sock, uint32_t *delivered)
             /* The first terminal completion supersedes directional claims.
              * Clearing them under the global lock lets one owner win without
              * deadlocking read and write owners against each other. */
-            for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
-                ep_exclusive_claim_t *claim = &g_exclusive_claims[i];
+            claim = g_exclusive_claim_buckets[bucket];
+            while (claim != NULL) {
+                ep_sock_t *next = claim->exclusive_next;
 
-                if (claim->held && claim->base == base &&
-                    claim->readiness_class != EP_EXCLUSIVE_CLASS_TERMINAL) {
-                    ep_exclusive_claim_clear(claim);
+                if (claim->exclusive_claim_base == base) {
+                    ep_exclusive_remove_classes_locked(
+                        claim, EP_EXCLUSIVE_CLASS_READ |
+                                   EP_EXCLUSIVE_CLASS_WRITE);
                 }
+                claim = next;
             }
         }
     } else if (peer_terminal) {
         denied_classes = requested_classes;
-    }
-
-    for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
-        if (!g_exclusive_claims[i].held &&
-            free_count < sizeof(free_idx) / sizeof(free_idx[0])) {
-            free_idx[free_count++] = (int)i;
-        }
     }
 
     granted_classes = requested_classes & (uint8_t)~denied_classes;
@@ -189,34 +255,7 @@ static int ep_exclusive_try_claim(ep_sock_t *sock, uint32_t *delivered)
     } else {
         missing_classes = granted_classes & (uint8_t)~owned_classes;
     }
-
-    for (uint8_t bit = EP_EXCLUSIVE_CLASS_READ;
-         bit <= EP_EXCLUSIVE_CLASS_TERMINAL; bit <<= 1) {
-        if ((missing_classes & bit) != 0) {
-            missing_count++;
-        }
-    }
-    if (missing_count > free_count) {
-        ep_exclusive_filter_classes(delivered, denied_classes);
-        pthread_mutex_unlock(&g_exclusive_lock);
-        /* Table full: fail open and deliver rather than drop readiness. */
-        return 1;
-    }
-    missing_count = 0;
-    for (uint8_t bit = EP_EXCLUSIVE_CLASS_READ;
-         bit <= EP_EXCLUSIVE_CLASS_TERMINAL; bit <<= 1) {
-        ep_exclusive_claim_t *claim;
-
-        if ((missing_classes & bit) == 0) {
-            continue;
-        }
-        claim = &g_exclusive_claims[free_idx[missing_count++]];
-        claim->base = base;
-        claim->owner = sock;
-        claim->afd_events = ep_exclusive_class_afd_events(bit);
-        claim->readiness_class = bit;
-        claim->held = 1;
-    }
+    ep_exclusive_add_classes_locked(sock, base, missing_classes);
     ep_exclusive_filter_classes(delivered, denied_classes);
     pthread_mutex_unlock(&g_exclusive_lock);
     return 1;
@@ -229,32 +268,36 @@ static int ep_exclusive_try_claim(ep_sock_t *sock, uint32_t *delivered)
  */
 static void ep_exclusive_release_owner(ep_sock_t *sock)
 {
-    unsigned i;
-
     pthread_mutex_lock(&g_exclusive_lock);
-    for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
-        ep_exclusive_claim_t *claim = &g_exclusive_claims[i];
-        if (claim->held && claim->owner == sock) {
-            ep_exclusive_claim_clear(claim);
-        }
-    }
+    ep_exclusive_unlink_locked(sock);
     pthread_mutex_unlock(&g_exclusive_lock);
 }
 
 static void ep_exclusive_release_quiescent(ep_sock_t *sock,
                                            uint32_t submitted_afd_events)
 {
-    unsigned i;
+    SOCKET base = sock->base_socket;
+    uint8_t quiescent_classes =
+        ep_exclusive_quiescent_classes(submitted_afd_events);
+    unsigned bucket = ep_exclusive_bucket(base);
+    ep_sock_t *claim;
 
     pthread_mutex_lock(&g_exclusive_lock);
-    for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
-        ep_exclusive_claim_t *claim = &g_exclusive_claims[i];
+    if (sock->exclusive_claim_classes != 0 &&
+        sock->exclusive_claim_base != base) {
+        /* Claims are keyed by provider base.  Once a provider-chain refresh
+         * changes that key, no class on the previous base remains owned by
+         * this registration. */
+        ep_exclusive_unlink_locked(sock);
+    }
+    claim = g_exclusive_claim_buckets[bucket];
+    while (claim != NULL) {
+        ep_sock_t *next = claim->exclusive_next;
 
-        if (claim->held &&
-            (claim->owner == sock || claim->base == sock->base_socket) &&
-            (claim->afd_events & ~submitted_afd_events) == 0) {
-            ep_exclusive_claim_clear(claim);
+        if (claim->exclusive_claim_base == base) {
+            ep_exclusive_remove_classes_locked(claim, quiescent_classes);
         }
+        claim = next;
     }
     pthread_mutex_unlock(&g_exclusive_lock);
 }
@@ -262,31 +305,116 @@ static void ep_exclusive_release_quiescent(ep_sock_t *sock,
 static void ep_exclusive_release_inactive(ep_sock_t *sock,
                                           uint8_t inactive_classes)
 {
-    unsigned i;
+    SOCKET base = sock->base_socket;
+    unsigned bucket = ep_exclusive_bucket(base);
+    ep_sock_t *claim;
 
     pthread_mutex_lock(&g_exclusive_lock);
-    for (i = 0; i < EP_EXCLUSIVE_CLAIM_SLOTS; i++) {
-        ep_exclusive_claim_t *claim = &g_exclusive_claims[i];
+    if (sock->exclusive_claim_classes != 0 &&
+        sock->exclusive_claim_base != base) {
+        ep_exclusive_unlink_locked(sock);
+    }
+    claim = g_exclusive_claim_buckets[bucket];
+    while (claim != NULL) {
+        ep_sock_t *next = claim->exclusive_next;
 
-        if (claim->held && claim->base == sock->base_socket &&
-            (claim->readiness_class & inactive_classes) != 0) {
-            ep_exclusive_claim_clear(claim);
+        if (claim->exclusive_claim_base == base) {
+            ep_exclusive_remove_classes_locked(claim, inactive_classes);
         }
+        claim = next;
     }
     pthread_mutex_unlock(&g_exclusive_lock);
 }
 
 #ifdef _WIN32
+static int ep_port_post_iocp(ep_port_t *port, LPOVERLAPPED overlapped,
+                             ep_fault_point_t fault_point,
+                             DWORD *error_out)
+{
+    HANDLE handle;
+    DWORD error = ERROR_SUCCESS;
+    int posted = 0;
+
+    pthread_mutex_lock(&port->iocp_post_lock);
+    handle = port->iocp_post_handle;
+    if (handle == NULL) {
+        error = ERROR_INVALID_HANDLE;
+    } else if (ep_fault_hit(fault_point) != 0) {
+        error = ERROR_GEN_FAILURE;
+    } else if (port->post_queued_completion_status(
+                   handle, 0, 0, overlapped)) {
+        posted = 1;
+    } else {
+        error = GetLastError();
+        if (error == ERROR_SUCCESS) {
+            error = ERROR_GEN_FAILURE;
+        }
+    }
+    pthread_mutex_unlock(&port->iocp_post_lock);
+
+    if (!posted && error_out != NULL) {
+        *error_out = error;
+    }
+    return posted;
+}
+
+/* Revoke future posts and return the one HANDLE that this caller owns for
+ * closing.  The post lock is the lease: no callback can retain the old
+ * numeric HANDLE after this function publishes the revoked alias. */
+static HANDLE ep_port_revoke_iocp_posts(ep_port_t *port)
+{
+    HANDLE handle;
+    HANDLE close_handle = NULL;
+
+    pthread_mutex_lock(&port->iocp_post_lock);
+    handle = port->iocp_post_handle;
+    port->iocp_post_handle = NULL;
+    if (atomic_exchange_explicit(&port->iocp_closed, 1,
+                                 memory_order_acq_rel) == 0) {
+        close_handle = handle;
+    }
+    pthread_mutex_unlock(&port->iocp_post_lock);
+    return close_handle;
+}
+
+static void ep_port_fail_iocp_post(ep_port_t *port, DWORD win_error)
+{
+    HANDLE close_handle;
+    int error;
+    int expected = 0;
+
+    if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
+        return;
+    }
+    error = ep_winerr_to_errno(win_error);
+    if (error <= 0) error = EIO;
+    (void)atomic_compare_exchange_strong_explicit(
+        &port->iocp_post_error, &expected, error,
+        memory_order_release, memory_order_relaxed);
+    atomic_fetch_add_explicit(&port->iocp_post_failures, 1,
+                              memory_order_relaxed);
+    atomic_store_explicit(&port->closing, 1, memory_order_release);
+    close_handle = ep_port_revoke_iocp_posts(port);
+    if (close_handle != NULL) {
+        (void)CloseHandle(close_handle);
+    }
+}
+
 static int ep_aux_post_completion(ep_sock_t *sock, NTSTATUS status)
 {
+    DWORD error = ERROR_SUCCESS;
+
     sock->io_status_block.Status = status;
     sock->io_status_block.Information = 0;
     atomic_store_explicit(&sock->completion_posted, 1,
                           memory_order_release);
-    if (!PostQueuedCompletionStatus(sock->port->iocp, 0, 0,
-                                    (LPOVERLAPPED)&sock->io_status_block)) {
+    if (!ep_port_post_iocp(sock->port,
+                           (LPOVERLAPPED)&sock->io_status_block,
+                           EP_FAULT_AUX_POST, &error)) {
         atomic_store_explicit(&sock->completion_posted, 0,
                               memory_order_release);
+        ep_port_fail_iocp_post(sock->port, error);
+        SetLastError(error);
         return 0;
     }
     return 1;
@@ -673,10 +801,12 @@ static void ep_port_record_async_error_locked(ep_port_t *port, int error)
     port->async_error = error;
     if (!atomic_load_explicit(&port->closing, memory_order_acquire) &&
         !atomic_load_explicit(&port->waiter_active, memory_order_acquire) &&
-        port->iocp != NULL &&
         !atomic_load_explicit(&port->iocp_closed, memory_order_acquire)) {
-        if (ep_fault_hit(EP_FAULT_IOCP_POST) == 0) {
-            (void)PostQueuedCompletionStatus(port->iocp, 0, 0, NULL);
+        DWORD win_error = ERROR_SUCCESS;
+
+        if (!ep_port_post_iocp(port, NULL, EP_FAULT_IOCP_POST,
+                               &win_error)) {
+            ep_port_fail_iocp_post(port, win_error);
         }
     }
 }
@@ -687,6 +817,12 @@ static int ep_port_take_async_error_locked(ep_port_t *port)
 
     port->async_error = 0;
     return error;
+}
+
+static int ep_port_take_iocp_post_error(ep_port_t *port)
+{
+    return atomic_exchange_explicit(&port->iocp_post_error, 0,
+                                    memory_order_acq_rel);
 }
 
 void ep_get_global_stats(wepoll_ex_global_stats *stats)
@@ -733,7 +869,9 @@ int ep_port_get_stats(ep_port_t *port, wepoll_ex_stats *stats)
                               port->oneshot_probe_visits;
     stats->stale_events_dropped = port->stale_events_dropped;
     stats->identity_failures = port->identity_failures;
-    stats->asynchronous_errors = port->asynchronous_errors;
+    stats->asynchronous_errors = port->asynchronous_errors +
+        atomic_load_explicit(&port->iocp_post_failures,
+                             memory_order_relaxed);
     stats->zero_timeout_budget_hits = port->zero_timeout_budget_hits;
     pthread_mutex_unlock(&port->fd_table_lock);
 
@@ -1293,6 +1431,7 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
 
     sock->kind = EP_REG_SOCKET;
     sock->wait_registration = NULL;
+    sock->exclusive_claim_base = INVALID_SOCKET;
     sock->base_socket = ep_socket_get_base(fd);
     if (sock->base_socket == INVALID_SOCKET) {
         DWORD file_type;
@@ -1492,18 +1631,44 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
         poll_status == EP_POLL_PENDING && sock->needs_rearm) {
         int error;
 
-        if (ep_sock_cancel_locked(sock) == 0) {
-            /* The synthetic cancellation completion transitions to IDLE and
-             * invokes the ordinary rearm path. */
+        if (ep_sock_cancel_locked(sock) != 0) {
+            error = ep_last_err();
+            /* A repeated retirement failure makes this registration
+             * unusable. Detach it publicly but preserve storage and pending
+             * accounting for DEL/close-time recovery or quarantine. */
+            ep_sock_drop_closed_locked(port, sock);
+            ep_set_errno(error);
+            return -1;
+        }
+        poll_status = atomic_load_explicit(&sock->poll_status,
+                                           memory_order_relaxed);
+        if (poll_status != EP_POLL_IDLE) {
+            /* A readiness packet was already queued.  Its completion owns
+             * the accounting transition and ordinary rearm. */
             return 0;
         }
-        error = ep_last_err();
-        /* A repeated retirement failure makes this registration unusable.
-         * Detach it publicly but preserve storage and pending accounting for
-         * DEL/close-time recovery or quarantine. */
-        ep_sock_drop_closed_locked(port, sock);
-        ep_set_errno(error);
-        return -1;
+        /* begin_close publishes before waiting for fd_table_lock.  It may
+         * have raced the blocking auxiliary disarm above, so do not arm a new
+         * callback after close has started. */
+        if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
+            return 0;
+        }
+        if (sock->aux_consumed_pending) {
+            /* A one-shot wait consumed this signal/count before callback
+             * retirement failed.  Re-post the preserved observation instead
+             * of probing the now-unsignaled object and losing readiness. */
+            if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
+                ep_set_errno(ep_winerr_to_errno(GetLastError()));
+                return -1;
+            }
+            ep_sock_set_needs_rearm_locked(sock, 0);
+            atomic_store_explicit(&sock->poll_status, EP_POLL_PENDING,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&sock->state, EP_SOCK_POLLING,
+                                  memory_order_relaxed);
+            port->pending_poll_count++;
+            return 0;
+        }
     }
     if (poll_status != EP_POLL_IDLE) {
         return 0;
@@ -1652,6 +1817,28 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
     return 0;
 }
 
+static int ep_sock_complete_pending_locked(ep_sock_t *sock)
+{
+    ep_port_t *port = sock->port;
+    uint32_t poll_status =
+        atomic_load_explicit(&sock->poll_status, memory_order_relaxed);
+
+    if ((poll_status != EP_POLL_PENDING &&
+         poll_status != EP_POLL_CANCELLED) ||
+        port->pending_poll_count == 0) {
+        assert(!"pending poll accounting invariant violated");
+        atomic_store_explicit(&sock->poll_status, EP_POLL_IDLE,
+                              memory_order_relaxed);
+        ep_port_record_async_error_locked(port, EIO);
+        ep_set_errno(EIO);
+        return -1;
+    }
+    atomic_store_explicit(&sock->poll_status, EP_POLL_IDLE,
+                          memory_order_relaxed);
+    port->pending_poll_count--;
+    return 0;
+}
+
 static int ep_sock_cancel_locked(ep_sock_t *sock)
 {
     if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) !=
@@ -1666,15 +1853,33 @@ static int ep_sock_cancel_locked(ep_sock_t *sock)
         if (disarm_result != 0) {
             return -1;
         }
-        if (atomic_load_explicit(&sock->completion_posted,
-                                 memory_order_acquire) == 0 &&
-            !ep_aux_post_completion(sock, STATUS_CANCELLED)) {
-            ep_set_errno(ep_winerr_to_errno(GetLastError()));
-            return -1;
-        }
         sock->pending_events = 0;
-        atomic_store_explicit(&sock->poll_status, EP_POLL_CANCELLED,
-                              memory_order_relaxed);
+        if (atomic_load_explicit(&sock->completion_posted,
+                                 memory_order_acquire) != 0) {
+            /* The queued packet still owns the embedded status block.  Mark
+             * it cancelled so completion consumes the pending count without
+             * surfacing stale readiness. */
+            atomic_store_explicit(&sock->poll_status, EP_POLL_CANCELLED,
+                                  memory_order_relaxed);
+        } else {
+            /* Blocking disarm has joined any callback, and no successful
+             * post exists.  No external actor can now reference this
+             * registration, so retire it without manufacturing an IOCP
+             * packet that a future wait or close would have to consume. */
+            assert(sock->wait_registration == NULL);
+            assert(atomic_load_explicit(&sock->callback_active,
+                                        memory_order_relaxed) == 0);
+            if (ep_sock_complete_pending_locked(sock) != 0) {
+                return -1;
+            }
+            if (!atomic_load_explicit(&sock->delete_pending,
+                                      memory_order_relaxed) &&
+                !atomic_load_explicit(&sock->port->closing,
+                                      memory_order_acquire)) {
+                atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                      memory_order_relaxed);
+            }
+        }
         return 0;
     }
     if (ep_afd_cancel(sock) != 0) {
@@ -1829,17 +2034,34 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
             int error = ep_last_err();
 
             /* The dequeued packet is consumed, but the logical pending slot
-             * stays pinned until retirement succeeds and a synthetic
-             * cancellation completion completes the normal accounting
-             * transition. */
+             * stays pinned until retirement succeeds.  Preserve readiness
+             * that an auto-reset event, semaphore, or mode-unknown wait may
+             * already have consumed before this cleanup failure. */
             atomic_store_explicit(&sock->completion_posted, 0,
                                   memory_order_release);
+            if (old_poll_status == EP_POLL_PENDING && status >= 0 &&
+                sock->kind == EP_REG_WAITABLE &&
+                sock->waitable_semantics != EP_WAITABLE_PERSISTENT &&
+                sock->waitable_semantics != EP_WAITABLE_TERMINAL) {
+                sock->aux_consumed_pending = 1;
+            }
             ep_port_record_async_error_locked(port, error);
             if (atomic_load_explicit(&sock->delete_pending,
                                      memory_order_relaxed) ||
                 atomic_load_explicit(&port->closing,
                                      memory_order_acquire)) {
-                (void)ep_sock_cancel_locked(sock);
+                int cancel_result = ep_sock_cancel_locked(sock);
+
+                if (cancel_result == 0 &&
+                    atomic_load_explicit(&sock->poll_status,
+                                         memory_order_relaxed) ==
+                        EP_POLL_IDLE &&
+                    atomic_load_explicit(&sock->delete_pending,
+                                         memory_order_relaxed)) {
+                    ep_sock_free_locked(port, sock);
+                    pthread_mutex_unlock(&port->fd_table_lock);
+                    return;
+                }
             } else {
                 ep_sock_set_needs_rearm_locked(sock, 1);
             }
@@ -1848,11 +2070,15 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
         }
         atomic_store_explicit(&sock->completion_posted, 0,
                               memory_order_release);
+        sock->aux_consumed_pending = 0;
     }
-    atomic_store_explicit(&sock->poll_status, EP_POLL_IDLE,
-                          memory_order_relaxed);
-    if (port->pending_poll_count > 0) {
-        port->pending_poll_count--;
+    if (ep_sock_complete_pending_locked(sock) != 0) {
+        if (atomic_load_explicit(&sock->delete_pending,
+                                 memory_order_relaxed)) {
+            ep_sock_free_locked(port, sock);
+        }
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return;
     }
 
     if (atomic_load_explicit(&sock->delete_pending, memory_order_relaxed)) {
@@ -2058,6 +2284,7 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     size_t pool_capacity = WEPOLL_AFD_POOL_SIZE;
     int fd_lock_initialized = 0;
     int wait_lock_initialized = 0;
+    int iocp_post_lock_initialized = 0;
     int ready_initialized = 0;
     int afd_pool_initialized = 0;
     int node_pool_initialized = 0;
@@ -2089,6 +2316,12 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
         goto fail;
     }
     wait_lock_initialized = 1;
+    mutex_error = pthread_mutex_init(&port->iocp_post_lock, NULL);
+    if (mutex_error != 0) {
+        ep_set_errno(mutex_error);
+        goto fail;
+    }
+    iocp_post_lock_initialized = 1;
 
     ep_ready_init(&port->ready_queue);
     if (!port->ready_queue.initialized) {
@@ -2137,6 +2370,7 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
         goto fail;
     }
     port->get_queued_completion_status_ex = GetQueuedCompletionStatusEx;
+    port->post_queued_completion_status = PostQueuedCompletionStatus;
 
     if (ep_fault_hit(EP_FAULT_IOCP_CREATE) != 0) {
         goto fail;
@@ -2146,6 +2380,7 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
         ep_set_errno(ep_winerr_to_errno(GetLastError()));
         goto fail;
     }
+    port->iocp_post_handle = port->iocp;
     if (ep_afd_open(port->iocp, &port->afd) != 0) {
         goto fail;
     }
@@ -2154,6 +2389,8 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     atomic_init(&port->waiter_active, 0);
     atomic_init(&port->closing, 0);
     atomic_init(&port->iocp_closed, 0);
+    atomic_init(&port->iocp_post_error, 0);
+    atomic_init(&port->iocp_post_failures, 0);
     atomic_init(&port->generation, 0);
     port->close_drain_timeout_ms = EP_CLOSE_DRAIN_TIMEOUT_MS;
     port->quarantine_drain_timeout_ms = EP_QUARANTINE_DRAIN_TIMEOUT_MS;
@@ -2184,6 +2421,9 @@ fail:
         if (wait_lock_initialized) {
             pthread_mutex_destroy(&port->wait_lock);
         }
+        if (iocp_post_lock_initialized) {
+            pthread_mutex_destroy(&port->iocp_post_lock);
+        }
         if (fd_lock_initialized) {
             pthread_mutex_destroy(&port->fd_table_lock);
         }
@@ -2202,24 +2442,26 @@ void ep_port_begin_close(ep_port_t *port)
     }
     if (atomic_exchange_explicit(&port->closing, 1,
                                  memory_order_acq_rel) == 0) {
-        /* Async-error wakeups and the close wake use the same lock so no
-         * thread can post through a HANDLE after this path publishes it as
-         * closed. */
-        pthread_mutex_lock(&port->fd_table_lock);
-        if (port->iocp != NULL &&
-            (ep_fault_hit(EP_FAULT_IOCP_POST) != 0 ||
-             !PostQueuedCompletionStatus(port->iocp, 0, 0, NULL))) {
+        /* The post lock is a short HANDLE lease shared by callbacks and
+         * control/error wakeups.  Revoke the alias while holding it before
+         * closing a failed completion port; callbacks then fail without
+         * retaining a stale numeric HANDLE. */
+        pthread_mutex_lock(&port->iocp_post_lock);
+        if (port->iocp_post_handle == NULL ||
+            ep_fault_hit(EP_FAULT_IOCP_POST) != 0 ||
+            !port->post_queued_completion_status(
+                port->iocp_post_handle, 0, 0, NULL)) {
             /* A failed wake must not leave an API waiter holding the port
              * reference forever.  Closing the completion port wakes blocked
              * GetQueuedCompletionStatusEx calls with an abandoned-wait error.
              * Pending request storage is quarantined later if it cannot be
              * drained safely. */
-            iocp_to_close = port->iocp;
-            port->iocp = NULL;
+            iocp_to_close = port->iocp_post_handle;
+            port->iocp_post_handle = NULL;
             atomic_store_explicit(&port->iocp_closed, 1,
                                   memory_order_release);
         }
-        pthread_mutex_unlock(&port->fd_table_lock);
+        pthread_mutex_unlock(&port->iocp_post_lock);
         if (iocp_to_close != NULL) {
             (void)CloseHandle(iocp_to_close);
         }
@@ -2316,10 +2558,12 @@ static void ep_port_finish_destroy_locked(ep_port_t *port)
         (void)CloseHandle(port->afd);
         port->afd = NULL;
     }
-    if (port->iocp != NULL &&
-        atomic_exchange_explicit(&port->iocp_closed, 1,
-                                 memory_order_acq_rel) == 0) {
-        (void)CloseHandle(port->iocp);
+    {
+        HANDLE iocp_to_close = ep_port_revoke_iocp_posts(port);
+
+        if (iocp_to_close != NULL) {
+            (void)CloseHandle(iocp_to_close);
+        }
     }
     port->iocp = NULL;
     ep_afd_pool_destroy(&port->afd_info_pool);
@@ -2329,6 +2573,7 @@ static void ep_port_finish_destroy_locked(ep_port_t *port)
 
     pthread_mutex_unlock(&port->wait_lock);
     pthread_mutex_destroy(&port->wait_lock);
+    pthread_mutex_destroy(&port->iocp_post_lock);
     pthread_mutex_destroy(&port->fd_table_lock);
     free(port);
 }
@@ -2339,10 +2584,12 @@ static void ep_port_abandon_locked(ep_port_t *port)
         (void)CloseHandle(port->afd);
         port->afd = NULL;
     }
-    if (port->iocp != NULL &&
-        atomic_exchange_explicit(&port->iocp_closed, 1,
-                                 memory_order_acq_rel) == 0) {
-        (void)CloseHandle(port->iocp);
+    {
+        HANDLE iocp_to_close = ep_port_revoke_iocp_posts(port);
+
+        if (iocp_to_close != NULL) {
+            (void)CloseHandle(iocp_to_close);
+        }
     }
     port->iocp = NULL;
     atomic_fetch_add_explicit(&g_irrecoverable_ports, 1,
@@ -3113,7 +3360,10 @@ static int ep_wait_lock_acquire(ep_port_t *port, int timeout_ms,
             return -1;
         }
         if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
-            ep_set_errno(EBADF);
+            int post_error = atomic_load_explicit(
+                &port->iocp_post_error, memory_order_acquire);
+
+            ep_set_errno(post_error != 0 ? post_error : EBADF);
             return -1;
         }
         if (timeout_ms == 0 ||
@@ -3170,8 +3420,19 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
      * start of the next wait call.  This prevents a perpetually ready socket
      * from starving the error forever while preserving ready-before-error
      * ordering within the call that first observed both conditions. */
+    {
+        int post_error = ep_port_take_iocp_post_error(port);
+
+        if (post_error != 0) {
+            ep_set_errno(post_error);
+            result = -1;
+            goto done;
+        }
+    }
     if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
-        ep_set_errno(EBADF);
+        int post_error = ep_port_take_iocp_post_error(port);
+
+        ep_set_errno(post_error != 0 ? post_error : EBADF);
         result = -1;
         goto done;
     }
@@ -3189,9 +3450,16 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
 
     for (;;) {
         int async_error;
+        int post_error = ep_port_take_iocp_post_error(port);
 
+        if (post_error != 0) {
+            ep_set_errno(post_error);
+            result = -1;
+            break;
+        }
         if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
-            ep_set_errno(EBADF);
+            post_error = ep_port_take_iocp_post_error(port);
+            ep_set_errno(post_error != 0 ? post_error : EBADF);
             result = -1;
             break;
         }
@@ -3216,6 +3484,9 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
 
             result = ep_drain_to_buffer(port, out, maxevents);
             if (result <= 0) {
+                int post_error = ep_port_take_iocp_post_error(port);
+
+                if (post_error != 0) arm_error = post_error;
                 pthread_mutex_lock(&port->fd_table_lock);
                 {
                     int reported_error =
@@ -3269,6 +3540,13 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
             &removed, wait_ms, FALSE);
         if (!ok) {
             DWORD error = GetLastError();
+            int post_error = ep_port_take_iocp_post_error(port);
+
+            if (post_error != 0) {
+                ep_set_errno(post_error);
+                result = -1;
+                break;
+            }
             if (error == WAIT_TIMEOUT) {
                 if (deferred_rearm_wait) {
                     pthread_mutex_lock(&port->fd_table_lock);
@@ -3319,6 +3597,12 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
 
         result = ep_drain_to_buffer(port, out, maxevents);
         if (result > 0) {
+            break;
+        }
+        post_error = ep_port_take_iocp_post_error(port);
+        if (post_error != 0) {
+            ep_set_errno(post_error);
+            result = -1;
             break;
         }
         pthread_mutex_lock(&port->fd_table_lock);

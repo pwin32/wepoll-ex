@@ -10,6 +10,8 @@
 
 #ifdef _WIN32
 
+#define WAITABLE_CANCEL_BATCH 64
+
 static int wait_one(int epfd, int timeout_ms, uint32_t *events_out)
 {
     struct epoll_event events[1];
@@ -1080,6 +1082,84 @@ static int test_waitable_cancel_lifecycle(void)
     return 0;
 }
 
+static int test_waitable_cancel_batch(void)
+{
+    HANDLE handles[WAITABLE_CANCEL_BATCH];
+    struct epoll_event event;
+    wepoll_ex_stats stats = {0};
+    uint32_t events = 0;
+    int epfd = -1;
+    size_t i;
+    int result = 1;
+
+    for (i = 0; i < WAITABLE_CANCEL_BATCH; i++) {
+        handles[i] = NULL;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0)
+        goto done;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    for (i = 0; i < WAITABLE_CANCEL_BATCH; i++) {
+        handles[i] = CreateEventW(NULL, TRUE, FALSE, NULL);
+        event.data.u64 = (uint64_t)i + 1;
+        if (handles[i] == NULL ||
+            epoll_ctl(epfd, EPOLL_CTL_ADD,
+                      (epoll_fd_t)handles[i], &event) != 0) {
+            fprintf(stderr,
+                    "waitable-cancel-batch: setup %u failed errno=%d\n",
+                    (unsigned)i, errno);
+            goto done;
+        }
+    }
+
+    if (wait_one(epfd, 0, &events) != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.active_registrations != WAITABLE_CANCEL_BATCH ||
+        stats.pending_polls != WAITABLE_CANCEL_BATCH) {
+        fprintf(stderr,
+                "waitable-cancel-batch: arm active=%llu pending=%llu "
+                "errno=%d\n",
+                (unsigned long long)stats.active_registrations,
+                (unsigned long long)stats.pending_polls, errno);
+        goto done;
+    }
+
+    for (i = 0; i < WAITABLE_CANCEL_BATCH; i++) {
+        if (epoll_ctl(epfd, EPOLL_CTL_DEL,
+                      (epoll_fd_t)handles[i], NULL) != 0) {
+            fprintf(stderr,
+                    "waitable-cancel-batch: DEL %u failed errno=%d\n",
+                    (unsigned)i, errno);
+            goto done;
+        }
+    }
+    if (epoll_fd_count(epfd) != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.active_registrations != 0 || stats.pending_polls != 0 ||
+        stats.rearm_queue_depth != 0) {
+        fprintf(stderr,
+                "waitable-cancel-batch: retained active=%llu pending=%llu "
+                "rearm=%llu errno=%d\n",
+                (unsigned long long)stats.active_registrations,
+                (unsigned long long)stats.pending_polls,
+                (unsigned long long)stats.rearm_queue_depth, errno);
+        goto done;
+    }
+
+    puts("waitable-cancel-batch: synchronous retirement OK");
+    result = 0;
+
+done:
+    if (epfd >= 0 && wepoll_close(epfd) != 0)
+        result = 1;
+    for (i = 0; i < WAITABLE_CANCEL_BATCH; i++) {
+        if (handles[i] != NULL) CloseHandle(handles[i]);
+    }
+    return result;
+}
+
 static int run_mode(const char *mode)
 {
     if (strcmp(mode, "event") == 0)
@@ -1118,6 +1198,8 @@ static int run_mode(const char *mode)
         return test_waitable_cleanup();
     if (strcmp(mode, "cancel") == 0)
         return test_waitable_cancel_lifecycle();
+    if (strcmp(mode, "cancel-batch") == 0)
+        return test_waitable_cancel_batch();
     fprintf(stderr, "unknown waitable mode: %s\n", mode);
     return 2;
 }
@@ -1130,7 +1212,7 @@ int main(int argc, char **argv)
         "event", "event-et", "auto-reset", "auto-reset-et", "semaphore",
         "semaphore-et", "pending-mod", "ready-mod", "timer-ready-mod",
         "timer-et", "job", "access", "process-thread", "thread-et",
-        "exclusive", "mutex", "cleanup", "cancel"
+        "exclusive", "mutex", "cleanup", "cancel", "cancel-batch"
     };
     size_t i;
 

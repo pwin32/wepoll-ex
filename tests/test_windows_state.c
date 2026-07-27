@@ -207,6 +207,214 @@ static int pump_iocp(ep_port_t *port, DWORD timeout_ms)
     return handled;
 }
 
+static PPostQueuedCompletionStatusFn g_lease_native_post;
+static HANDLE g_lease_aux_entered;
+static HANDLE g_lease_aux_release;
+static volatile LONG g_lease_block_aux;
+
+static BOOL WINAPI lease_post_stub(HANDLE completion_port,
+                                   DWORD bytes,
+                                   ULONG_PTR key,
+                                   LPOVERLAPPED overlapped)
+{
+    if (overlapped != NULL &&
+        InterlockedCompareExchange(&g_lease_block_aux, 0, 0) != 0) {
+        (void)SetEvent(g_lease_aux_entered);
+        if (WaitForSingleObject(g_lease_aux_release, 5000) !=
+            WAIT_OBJECT_0) {
+            SetLastError(ERROR_TIMEOUT);
+            return FALSE;
+        }
+    }
+    return g_lease_native_post(completion_port, bytes, key, overlapped);
+}
+
+typedef struct lease_close_context {
+    ep_port_t *port;
+    HANDLE started;
+    HANDLE done;
+} lease_close_context_t;
+
+static DWORD WINAPI lease_close_thread(void *parameter)
+{
+    lease_close_context_t *context = (lease_close_context_t *)parameter;
+
+    (void)SetEvent(context->started);
+    ep_port_begin_close(context->port);
+    (void)SetEvent(context->done);
+    return 0;
+}
+
+static int test_aux_post_close_lease(void)
+{
+    lease_close_context_t context;
+    ep_port_t *port = NULL;
+    HANDLE event_handle = NULL;
+    HANDLE thread = NULL;
+    epoll_data_t data;
+    epoll_event_ex ignored;
+    int result = -1;
+
+    memset(&context, 0, sizeof(context));
+    context.started = CreateEventW(NULL, TRUE, FALSE, NULL);
+    context.done = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_lease_aux_entered = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_lease_aux_release = CreateEventW(NULL, TRUE, FALSE, NULL);
+    event_handle = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (context.started == NULL || context.done == NULL ||
+        g_lease_aux_entered == NULL || g_lease_aux_release == NULL ||
+        event_handle == NULL || ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+
+    memset(&data, 0, sizeof(data));
+    if (ep_port_register(port, (SOCKET)(uintptr_t)event_handle,
+                         EPOLLIN, 0, data, NULL) != 0) {
+        goto cleanup;
+    }
+    memset(&ignored, 0, sizeof(ignored));
+    if (ep_port_wait(port, &ignored, 1, 0, NULL) != 0) {
+        goto cleanup;
+    }
+
+    g_lease_native_post = port->post_queued_completion_status;
+    port->post_queued_completion_status = lease_post_stub;
+    InterlockedExchange(&g_lease_block_aux, 1);
+    if (!SetEvent(event_handle) ||
+        WaitForSingleObject(g_lease_aux_entered, 2000) != WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+
+    context.port = port;
+    thread = CreateThread(NULL, 0, lease_close_thread, &context, 0, NULL);
+    if (thread == NULL ||
+        WaitForSingleObject(context.started, 2000) != WAIT_OBJECT_0 ||
+        WaitForSingleObject(context.done, 100) != WAIT_TIMEOUT) {
+        goto cleanup;
+    }
+
+    InterlockedExchange(&g_lease_block_aux, 0);
+    if (!SetEvent(g_lease_aux_release) ||
+        WaitForSingleObject(context.done, 5000) != WAIT_OBJECT_0 ||
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+    port->post_queued_completion_status = g_lease_native_post;
+    if (ep_port_destroy(port) != 0) {
+        port = NULL;
+        goto cleanup;
+    }
+    port = NULL;
+    result = 0;
+
+cleanup:
+    InterlockedExchange(&g_lease_block_aux, 0);
+    if (g_lease_aux_release != NULL) (void)SetEvent(g_lease_aux_release);
+    if (thread != NULL &&
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0) {
+        (void)TerminateThread(thread, 1);
+        result = -1;
+    }
+    if (port != NULL) {
+        if (g_lease_native_post != NULL) {
+            port->post_queued_completion_status = g_lease_native_post;
+        }
+        if (ep_port_destroy(port) != 0) result = -1;
+    }
+    if (thread != NULL) CloseHandle(thread);
+    if (event_handle != NULL) CloseHandle(event_handle);
+    if (g_lease_aux_release != NULL) CloseHandle(g_lease_aux_release);
+    if (g_lease_aux_entered != NULL) CloseHandle(g_lease_aux_entered);
+    if (context.done != NULL) CloseHandle(context.done);
+    if (context.started != NULL) CloseHandle(context.started);
+    g_lease_native_post = NULL;
+    g_lease_aux_release = NULL;
+    g_lease_aux_entered = NULL;
+    return result;
+}
+
+static int test_aux_posted_cancel(void)
+{
+    ep_port_t *port = NULL;
+    ep_sock_t *sock = NULL;
+    HANDLE event_handle = NULL;
+    epoll_data_t data;
+    epoll_event_ex ignored;
+    SOCKET fd;
+    ULONGLONG deadline;
+    int state_ok;
+    int result = -1;
+
+    event_handle = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (event_handle == NULL || ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+    fd = (SOCKET)(uintptr_t)event_handle;
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0xc1c2c3c4c5c6c7c8);
+    if (ep_port_register(port, fd, EPOLLIN, 0, data, NULL) != 0) {
+        goto cleanup;
+    }
+    memset(&ignored, 0, sizeof(ignored));
+    if (ep_port_wait(port, &ignored, 1, 0, NULL) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    state_ok = sock != NULL && sock->next == NULL &&
+        sock->kind == EP_REG_WAITABLE && port->pending_poll_count == 1 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok || !SetEvent(event_handle)) {
+        goto cleanup;
+    }
+
+    deadline = GetTickCount64() + 2000;
+    while (atomic_load_explicit(&sock->completion_posted,
+                                memory_order_acquire) == 0 &&
+           GetTickCount64() < deadline) {
+        Sleep(1);
+    }
+    if (atomic_load_explicit(&sock->completion_posted,
+                             memory_order_acquire) == 0 ||
+        ep_port_unregister(port, fd) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = port->fd_table_count == 0 &&
+        port->pending_poll_count == 1 && port->sock_list_head == sock &&
+        sock->next == NULL &&
+        atomic_load_explicit(&sock->delete_pending,
+                             memory_order_relaxed) != 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_CANCELLED &&
+        atomic_load_explicit(&sock->completion_posted,
+                             memory_order_acquire) != 0;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok || pump_iocp(port, 1000) < 1) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = port->fd_table_count == 0 &&
+        port->pending_poll_count == 0 && port->sock_list_head == NULL;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (port != NULL && ep_port_destroy(port) != 0) {
+        result = -1;
+    }
+    if (event_handle != NULL) CloseHandle(event_handle);
+    return result;
+}
+
 static int register_events(state_fixture_t *fixture, uint32_t events,
                            uint32_t flags, uint64_t value, void *context)
 {
@@ -1116,6 +1324,10 @@ int main(int argc, char **argv)
         result = test_pending_expansion_cancelled_mod();
     } else if (strcmp(argv[1], "transitional-idle") == 0) {
         result = test_transitional_idle();
+    } else if (strcmp(argv[1], "aux-posted-cancel") == 0) {
+        result = test_aux_posted_cancel();
+    } else if (strcmp(argv[1], "aux-post-close-lease") == 0) {
+        result = test_aux_post_close_lease();
     }
     (void)WSACleanup();
 

@@ -44,6 +44,12 @@ use-after-free. AFD is undocumented, and the build currently targets Windows
 8 or later (`_WIN32_WINNT=0x0602`). The Windows path is validated only with the
 MinGW/MSYS2 checks below.
 
+Auxiliary callbacks and control/error wakeups hold a short per-port IOCP post
+lease across `PostQueuedCompletionStatus`. Close revokes that posting alias
+before closing the HANDLE, so a callback cannot post through a stale numeric
+HANDLE after reuse. An unexpected post failure makes the port unusable, closes
+the IOCP to wake a blocked waiter, and reports the retained error.
+
 ### Linux development path
 
 `src/wepoll_ex_posix.c` leaves the basic `epoll_create*`, `epoll_ctl`, and
@@ -90,16 +96,21 @@ mask/data when it completes. A queued notification from a known-consumptive or
 mode-unknown waitable is replaced with an equivalent current-generation
 snapshot so MOD cannot discard a signal or timer expiration that the
 underlying wait may already have consumed. ET is rejected for waitable timers
-because an arbitrary timer HANDLE does not expose its reset mode.
+because an arbitrary timer HANDLE does not expose its reset mode. Blocking
+auxiliary cancellation retires an unsignaled registration immediately when no
+packet was posted; an already-posted packet keeps storage pinned until dequeue.
+If callback retirement first fails after consuming an auto-reset event,
+semaphore count, or mode-unknown wait, the consumed notification is preserved
+and replayed after cleanup succeeds.
 
 `EPOLLET` uses observed-readiness filtering with throttled re-sampling of an
 already-seen level. `EPOLLEXCLUSIVE` applies only to socket registrations and
 may be combined with `EPOLLET`, but not with `EPOLLONESHOT`, `EPOLLRDHUP`, or
 unsupported event bits. Every MOD of a registration added exclusive returns
-`EINVAL`, even when the MOD mask omits `EPOLLEXCLUSIVE`. A bounded
-process-wide filter tracks read, write, and terminal readiness independently,
-so a continuously writable exclusive owner does not suppress a disjoint read
-wake. Windows
+`EINVAL`, even when the MOD mask omits `EPOLLEXCLUSIVE`. An allocation-free
+process-wide claim index uses intrusive registration nodes and hash buckets to
+track read, write, and terminal readiness independently, so a continuously
+writable exclusive owner does not suppress a disjoint read wake. Windows
 `epoll_pwait*` accepts a non-null signal-mask pointer and ignores it (there is
 no POSIX process signal mask). Linux `epoll_pwait2_ex` applies a supplied mask
 atomically through the native wait. `EPOLLWAKEUP` is accepted and ignored on
@@ -109,8 +120,8 @@ prompt Linux extended-wait wakeup.
 Remaining platform limits are explicit: Windows signal masks and
 `EPOLLWAKEUP` have no native effect, `epoll_pwait2*` has millisecond timeout
 resolution, edge delivery is observed-level rather than Linux kernel queue
-semantics, the secondary process-wide exclusive-claim table is bounded and
-fails open if exhausted, and virtual epoll descriptors cannot be nested.
+semantics, exclusive-claim updates serialize through one process-wide mutex,
+and virtual epoll descriptors cannot be nested.
 
 On Linux, `epoll_fd_count()` reports registrations owned by the extension
 metadata, including successful `epoll_ctl_batch` operations. Native

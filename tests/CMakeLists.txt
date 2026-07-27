@@ -214,7 +214,9 @@ else()
                 pending-metadata-mod
                 pending-narrowing-mod
                 pending-expansion-mod
-                transitional-idle)
+                transitional-idle
+                aux-posted-cancel
+                aux-post-close-lease)
             string(REPLACE "-" "_" _state_name "${_state_mode}")
             add_test(NAME wepoll_ex_windows_state_${_state_name}
                 COMMAND test_wepoll_ex_windows_state ${_state_mode})
@@ -276,6 +278,7 @@ else()
             exclusive-wake
             exclusive-et
             exclusive-disjoint
+            exclusive-scale
             exclusive-invalid
             pwait-sigmask
             wakeup-flag)
@@ -284,6 +287,10 @@ else()
             COMMAND test_wepoll_ex_windows_edge ${_edge_mode})
         set_tests_properties(wepoll_ex_windows_edge_${_edge_name}
             PROPERTIES TIMEOUT 20)
+        if(_edge_mode STREQUAL "exclusive-scale")
+            set_tests_properties(wepoll_ex_windows_edge_${_edge_name}
+                PROPERTIES TIMEOUT 60)
+        endif()
         list(APPEND _wepoll_ex_shared_runtime_tests
             wepoll_ex_windows_edge_${_edge_name})
     endforeach()
@@ -306,7 +313,8 @@ else()
             exclusive
             mutex
             cleanup
-            cancel)
+            cancel
+            cancel-batch)
         string(REPLACE "-" "_" _waitable_name "${_waitable_mode}")
         add_test(NAME wepoll_ex_windows_waitable_${_waitable_name}
             COMMAND test_wepoll_ex_windows_waitable ${_waitable_mode})
@@ -386,9 +394,13 @@ else()
                 iocp-create
                 iocp-post
                 iocp-dequeue
+                aux-closed-iocp
+                aux-post
+                aux-post-immediate
                 ready-node-alloc
                 aux-waitable-disarm
                 aux-waitable-disarm-repeat
+                aux-consumptive-disarm
                 aux-pipe-disarm)
             string(REPLACE "-" "_" _fault_name "${_fault_mode}")
             add_test(NAME wepoll_ex_windows_fault_${_fault_name}
