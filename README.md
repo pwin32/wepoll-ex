@@ -41,8 +41,15 @@ descriptor immediately, bounds public-operation reference waits and AFD
 completion draining, and hands recoverable late completions to a detached
 reaper. An unrecoverable port remains quarantined rather than risking
 use-after-free. AFD is undocumented, and the build currently targets Windows
-8 or later (`_WIN32_WINNT=0x0602`). The Windows path is validated only with the
-MinGW/MSYS2 checks below.
+8 or later (`_WIN32_WINNT=0x0602`). Release-qualified Windows evidence is
+limited to x86-64 MinGW-w64 GCC 15.2 on Windows 10.0.19044. Windows 8 itself,
+MSVC/clang-cl, x86/ARM64, and real alternative Winsock providers remain
+unqualified.
+
+At most four detached reapers run concurrently, each with a 60-second drain
+window. A production workload should finish with `active_quarantines == 0` and
+`irrecoverable_ports == 0`; a nonzero value requires investigation and may
+represent intentional process-lifetime retention.
 
 Auxiliary callbacks and control/error wakeups hold a short per-port IOCP post
 lease across `PostQueuedCompletionStatus`. Close revokes that posting alias
@@ -222,6 +229,10 @@ ready batches, oneshot rearming, and armed control churn:
 ./build-mingw/bench/bench_windows.exe --production
 ```
 
+The production profile creates 50,001 UDP sockets but binds only the first 512.
+Its 50k point measures registration scaling, not a 50k armed-ready workload,
+and the benchmark intentionally has no pass/fail latency thresholds.
+
 Linux qualification covers API contracts, close/wait/cancellation races,
 native `epoll_pwait2` where libc and the kernel provide it, plus a separately
 forced fallback build, signal-mask waits, metadata changes, reused-fd identity,
@@ -236,12 +247,15 @@ compiler, Windows version, and build flags for new results.
 
 The installed-package test builds and runs the default target plus every
 exported explicit shared/static target using the active compiler and linker
-flags, and verifies that only the requested components are exported.
+flags. It rejects incompatible preview-version requests and verifies that only
+the requested components are exported. A companion shared-library test pins
+the public symbol list and ELF SONAME contract.
 
 ## Install and consume
 
 Version 0.1.0 is an experimental preview and does not promise a stable ABI.
-Install it to an isolated prefix while evaluating it:
+Each preview release therefore uses exact CMake package compatibility and an
+exact-version ELF SONAME. Install it to an isolated prefix while evaluating it:
 
 ```sh
 cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \
@@ -254,7 +268,7 @@ CMake consumers can use the installed package and its default target (shared
 when both library forms are installed):
 
 ```cmake
-find_package(wepoll_ex 0.1.0 CONFIG REQUIRED)
+find_package(wepoll_ex 0.1.0 EXACT CONFIG REQUIRED)
 target_link_libraries(my_server PRIVATE wepoll_ex::wepoll_ex)
 ```
 

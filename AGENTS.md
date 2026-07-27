@@ -58,9 +58,11 @@ lifetime mode, and flags for Windows runs.
 ## Packaging, Commits, and Network
 
 Install through the generated CMake package and distribute `LICENSE` and
-`NOTICE`. Use imperative commit subjects and detailed bodies covering behavior,
-tests, and documentation. PRs describe behavior, toolchain, limitations, and
-linked issues.
+`NOTICE`. Until the preview ABI is frozen, keep exact package/ELF SONAME
+compatibility and update the shared-export allowlist intentionally for every
+public API change. Use imperative commit subjects and detailed bodies covering
+behavior, tests, and documentation. PRs describe behavior, toolchain,
+limitations, and linked issues.
 Set a real Git author identity before release history is published. Upstream
 is `ssh://git@192.168.50.180:2222/congjc/wepoll-ex.git`; do not push or tag a
 shared release without explicit direction. For network access, especially

@@ -454,6 +454,24 @@ else()
     unset(_wepoll_ex_shared_runtime_tests)
 endif()
 
+if(WEPOLL_EX_BUILD_SHARED)
+    if(WEPOLL_EX_PLATFORM_WINDOWS)
+        set(_wepoll_ex_export_format PE)
+    else()
+        set(_wepoll_ex_export_format ELF)
+    endif()
+    add_test(NAME wepoll_ex_shared_exports
+        COMMAND ${CMAKE_COMMAND}
+            "-DWEPOLL_EX_BINARY=$<TARGET_FILE:wepoll_ex_shared>"
+            "-DWEPOLL_EX_EXPORT_FORMAT=${_wepoll_ex_export_format}"
+            "-DWEPOLL_EX_NM=${CMAKE_NM}"
+            "-DWEPOLL_EX_OBJDUMP=${CMAKE_OBJDUMP}"
+            "-DWEPOLL_EX_EXPECTED_VERSION=${PROJECT_VERSION}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check_exports.cmake)
+    set_tests_properties(wepoll_ex_shared_exports PROPERTIES TIMEOUT 30)
+    unset(_wepoll_ex_export_format)
+endif()
+
 set(_package_test_prefix ${CMAKE_CURRENT_BINARY_DIR}/package-consumer-install)
 set(_package_test_build ${CMAKE_CURRENT_BINARY_DIR}/package-consumer-build)
 

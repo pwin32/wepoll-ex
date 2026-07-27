@@ -66,11 +66,32 @@ The full seven-variant MinGW wrapper completed successfully, including three
 repeats of every applicable API, backpressure, stress, and concurrent-control
 test.
 
+The final July 27, 2026 preview-contract qualification added exact package,
+SONAME, and export-surface regressions. Combined best-effort, static-only,
+shared-only, strict-identity, strict shared-only, synchronized-lifetime, and
+synchronized shared-only contained 108, 106, 55, 108, 55, 108, and 55 CTest
+entries. Their passed/skipped counts were 107/1, 105/1, 55/0, 107/1, 55/0,
+103/5, and 51/4. Linux/WSL GCC 14.2 native and forced-fallback Release passed
+4/4 each, the API/pool lanes passed five repeats, ASan/UBSan passed 3/3, and
+Clang 19.1.7 strict Release passed 4/4.
+
+On Windows 10.0.19044, the deterministic long stress profile completed all
+250,000 operations on 128 sockets with 59,906 sends, 4,960 epoll rotations,
+and zero backpressure in combined best-effort and best-effort, strict, and
+synchronized shared-library builds. The four corresponding production
+benchmarks completed all 13 CSV rows with a 50,000-socket maximum and 1,000
+timed iterations; their internal measured sections took 8.487, 7.512, 8.973,
+and 6.053 seconds respectively. Setup/teardown is excluded, ready batches stop
+at 512, and no portable performance threshold is claimed.
+
 The current worktree limits the development wrapper to Linux instead of
 assuming every non-Windows platform provides `epoll` and `eventfd`. It also
 behaves cleanly as a CMake subproject: it does not force the parent build type,
 and tests default off unless the project is top-level. Ordinary configuration
-still supports CMake 3.16; checked-in presets require CMake 3.21.
+still supports CMake 3.16; checked-in presets require CMake 3.21. Preview
+packages now use exact-version CMake compatibility and the ELF SONAME
+`libwepoll_ex.so.0.1.0`; package tests reject an older non-exact 0.x request,
+and shared-library allowlists pin the 14 Linux and 20 Windows public exports.
 
 Windows socket lifetime is now an explicit CMake policy:
 `WEPOLL_EX_SOCKET_LIFETIME_MODE=best-effort|strict|synchronized`.
@@ -246,9 +267,11 @@ handler. This tree measured a 79.9k requests/s median versus 78.5k for commit
 `ebc247d`; individual paired deltas ranged from -4.4% to +4.1%. That spread is
 local noise, so this run does not demonstrate a throughput improvement.
 
-This validation is not a support matrix. MSVC and other Windows toolchains are
-not yet validated, and AFD is undocumented. `_WIN32_WINNT=0x0602` is the
-Windows 8-or-later compile/runtime assumption; Windows 8 itself was not tested.
+This validation is not a support matrix. Release-qualified Windows evidence is
+limited to x86-64 MinGW-w64 GCC 15.2 on Windows 10.0.19044. MSVC/clang-cl,
+x86/ARM64, real alternative Winsock providers, and Windows 8 itself remain
+unqualified. AFD is undocumented, and `_WIN32_WINNT=0x0602` remains the
+Windows 8-or-later compile/runtime assumption.
 Windows now accepts `EPOLLET` and ADD-time `EPOLLEXCLUSIVE`. Socket edge
 delivery is an observed-bit filter over AFD level reports rather than a kernel
 edge queue, and exclusive wake uniqueness relies on AFD exclusive-poll

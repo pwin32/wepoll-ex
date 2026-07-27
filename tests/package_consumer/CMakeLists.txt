@@ -15,8 +15,24 @@ if(WEPOLL_EX_EXPECT_STATIC)
     list(APPEND _wepoll_ex_components static)
 endif()
 
+set(_wepoll_ex_package_dir "${wepoll_ex_DIR}")
+unset(wepoll_ex_DIR CACHE)
+
+# Deliberately omit EXACT.  SameMajorVersion would incorrectly allow the
+# installed 0.1.0 preview to satisfy this older 0.x request.
+find_package(wepoll_ex 0.0.0 CONFIG QUIET
+    PATHS "${_wepoll_ex_package_dir}"
+    NO_DEFAULT_PATH)
+if(wepoll_ex_FOUND)
+    message(FATAL_ERROR
+        "Preview package 0.1.0 accepted the incompatible 0.0.0 request")
+endif()
+
+unset(wepoll_ex_DIR CACHE)
 find_package(wepoll_ex 0.1.0 EXACT CONFIG REQUIRED
-    COMPONENTS ${_wepoll_ex_components})
+    COMPONENTS ${_wepoll_ex_components}
+    PATHS "${_wepoll_ex_package_dir}"
+    NO_DEFAULT_PATH)
 
 if(NOT wepoll_ex_VERSION STREQUAL "0.1.0" OR
    NOT WEPOLL_EX_VERSION STREQUAL "0.1.0")

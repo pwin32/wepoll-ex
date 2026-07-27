@@ -31,6 +31,11 @@ nginx source/build tree. The tracked `nginx/config` hook separately registers
 the adapter as an nginx EVENT addon and compiles the static wepoll-ex sources
 into that disposable nginx build.
 
+Until the ABI is frozen, installed CMake packages use `ExactVersion`
+compatibility and ELF shared libraries use the full project version as their
+SONAME. The package consumer rejects an older non-exact 0.x request, while an
+export allowlist rejects accidental public symbols on both Linux and MinGW.
+
 ## Windows data flow and lifetime
 
 1. `epoll_create*` creates an `ep_port_t`, IOCP, AFD poll state, pools, and a
@@ -92,6 +97,11 @@ into that disposable nginx build.
    numeric HANDLE. An unexpected post failure closes the IOCP to wake blocked
    waiters and latches the original error. A failed close has still consumed
    the epfd and must not be retried.
+
+At most four detached reapers may run concurrently. Operational qualification
+requires `active_quarantines` and `irrecoverable_ports` to return to zero after
+the workload; otherwise the process may retain unreachable port storage by
+design.
 
 The ready queue is single-consumer MPSC. Producers append without a mutex; the
 consumer uses a sentinel before reclaiming nodes. Both AFD-buffer pools use a
@@ -286,24 +296,22 @@ and metadata reference before unwinding.
 ## Verification baseline
 
 On July 27, 2026, strict MinGW GCC 15.2 with
-`-O2 -Wall -Wextra -Wpedantic -Werror` completed 107 combined best-effort, 106
-static-only, 54 shared-only, 107 strict-identity, and 107 synchronized-lifetime
-CTest entries. Their passed/skipped counts were 106/1, 105/1, 54/0, 106/1,
-and 102/5. Combined, static-only, strict, and synchronized each skipped the
-environment-dependent UDP/ICMP case; synchronized mode also skipped the four
-native-reuse identity cases owned by its DEL-before-close contract. Repeated
+`-O2 -Wall -Wextra -Wpedantic -Werror` completed 108 combined best-effort, 106
+static-only, 55 shared-only, 108 strict-identity, 55 strict shared-only, 108
+synchronized-lifetime, and 55 synchronized shared-only CTest entries. Their
+passed/skipped counts were 107/1, 105/1, 55/0, 107/1, 55/0, 103/5, and 51/4.
+Combined, static-only, strict, and synchronized each skipped the
+environment-dependent UDP/ICMP case; synchronized modes also skipped the four
+native-reuse identity cases owned by their DEL-before-close contract. Repeated
 API, backpressure, stress, and concurrent-control lanes passed in every
-applicable variant.
-Strict shared-only passed 54/54 entries. Synchronized shared-only passed 50/54
-and skipped the same four contract-owned native-reuse cases. These explicit
-DLL lanes prevent the combined builds' static-preferred test linkage from
-standing in for lifetime-policy coverage of the shared library.
+applicable variant. The shared builds also passed exact public-export checks.
 
-The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 3/3, repeated
-API/pool runs, an explicitly forced `epoll_pwait2` fallback CTest 3/3, and
-ASan/UBSan CTest 3/3. Clang 19.1.7 strict Release also passed 3/3. Coverage
-includes socket ET/exclusive read, write, mixed-class, and stale snapshot
-transitions; direction-aware pipe adapters; waitable terminal ET and
+The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 4/4, repeated
+API/pool runs, an explicitly forced `epoll_pwait2` fallback CTest 4/4, and
+ASan/UBSan CTest 3/3. Clang 19.1.7 strict Release also passed 4/4. Coverage
+includes exact preview package compatibility, ELF SONAME and Linux/MinGW
+export surfaces; socket ET/exclusive read, write, mixed-class, and stale
+snapshot transitions; direction-aware pipe adapters; waitable terminal ET and
 pending/queued MOD races; consumptive notification counts; auxiliary-disarm
 fault recovery and preserved consumptive retries; immediate auxiliary
 cancellation reclamation; IOCP post/close lease races and fatal-post wakeups;
@@ -311,6 +319,14 @@ provider identity modes; cancellation/close/quarantine; packaging; and
 static-winpthread dependency checks. `scripts/qualify-posix.sh`,
 `scripts/qualify-mingw.sh`, CMake presets, and `scripts/repeat-ctest.sh` make
 those lanes reproducible.
+
+The deterministic long stress profile completed 250,000 operations on 128
+sockets with zero backpressure in combined best-effort and best-effort,
+strict, and synchronized shared-library builds. The production benchmark also
+completed all 13 CSV rows for those four builds at a 50,000-socket maximum and
+1,000 timed iterations. This is registration scaling plus ready batches up to
+512, not a 50,000-socket armed-wait result, and no performance threshold is
+claimed.
 
 The nginx 1.31.3 adapter passes a strict full Win32 link, dependency inspection,
 `nginx -t`, 100 loopback requests across a worker reload, and graceful quit

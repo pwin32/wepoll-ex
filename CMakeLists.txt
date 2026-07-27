@@ -235,7 +235,9 @@ if(WEPOLL_EX_BUILD_SHARED)
         OUTPUT_NAME wepoll_ex
         POSITION_INDEPENDENT_CODE ON
         VERSION ${PROJECT_VERSION}
-        SOVERSION 0
+        # The 0.x preview does not promise ABI compatibility between
+        # releases.  Keep the ELF SONAME exact until an ABI is frozen.
+        SOVERSION ${PROJECT_VERSION}
         C_VISIBILITY_PRESET hidden)
     target_include_directories(wepoll_ex_shared
         PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -348,7 +350,7 @@ configure_package_config_file(
 write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/wepoll_exConfigVersion.cmake
     VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion)
+    COMPATIBILITY ExactVersion)
 
 install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/wepoll_exConfig.cmake
