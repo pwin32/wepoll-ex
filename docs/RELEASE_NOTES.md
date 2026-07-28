@@ -78,13 +78,14 @@ Clang 19.1.7 strict Release passed 4/4.
 The July 28, 2026 socket-event parity qualification used MinGW GCC 15.2 with
 `-O2 -Wall -Wextra -Wpedantic -Werror`. Combined best-effort, static-only,
 shared-only, strict-identity, strict shared-only, synchronized-lifetime, and
-synchronized shared-only contained 114, 112, 63, 114, 63, 114, and 63 CTest
-entries. Their passed/skipped counts were 113/1, 111/1, 62/1, 113/1, 62/1,
-109/5, and 58/5. The only general skip was the environment-dependent UDP/ICMP
+synchronized shared-only contained 116, 114, 65, 116, 65, 116, and 65 CTest
+entries. Their passed/skipped counts were 115/1, 113/1, 64/1, 115/1, 64/1,
+111/5, and 60/5. The only general skip was the environment-dependent UDP/ICMP
 probe; synchronized variants also skipped the four native-reuse identity cases
 owned by their DEL-before-close contract. Three repeats of the applicable API,
-backpressure, stress, concurrent-control, AFD mapping/status, socket-alias, and
-urgent-data LT/ET/ONESHOT/MOD tests passed. Linux/WSL GCC 14.2 native and forced
+backpressure, stress, concurrent-control, AFD mapping/status, socket-alias,
+urgent-data LT/ET/ONESHOT/MOD, and inline-urgent LT/ET tests passed. Linux/WSL
+GCC 14.2 native and forced
 fallback Release passed 4/4 each, the API/pool lanes passed five repeats,
 ASan/UBSan passed 3/3, and Clang 19.1.7 strict Release passed 4/4.
 
@@ -175,15 +176,17 @@ and ignores them. Exclusive ADD accepts `EPOLLET` but rejects `EPOLLONESHOT`,
 
 Windows socket completion translation now consumes the AFD per-handle status
 as well as its event bits. A negative status contributes unrequested
-`EPOLLERR`; abortive close guarantees unrequested `EPOLLERR | EPOLLHUP`; and a
-failed connect now guarantees `EPOLLERR | EPOLLHUP` alongside the requested
-readable/writable aliases. Graceful disconnect remains readable EOF plus
-`EPOLLRDHUP`, without being promoted to an error. Public regressions now cover
-the readable/writable aliases, urgent `EPOLLPRI`/`EPOLLRDBAND` LT/ET/ONESHOT/MOD
-behavior, UDP IPv4/IPv6 readiness, and optional connected-UDP ICMP errors. AFD
-cannot distinguish the three writable aliases, `EPOLLMSG` is never produced,
-`SO_OOBINLINE` remains unqualified, and providers that express a UDP error as
-an abort may also produce `EPOLLHUP`.
+`EPOLLERR`; TCP abortive close guarantees unrequested `EPOLLERR | EPOLLHUP`;
+an abort on a confirmed IPv4/IPv6 UDP socket omits HUP; and a failed connect
+guarantees `EPOLLERR | EPOLLHUP` alongside the requested readable/writable
+aliases. Graceful disconnect remains readable EOF plus `EPOLLRDHUP`, without
+being promoted to an error. Public regressions now cover the readable/writable
+aliases, urgent `EPOLLPRI`/`EPOLLRDBAND` LT/ET/ONESHOT/MOD behavior,
+`SO_OOBINLINE` LT/ET delivery as ordinary `EPOLLIN`, UDP IPv4/IPv6 readiness,
+and optional connected-UDP ICMP errors without HUP. Missing or ambiguous
+provider protocol metadata retains the conservative abort mapping. AFD cannot
+distinguish the three writable aliases, `SO_OOBINLINE` does not retain Linux's
+separate `EPOLLPRI` indication, and `EPOLLMSG` is never produced.
 
 Windows `EPOLLET` and ADD-time `EPOLLEXCLUSIVE` are no longer rejected.
 Socket edge-triggered delivery latches observed interest bits from AFD level
@@ -320,8 +323,9 @@ no-op, and `epoll_pwait2*` rounds positive submillisecond timeouts up to one
 millisecond. `EPOLLEXCLUSIVE` may combine with `EPOLLET`, but not with
 `EPOLLONESHOT`, `EPOLLRDHUP`, or unsupported event bits; virtual Windows epoll
 descriptors cannot be nested, AFD writable aliases share one readiness class,
-`EPOLLMSG` is not emitted, `SO_OOBINLINE` is unqualified, UDP aborts may
-over-report `EPOLLHUP`, and pipe writable readiness remains advisory.
+`EPOLLMSG` is not emitted, `SO_OOBINLINE` collapses priority into ordinary
+readability, unknown provider protocol metadata retains a conservative abort
+mapping, and pipe writable readiness remains advisory.
 Performance measurements are local loopback observations, not portable
 throughput guarantees.
 

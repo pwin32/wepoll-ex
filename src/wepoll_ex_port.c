@@ -1488,6 +1488,7 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
             return NULL;
         }
     } else {
+        sock->socket_protocol = ep_socket_get_protocol(fd);
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
         identity_result = ep_socket_get_endpoint_id(fd, &sock->endpoint_id);
         if (identity_result < 0) {
@@ -2139,7 +2140,8 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
 #endif
         delivered = ep_afd_to_epoll_events(
             sock->afd_info->Handles[0].Events,
-            sock->afd_info->Handles[0].Status);
+            sock->afd_info->Handles[0].Status,
+            sock->socket_protocol);
     } else if (sock->kind == EP_REG_WAITABLE) {
         /* Consumptive waits use the callback/immediate wait itself as the
          * readiness observation.  Persistent objects can be sampled safely;

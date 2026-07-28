@@ -237,18 +237,24 @@ and metadata reference before unwinding.
   `EPOLLRDNORM` share one class, `EPOLLOUT`, `EPOLLWRNORM`, and `EPOLLWRBAND`
   share one class, and `EPOLLPRI` and `EPOLLRDBAND` share one class. A graceful
   disconnect reports readable EOF plus `EPOLLRDHUP` without `EPOLLERR` or
-  `EPOLLHUP`. An abortive close reports unrequested `EPOLLERR | EPOLLHUP`, and
-  connect failure reports the requested readable/writable aliases plus
-  unrequested `EPOLLERR | EPOLLHUP`. A negative AFD per-handle status reports
-  unrequested `EPOLLERR` independently of the event bits.
+  `EPOLLHUP`. A TCP abortive close reports unrequested `EPOLLERR | EPOLLHUP`;
+  an abort on a socket whose cached protocol metadata is an exact IPv4/IPv6
+  UDP match reports `EPOLLERR` without HUP; and connect failure reports the
+  requested readable/writable aliases plus unrequested `EPOLLERR | EPOLLHUP`.
+  A negative AFD per-handle status reports unrequested `EPOLLERR`
+  independently of the event bits. Missing or ambiguous provider protocol
+  metadata retains the conservative abort mapping with HUP.
 - TCP urgent-data readiness is qualified for LT persistence until
   `recv(MSG_OOB)`, observed ET suppression and re-edge, ONESHOT MOD rearm, and
-  MOD filtering/data replacement. `EPOLLMSG` is accepted but AFD has no event
-  class that produces it. `SO_OOBINLINE` is not qualified. UDP IPv4/IPv6
-  readiness is covered publicly; connected-UDP ICMP error delivery is also
-  checked when `SIO_UDP_CONNRESET`, the provider, and host firewall expose it.
-  Some providers represent that UDP error as an AFD abort and therefore add
-  `EPOLLHUP`; suppressing it would require protocol-aware translation.
+  MOD filtering/data replacement. With `SO_OOBINLINE`, the urgent byte is
+  qualified as ordinary `EPOLLIN`, is consumed by normal `recv()`, persists in
+  LT, and re-edges under the observed ET rule. AFD does not expose a separate
+  expedited class in that mode, so Windows does not also report Linux's
+  `EPOLLPRI` indication. `EPOLLMSG` is accepted but AFD has no event class that
+  produces it. UDP IPv4/IPv6 readiness is covered publicly; connected-UDP ICMP
+  error delivery is also checked when
+  `SIO_UDP_CONNRESET`, the provider, and host firewall expose it, and any
+  observed event must contain `EPOLLERR` without `EPOLLHUP`.
 - Socket `EPOLLET` is implemented as an observed-edge filter over AFD level
   snapshots: each interest bit is delivered once while continuously true, then
   suppressed until it drops out of the latest level and reappears. Empty edge
@@ -279,6 +285,8 @@ and metadata reference before unwinding.
   millisecond because the IOCP dequeue API accepts millisecond timeouts.
   Windows virtual epoll descriptors also cannot be nested as monitored objects
   inside another epoll instance.
+- `SO_OOBINLINE` exposes urgent bytes as ordinary readable data without a
+  separate `EPOLLPRI` bit on Windows.
 - `EPOLLWAKEUP` is accepted and ignored on Windows.
 - `epoll_ctl_batch` best-effort rolls back successful ADDs after a later
   failure. Earlier MOD and DEL operations remain applied.
@@ -319,16 +327,16 @@ and metadata reference before unwinding.
 ## Verification baseline
 
 On July 28, 2026, strict MinGW GCC 15.2 with
-`-O2 -Wall -Wextra -Wpedantic -Werror` completed 114 combined best-effort, 112
-static-only, 63 shared-only, 114 strict-identity, 63 strict shared-only, 114
-synchronized-lifetime, and 63 synchronized shared-only CTest entries. Their
-passed/skipped counts were 113/1, 111/1, 62/1, 113/1, 62/1, 109/5, and 58/5.
+`-O2 -Wall -Wextra -Wpedantic -Werror` completed 116 combined best-effort, 114
+static-only, 65 shared-only, 116 strict-identity, 65 strict shared-only, 116
+synchronized-lifetime, and 65 synchronized shared-only CTest entries. Their
+passed/skipped counts were 115/1, 113/1, 64/1, 115/1, 64/1, 111/5, and 60/5.
 All seven variants skipped the environment-dependent UDP/ICMP case;
 synchronized modes additionally skipped the four native-reuse identity cases
 owned by their DEL-before-close contract. Three repeats of every applicable API,
-backpressure, stress, concurrent-control, AFD mapping/status, socket-alias, and
-urgent-data LT/ET/ONESHOT/MOD lane passed. The shared builds also passed exact
-public-export checks.
+backpressure, stress, concurrent-control, AFD mapping/status, socket-alias,
+urgent-data LT/ET/ONESHOT/MOD, and inline-urgent LT/ET lane passed. The shared
+builds also passed exact public-export checks.
 
 The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 4/4, five
 repeats each of the API and pool executables, an explicitly forced

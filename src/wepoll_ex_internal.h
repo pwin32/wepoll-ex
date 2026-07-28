@@ -276,6 +276,14 @@ typedef enum ep_reg_kind {
     EP_REG_PIPE = 2
 } ep_reg_kind_t;
 
+/* Only protocols whose Winsock metadata is an exact UDP/IP match receive
+ * protocol-specific AFD event handling.  Every unsupported, malformed, or
+ * unavailable protocol description remains conservative. */
+typedef enum ep_socket_protocol {
+    EP_SOCKET_PROTOCOL_UNKNOWN = 0,
+    EP_SOCKET_PROTOCOL_UDP = 1
+} ep_socket_protocol_t;
+
 typedef enum ep_waitable_semantics {
     EP_WAITABLE_NONE = 0,
     EP_WAITABLE_PERSISTENT = 1,
@@ -304,6 +312,7 @@ struct ep_sock {
     uint8_t kind; /* ep_reg_kind_t */
     uint8_t waitable_semantics; /* ep_waitable_semantics_t */
     uint8_t pipe_access; /* ep_pipe_access_t */
+    uint8_t socket_protocol; /* ep_socket_protocol_t */
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     uint64_t endpoint_id;
     uint8_t endpoint_id_state;
@@ -630,9 +639,12 @@ int      ep_afd_open(HANDLE iocp, HANDLE *out);
 int      ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events,
                             int *pending_out);
 int      ep_afd_cancel(ep_sock_t *sock);
-uint32_t ep_afd_to_epoll_events(ULONG afd_events, NTSTATUS afd_status);
+uint32_t ep_afd_to_epoll_events(ULONG afd_events, NTSTATUS afd_status,
+                                uint8_t socket_protocol);
 uint32_t ep_epoll_to_afd_events(uint32_t epoll_events);
 #ifdef _WIN32
+uint8_t  ep_socket_protocol_from_info(const WSAPROTOCOL_INFOW *protocol_info,
+                                      int protocol_info_length);
 /* Internal callback form used to test provider-chain resolution without
  * installing a process- or system-wide Winsock layered service provider. */
 typedef SOCKET (*ep_socket_ioctl_fn)(SOCKET socket, DWORD ioctl,
@@ -653,6 +665,7 @@ int      ep_socket_get_endpoint_id_with_ioctl(
 #endif
 #endif
 SOCKET   ep_socket_get_base(SOCKET socket);
+uint8_t  ep_socket_get_protocol(SOCKET socket);
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 int      ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id);
 #endif

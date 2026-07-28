@@ -174,6 +174,15 @@ static int recv_oob(SOCKET socket_fd, char expected)
         ? 0 : -1;
 }
 
+static int enable_oob_inline(SOCKET socket_fd)
+{
+    int enabled = 1;
+
+    return setsockopt(socket_fd, SOL_SOCKET, SO_OOBINLINE,
+                      (const char *)&enabled,
+                      (int)sizeof(enabled)) == SOCKET_ERROR ? -1 : 0;
+}
+
 static int run_read_alias_case(uint32_t interest, uint32_t expected,
                                uint64_t data, const char *name)
 {
@@ -469,6 +478,161 @@ cleanup:
     return result;
 }
 
+static int run_oob_inline_interest_case(uint32_t interest,
+                                        uint32_t expected_events,
+                                        uint64_t data,
+                                        const char *name)
+{
+    tcp_pair_t pair;
+    int epfd = -1;
+    int registered = 0;
+    int result = -1;
+
+    if (make_tcp_pair(&pair) != 0) {
+        return -1;
+    }
+    if (enable_oob_inline(pair.server) != 0) {
+        goto cleanup;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0 ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, pair.server,
+                   interest, data) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (send_oob(pair.client, 'q') != 0) {
+        goto cleanup;
+    }
+    if (expected_events != 0) {
+        if (wait_exact(epfd, 2000, data, expected_events, name) != 0) {
+            goto cleanup;
+        }
+    } else if (wait_empty(epfd, 100, name) != 0) {
+        goto cleanup;
+    }
+    if (recv_normal(pair.server, 'q') != 0 ||
+        wait_empty(epfd, 100, "OOBINLINE interest drained") != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, pair.server, 0, 0) != 0) {
+        result = -1;
+    }
+    if (epfd >= 0) {
+        (void)wepoll_close(epfd);
+    }
+    tcp_pair_close(&pair);
+    return result;
+}
+
+static int test_oob_inline_lt(void)
+{
+    tcp_pair_t pair;
+    const uint64_t data = UINT64_C(0x4551);
+    int epfd = -1;
+    int registered = 0;
+    int result = -1;
+
+    if (run_oob_inline_interest_case(
+            EPOLLIN | EPOLLPRI, EPOLLIN, UINT64_C(0x4550),
+            "OOBINLINE combined interest") != 0 ||
+        run_oob_inline_interest_case(
+            EPOLLPRI, 0, UINT64_C(0x4553),
+            "OOBINLINE PRI-only interest") != 0 ||
+        make_tcp_pair(&pair) != 0) {
+        return -1;
+    }
+    if (enable_oob_inline(pair.server) != 0) {
+        goto cleanup;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0 ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, pair.server,
+                   EPOLLIN, data) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (send_oob(pair.client, 'i') != 0 ||
+        wait_exact(epfd, 2000, data, EPOLLIN,
+                   "OOBINLINE LT first") != 0 ||
+        wait_exact(epfd, 2000, data, EPOLLIN,
+                   "OOBINLINE LT persistent") != 0 ||
+        recv_normal(pair.server, 'i') != 0 ||
+        wait_empty(epfd, 100, "OOBINLINE LT drained") != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, pair.server, 0, 0) != 0) {
+        result = -1;
+    }
+    if (epfd >= 0) {
+        (void)wepoll_close(epfd);
+    }
+    tcp_pair_close(&pair);
+    if (result == 0) {
+        puts("oob-inline-lt: OK");
+    }
+    return result;
+}
+
+static int test_oob_inline_et(void)
+{
+    tcp_pair_t pair;
+    const uint64_t data = UINT64_C(0x4552);
+    int epfd = -1;
+    int registered = 0;
+    int result = -1;
+
+    if (make_tcp_pair(&pair) != 0) {
+        return -1;
+    }
+    if (enable_oob_inline(pair.server) != 0) {
+        goto cleanup;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0 ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, pair.server,
+                   EPOLLIN | EPOLLET, data) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (send_oob(pair.client, 'a') != 0 ||
+        wait_exact(epfd, 2000, data, EPOLLIN,
+                   "OOBINLINE ET first") != 0 ||
+        wait_empty(epfd, 100, "OOBINLINE ET duplicate") != 0 ||
+        recv_normal(pair.server, 'a') != 0 ||
+        wait_empty(epfd, 100, "OOBINLINE ET gap") != 0 ||
+        send_oob(pair.client, 'b') != 0 ||
+        wait_exact(epfd, 2000, data, EPOLLIN,
+                   "OOBINLINE ET re-edge") != 0 ||
+        recv_normal(pair.server, 'b') != 0 ||
+        wait_empty(epfd, 100, "OOBINLINE ET drained") != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, pair.server, 0, 0) != 0) {
+        result = -1;
+    }
+    if (epfd >= 0) {
+        (void)wepoll_close(epfd);
+    }
+    tcp_pair_close(&pair);
+    if (result == 0) {
+        puts("oob-inline-et: OK");
+    }
+    return result;
+}
+
 static void udp_fixture_init(udp_fixture_t *fixture)
 {
     memset(fixture, 0, sizeof(*fixture));
@@ -681,7 +845,8 @@ static int test_udp_error(void)
         goto cleanup;
     }
     if (wait_count != 1 || output.data.u64 != data ||
-        (output.events & EPOLLERR) == 0) {
+        (output.events & EPOLLERR) == 0 ||
+        (output.events & EPOLLHUP) != 0) {
         fprintf(stderr,
                 "UDP error mismatch: count=%d errno=%d WSA=%d "
                 "data=0x%llx events=0x%08lx\n",
@@ -735,6 +900,12 @@ static int run_mode(const char *mode)
     if (strcmp(mode, "oob-mod") == 0) {
         return test_oob_mod();
     }
+    if (strcmp(mode, "oob-inline-lt") == 0) {
+        return test_oob_inline_lt();
+    }
+    if (strcmp(mode, "oob-inline-et") == 0) {
+        return test_oob_inline_et();
+    }
     if (strcmp(mode, "udp-v4") == 0) {
         return test_udp_readiness(AF_INET);
     }
@@ -747,7 +918,7 @@ static int run_mode(const char *mode)
     fprintf(stderr,
             "usage: test_windows_socket_events "
             "[aliases|oob-lt|oob-et|oob-oneshot|oob-mod|"
-            "udp-v4|udp-v6|udp-error]\n");
+            "oob-inline-lt|oob-inline-et|udp-v4|udp-v6|udp-error]\n");
     return TEST_FAILED;
 }
 

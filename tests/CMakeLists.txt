@@ -287,6 +287,8 @@ else()
             oob-et
             oob-oneshot
             oob-mod
+            oob-inline-lt
+            oob-inline-et
             udp-v4
             udp-v6
             udp-error)

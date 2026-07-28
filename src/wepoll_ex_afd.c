@@ -288,6 +288,50 @@ SOCKET ep_socket_get_base(SOCKET socket)
 #endif
 }
 
+#ifdef _WIN32
+uint8_t ep_socket_protocol_from_info(const WSAPROTOCOL_INFOW *protocol_info,
+                                     int protocol_info_length)
+{
+    if (protocol_info == NULL ||
+        protocol_info_length < (int)sizeof(*protocol_info)) {
+        return EP_SOCKET_PROTOCOL_UNKNOWN;
+    }
+    if ((protocol_info->iAddressFamily == AF_INET ||
+         protocol_info->iAddressFamily == AF_INET6) &&
+        protocol_info->iSocketType == SOCK_DGRAM &&
+        protocol_info->iProtocol == IPPROTO_UDP &&
+        protocol_info->iProtocolMaxOffset == 0) {
+        return EP_SOCKET_PROTOCOL_UDP;
+    }
+    return EP_SOCKET_PROTOCOL_UNKNOWN;
+}
+#endif
+
+uint8_t ep_socket_get_protocol(SOCKET socket)
+{
+#ifdef _WIN32
+    WSAPROTOCOL_INFOW protocol_info;
+    int protocol_info_length = (int)sizeof(protocol_info);
+    int saved_errno = ep_last_err();
+    int saved_wsa_error = WSAGetLastError();
+    uint8_t protocol = EP_SOCKET_PROTOCOL_UNKNOWN;
+
+    memset(&protocol_info, 0, sizeof(protocol_info));
+    if (socket != INVALID_SOCKET &&
+        getsockopt(socket, SOL_SOCKET, SO_PROTOCOL_INFOW,
+                   (char *)&protocol_info, &protocol_info_length) == 0) {
+        protocol = ep_socket_protocol_from_info(&protocol_info,
+                                                protocol_info_length);
+    }
+    WSASetLastError(saved_wsa_error);
+    ep_set_errno(saved_errno);
+    return protocol;
+#else
+    (void)socket;
+    return EP_SOCKET_PROTOCOL_UNKNOWN;
+#endif
+}
+
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 #ifdef _WIN32
 int ep_socket_get_endpoint_id_with_ioctl(
@@ -517,7 +561,8 @@ int ep_afd_cancel(ep_sock_t *sock)
 /* Translate AFD poll result events to Linux epoll events.             */
 /* --------------------------------------------------------------------- */
 
-uint32_t ep_afd_to_epoll_events(ULONG afd_events, NTSTATUS afd_status)
+uint32_t ep_afd_to_epoll_events(ULONG afd_events, NTSTATUS afd_status,
+                                uint8_t socket_protocol)
 {
     uint32_t out = 0;
 
@@ -531,8 +576,11 @@ uint32_t ep_afd_to_epoll_events(ULONG afd_events, NTSTATUS afd_status)
         out |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
     if (afd_events & AFD_POLL_DISCONNECT)
         out |= EPOLLIN | EPOLLRDNORM | EPOLLRDHUP;
-    if (afd_events & AFD_POLL_ABORT)
-        out |= EPOLLERR | EPOLLHUP;
+    if (afd_events & AFD_POLL_ABORT) {
+        out |= EPOLLERR;
+        if (socket_protocol != EP_SOCKET_PROTOCOL_UDP)
+            out |= EPOLLHUP;
+    }
     if (afd_events & AFD_POLL_CONNECT_FAIL)
         out |= EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDNORM |
                EPOLLWRNORM | EPOLLRDHUP;

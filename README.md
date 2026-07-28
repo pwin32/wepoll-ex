@@ -112,8 +112,9 @@ and replayed after cleanup succeeds.
 
 Windows socket event translation consumes both the AFD event bits and the
 per-handle completion status. A negative per-handle status reports
-`EPOLLERR`; abortive close reports unrequested `EPOLLERR | EPOLLHUP`; and a
-failed connect reports the requested readable/writable aliases plus
+`EPOLLERR`; TCP abortive close reports unrequested `EPOLLERR | EPOLLHUP`; a
+confirmed IPv4/IPv6 UDP abort reports `EPOLLERR` without the terminal HUP bit;
+and a failed connect reports the requested readable/writable aliases plus
 unrequested `EPOLLERR | EPOLLHUP`. Graceful disconnect remains readable EOF
 and `EPOLLRDHUP`, without being promoted to an error. TCP urgent data maps the
 single AFD expedited-read class to `EPOLLPRI` and `EPOLLRDBAND`, filtered to
@@ -121,18 +122,22 @@ the aliases requested by the registration. LT readiness persists until
 `recv(MSG_OOB)`, ET re-edges after the urgent level clears and reappears,
 ONESHOT requires MOD rearm, and MOD applies the latest mask/data. AFD likewise
 does not distinguish ordinary writable aliases: `EPOLLOUT`, `EPOLLWRNORM`,
-and `EPOLLWRBAND` describe one readiness class. `EPOLLMSG` is accepted as an
-event bit but is never produced on Windows, and `SO_OOBINLINE` behavior is not
-qualified.
+and `EPOLLWRBAND` describe one readiness class. With `SO_OOBINLINE`, urgent
+bytes are qualified as ordinary `EPOLLIN` readiness, remain level-ready until
+normal `recv()`, and follow the same observed ET suppression/re-edge rule. AFD
+does not retain a separate priority indication in this mode, so Windows does
+not additionally produce Linux's `EPOLLPRI` notification. `EPOLLMSG` is
+accepted as an event bit but is never produced on Windows.
 
 UDP error coverage has two layers. Deterministic internal completions verify
 that an AFD status such as port-unreachable reaches public delivery as
 `EPOLLERR`. A public connected-UDP probe enables `SIO_UDP_CONNRESET`, arms the
 poll before sending, and requires a delivered `EPOLLERR` to correspond to
-`recv() == WSAECONNRESET`; the probe still skips when the host suppresses ICMP
-or the provider does not implement the control. Some providers may accompany
-a UDP abort with `EPOLLHUP`; removing that over-reporting would require
-protocol-aware AFD translation.
+`recv() == WSAECONNRESET` without `EPOLLHUP`; the probe still skips when the
+host suppresses ICMP or the provider does not implement the control. Protocol
+metadata is cached at ADD. Exact IPv4/IPv6 UDP matches suppress the terminal
+HUP bit, while unavailable or ambiguous provider metadata retains the
+conservative `EPOLLERR | EPOLLHUP` abort mapping.
 
 `EPOLLET` uses observed-readiness filtering with throttled re-sampling of an
 already-seen level. `EPOLLEXCLUSIVE` applies only to socket registrations and
@@ -152,9 +157,10 @@ Remaining platform limits are explicit: Windows signal masks and
 `EPOLLWAKEUP` have no native effect, `epoll_pwait2*` has millisecond timeout
 resolution, edge delivery is observed-level rather than Linux kernel queue
 semantics, AFD collapses the writable aliases into one readiness class,
-`EPOLLMSG` is never produced, `SO_OOBINLINE` and protocol-aware suppression of
-UDP `EPOLLHUP` remain unqualified, exclusive-claim updates serialize through
-one process-wide mutex, and virtual epoll descriptors cannot be nested.
+`EPOLLMSG` is never produced, `SO_OOBINLINE` collapses priority into ordinary
+readability, unknown provider protocol metadata retains a conservative abort
+mapping, exclusive-claim updates serialize through one process-wide mutex, and
+virtual epoll descriptors cannot be nested.
 
 On Linux, `epoll_fd_count()` reports registrations owned by the extension
 metadata, including successful `epoll_ctl_batch` operations. Native

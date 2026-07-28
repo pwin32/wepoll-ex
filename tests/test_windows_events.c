@@ -40,6 +40,16 @@ static int check_mask(const char *name, uint32_t actual, uint32_t expected)
     return -1;
 }
 
+static int check_protocol(const char *name, uint8_t actual, uint8_t expected)
+{
+    if (actual == expected) {
+        return 0;
+    }
+    fprintf(stderr, "%s: expected protocol %u, got %u\n",
+            name, (unsigned)expected, (unsigned)actual);
+    return -1;
+}
+
 static void tcp_pair_init(tcp_pair_t *pair)
 {
     pair->client = INVALID_SOCKET;
@@ -175,6 +185,104 @@ static SOCKET make_udp_socket(void)
     return socket_fd;
 }
 
+static SOCKET make_tcp_listener_socket(void)
+{
+    struct sockaddr_in address;
+    SOCKET socket_fd;
+
+    socket_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (socket_fd == INVALID_SOCKET) {
+        return INVALID_SOCKET;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(0);
+    if (bind(socket_fd, (const struct sockaddr *)&address,
+             (int)sizeof(address)) == SOCKET_ERROR ||
+        listen(socket_fd, 1) == SOCKET_ERROR) {
+        closesocket(socket_fd);
+        return INVALID_SOCKET;
+    }
+    return socket_fd;
+}
+
+static int test_protocol_metadata(void)
+{
+    WSAPROTOCOL_INFOW protocol_info;
+
+    memset(&protocol_info, 0, sizeof(protocol_info));
+    protocol_info.iAddressFamily = AF_INET;
+    protocol_info.iSocketType = SOCK_DGRAM;
+    protocol_info.iProtocol = IPPROTO_UDP;
+    if (check_protocol("UDP IPv4 metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       EP_SOCKET_PROTOCOL_UDP) != 0) {
+        return -1;
+    }
+
+    protocol_info.iAddressFamily = AF_INET6;
+    if (check_protocol("UDP IPv6 metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       EP_SOCKET_PROTOCOL_UDP) != 0 ||
+        check_mask("UDP IPv6 metadata abort",
+                   ep_afd_to_epoll_events(
+                       AFD_POLL_ABORT, STATUS_SUCCESS,
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info))),
+                   EPOLLERR) != 0) {
+        return -1;
+    }
+
+    protocol_info.iProtocolMaxOffset = 1;
+    if (check_protocol("UDP protocol range metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       EP_SOCKET_PROTOCOL_UNKNOWN) != 0) {
+        return -1;
+    }
+
+    protocol_info.iProtocolMaxOffset = 0;
+    protocol_info.iAddressFamily = AF_UNSPEC;
+    if (check_protocol("UDP wrong-family metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       EP_SOCKET_PROTOCOL_UNKNOWN) != 0) {
+        return -1;
+    }
+
+    protocol_info.iAddressFamily = AF_INET;
+    protocol_info.iSocketType = SOCK_STREAM;
+    protocol_info.iProtocol = IPPROTO_UDP;
+    if (check_protocol("UDP wrong-type metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       EP_SOCKET_PROTOCOL_UNKNOWN) != 0) {
+        return -1;
+    }
+
+    protocol_info.iSocketType = SOCK_DGRAM;
+    protocol_info.iProtocol = IPPROTO_TCP;
+    if (check_protocol("UDP wrong-protocol metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       EP_SOCKET_PROTOCOL_UNKNOWN) != 0 ||
+        check_protocol("missing protocol metadata",
+                       ep_socket_protocol_from_info(NULL, 0),
+                       EP_SOCKET_PROTOCOL_UNKNOWN) != 0 ||
+        check_protocol("short protocol metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info) - 1),
+                       EP_SOCKET_PROTOCOL_UNKNOWN) != 0) {
+        return -1;
+    }
+
+    puts("protocol metadata: OK");
+    return 0;
+}
+
 static int test_mapping(void)
 {
     const uint32_t always_afd =
@@ -188,48 +296,71 @@ static int test_mapping(void)
         AFD_POLL_DISCONNECT | AFD_POLL_ABORT | AFD_POLL_LOCAL_CLOSE |
         AFD_POLL_ACCEPT | AFD_POLL_CONNECT_FAIL;
 
-    if (check_mask("AFD receive",
+    if (test_protocol_metadata() != 0 ||
+        check_mask("AFD receive",
                    ep_afd_to_epoll_events(AFD_POLL_RECEIVE,
-                                          STATUS_SUCCESS),
+                                          STATUS_SUCCESS,
+                                          EP_SOCKET_PROTOCOL_UNKNOWN),
                    EPOLLIN | EPOLLRDNORM) != 0 ||
         check_mask("AFD accept",
                    ep_afd_to_epoll_events(AFD_POLL_ACCEPT,
-                                          STATUS_SUCCESS),
+                                          STATUS_SUCCESS,
+                                          EP_SOCKET_PROTOCOL_UNKNOWN),
                    EPOLLIN | EPOLLRDNORM) != 0 ||
         check_mask("AFD expedited",
                    ep_afd_to_epoll_events(AFD_POLL_RECEIVE_EXPEDITED,
-                                          STATUS_SUCCESS),
+                                          STATUS_SUCCESS,
+                                          EP_SOCKET_PROTOCOL_UNKNOWN),
                    EPOLLPRI | EPOLLRDBAND) != 0 ||
         check_mask("AFD send",
                    ep_afd_to_epoll_events(AFD_POLL_SEND,
-                                          STATUS_SUCCESS),
+                                          STATUS_SUCCESS,
+                                          EP_SOCKET_PROTOCOL_UNKNOWN),
                    EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND) != 0 ||
         check_mask("AFD disconnect",
                    ep_afd_to_epoll_events(AFD_POLL_DISCONNECT,
-                                          STATUS_SUCCESS),
+                                          STATUS_SUCCESS,
+                                          EP_SOCKET_PROTOCOL_UNKNOWN),
                    EPOLLIN | EPOLLRDNORM | EPOLLRDHUP) != 0 ||
-        check_mask("AFD abort",
+        check_mask("AFD abort unknown",
                    ep_afd_to_epoll_events(AFD_POLL_ABORT,
-                                          STATUS_SUCCESS),
+                                          STATUS_SUCCESS,
+                                          EP_SOCKET_PROTOCOL_UNKNOWN),
                    EPOLLERR | EPOLLHUP) != 0 ||
+        check_mask("AFD abort UDP",
+                   ep_afd_to_epoll_events(AFD_POLL_ABORT,
+                                          STATUS_SUCCESS,
+                                          EP_SOCKET_PROTOCOL_UDP),
+                   EPOLLERR) != 0 ||
         check_mask("AFD connect failure",
                    ep_afd_to_epoll_events(AFD_POLL_CONNECT_FAIL,
-                                          STATUS_SUCCESS),
+                                          STATUS_SUCCESS,
+                                          EP_SOCKET_PROTOCOL_UDP),
                    EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDNORM |
                        EPOLLWRNORM | EPOLLRDHUP) != 0 ||
         check_mask("AFD local close",
                    ep_afd_to_epoll_events(AFD_POLL_LOCAL_CLOSE,
-                                          STATUS_SUCCESS),
+                                          STATUS_SUCCESS,
+                                          EP_SOCKET_PROTOCOL_UDP),
                    EPOLLHUP) != 0 ||
+        check_mask("AFD UDP abort plus local close",
+                   ep_afd_to_epoll_events(AFD_POLL_ABORT |
+                                              AFD_POLL_LOCAL_CLOSE,
+                                          STATUS_SUCCESS,
+                                          EP_SOCKET_PROTOCOL_UDP),
+                   EPOLLERR | EPOLLHUP) != 0 ||
         check_mask("AFD status error",
-                   ep_afd_to_epoll_events(0, STATUS_PORT_UNREACHABLE),
+                   ep_afd_to_epoll_events(0, STATUS_PORT_UNREACHABLE,
+                                          EP_SOCKET_PROTOCOL_UNKNOWN),
                    EPOLLERR) != 0 ||
         check_mask("AFD abort status error",
                    ep_afd_to_epoll_events(AFD_POLL_ABORT,
-                                          STATUS_PORT_UNREACHABLE),
-                   EPOLLERR | EPOLLHUP) != 0 ||
+                                          STATUS_PORT_UNREACHABLE,
+                                          EP_SOCKET_PROTOCOL_UDP),
+                   EPOLLERR) != 0 ||
         check_mask("AFD combined",
-                   ep_afd_to_epoll_events(all_afd, STATUS_SUCCESS),
+                   ep_afd_to_epoll_events(all_afd, STATUS_SUCCESS,
+                                          EP_SOCKET_PROTOCOL_UDP),
                    all_epoll) != 0) {
         return -1;
     }
@@ -261,9 +392,15 @@ static int test_mapping(void)
     return 0;
 }
 
-static int run_status_delivery_case(const char *name, uint32_t interest,
-                                    ULONG afd_events, NTSTATUS afd_status,
-                                    uint32_t expected, uint64_t expected_data)
+typedef SOCKET (*socket_factory_fn)(void);
+
+static int run_status_delivery_case(const char *name,
+                                    socket_factory_fn socket_factory,
+                                    uint8_t expected_protocol,
+                                    int force_unknown_protocol,
+                                    uint32_t interest, ULONG afd_events,
+                                    NTSTATUS afd_status, uint32_t expected,
+                                    uint64_t expected_data)
 {
     ep_port_t *port = NULL;
     ep_sock_t *sock = NULL;
@@ -281,7 +418,7 @@ static int run_status_delivery_case(const char *name, uint32_t interest,
 
     memset(&data, 0, sizeof(data));
     data.u64 = expected_data;
-    socket_fd = make_udp_socket();
+    socket_fd = socket_factory();
     if (socket_fd == INVALID_SOCKET || ep_port_create(0, 0, &port) != 0) {
         fprintf(stderr, "%s: setup failed, errno=%d WSA=%d\n",
                 name, errno, WSAGetLastError());
@@ -312,6 +449,16 @@ static int run_status_delivery_case(const char *name, uint32_t interest,
         goto cleanup;
     }
     pthread_mutex_lock(&port->fd_table_lock);
+    if (sock->socket_protocol != expected_protocol) {
+        fprintf(stderr, "%s: cached protocol expected %u, got %u\n",
+                name, (unsigned)expected_protocol,
+                (unsigned)sock->socket_protocol);
+        pthread_mutex_unlock(&port->fd_table_lock);
+        goto cleanup;
+    }
+    if (force_unknown_protocol) {
+        sock->socket_protocol = EP_SOCKET_PROTOCOL_UNKNOWN;
+    }
     sock->afd_info->NumberOfHandles = 1;
     sock->afd_info->Handles[0].Events = afd_events;
     sock->afd_info->Handles[0].Status = afd_status;
@@ -374,26 +521,42 @@ cleanup:
 
 static int test_status_delivery(void)
 {
-    if (run_status_delivery_case("status-only error", EPOLLIN, 0,
+    if (run_status_delivery_case("status-only error", make_udp_socket,
+                                 EP_SOCKET_PROTOCOL_UDP, 0, EPOLLIN, 0,
                                  STATUS_PORT_UNREACHABLE, EPOLLERR,
                                  UINT64_C(0x3001)) != 0 ||
-        run_status_delivery_case("abort terminal", EPOLLPRI,
+        run_status_delivery_case("UDP IPv4 abort", make_udp_socket,
+                                 EP_SOCKET_PROTOCOL_UDP, 0, EPOLLPRI,
+                                 AFD_POLL_ABORT, STATUS_SUCCESS,
+                                 EPOLLERR,
+                                 UINT64_C(0x3002)) != 0 ||
+        run_status_delivery_case("TCP abort", make_tcp_listener_socket,
+                                 EP_SOCKET_PROTOCOL_UNKNOWN, 0, EPOLLPRI,
                                  AFD_POLL_ABORT, STATUS_SUCCESS,
                                  EPOLLERR | EPOLLHUP,
-                                 UINT64_C(0x3002)) != 0 ||
-        run_status_delivery_case("connect failure", EPOLLOUT,
-                                 AFD_POLL_CONNECT_FAIL, STATUS_SUCCESS,
-                                 EPOLLOUT | EPOLLERR | EPOLLHUP,
                                  UINT64_C(0x3003)) != 0 ||
-        run_status_delivery_case("connect failure filtered", EPOLLPRI,
-                                 AFD_POLL_CONNECT_FAIL, STATUS_SUCCESS,
+        run_status_delivery_case("unknown protocol abort", make_udp_socket,
+                                 EP_SOCKET_PROTOCOL_UDP, 1, EPOLLPRI,
+                                 AFD_POLL_ABORT, STATUS_SUCCESS,
                                  EPOLLERR | EPOLLHUP,
                                  UINT64_C(0x3004)) != 0 ||
-        run_status_delivery_case("read plus status", EPOLLIN,
+        run_status_delivery_case("connect failure", make_udp_socket,
+                                 EP_SOCKET_PROTOCOL_UDP, 0, EPOLLOUT,
+                                 AFD_POLL_CONNECT_FAIL, STATUS_SUCCESS,
+                                 EPOLLOUT | EPOLLERR | EPOLLHUP,
+                                 UINT64_C(0x3005)) != 0 ||
+        run_status_delivery_case("connect failure filtered",
+                                 make_udp_socket, EP_SOCKET_PROTOCOL_UDP, 0,
+                                 EPOLLPRI,
+                                 AFD_POLL_CONNECT_FAIL, STATUS_SUCCESS,
+                                 EPOLLERR | EPOLLHUP,
+                                 UINT64_C(0x3006)) != 0 ||
+        run_status_delivery_case("read plus status", make_udp_socket,
+                                 EP_SOCKET_PROTOCOL_UDP, 0, EPOLLIN,
                                  AFD_POLL_RECEIVE,
                                  STATUS_PORT_UNREACHABLE,
                                  EPOLLIN | EPOLLERR,
-                                 UINT64_C(0x3005)) != 0) {
+                                 UINT64_C(0x3007)) != 0) {
         return -1;
     }
     puts("status: OK");
