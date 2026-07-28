@@ -444,114 +444,6 @@ static int test_real_base_resolution(void)
 }
 
 /* ------------------------------------------------------------------------- */
-/* UDP readiness and error tests.                                            */
-/* ------------------------------------------------------------------------- */
-
-static int test_udp_readiness(int family)
-{
-    udp_fixture_t fixture;
-    struct epoll_event output;
-    int epfd = -1;
-    int setup;
-    int result = -1;
-    const uint64_t data = family == AF_INET
-        ? UINT64_C(0x55445034) : UINT64_C(0x55445036);
-    const char byte = family == AF_INET ? '4' : '6';
-
-    setup = make_udp_fixture(&fixture, family);
-    if (setup != SETUP_OK) {
-        if (setup == SETUP_UNAVAILABLE) {
-            printf("UDP IPv%d readiness: SKIP (address family unavailable)\n",
-                   family == AF_INET ? 4 : 6);
-            return 1;
-        }
-        return -1;
-    }
-    epfd = epoll_create1(0);
-    if (epfd < 0 || add_socket(epfd, fixture.receiver, EPOLLIN | EPOLLERR,
-                               data) != 0 ||
-        epoll_wait(epfd, &output, 1, 0) != 0 ||
-        add_socket(epfd, fixture.sender, EPOLLOUT,
-                   data + UINT64_C(1)) != 0 ||
-        wait_for_mask(epfd, data + UINT64_C(1), EPOLLOUT, 2000,
-                      &output) != 0 ||
-        epoll_ctl(epfd, EPOLL_CTL_DEL, fixture.sender, NULL) != 0 ||
-        send_udp_byte(&fixture, byte) != 0 ||
-        wait_for_data(epfd, data, 2000, &output) != 0 ||
-        recv_udp_byte(&fixture, byte) != 0 ||
-        epoll_ctl(epfd, EPOLL_CTL_DEL, fixture.receiver, NULL) != 0) {
-        fprintf(stderr, "UDP IPv%d readiness failed: errno=%d WSA=%d\n",
-                family == AF_INET ? 4 : 6, errno, WSAGetLastError());
-        goto cleanup;
-    }
-    result = 0;
-
-cleanup:
-    if (epfd >= 0)
-        (void)wepoll_close(epfd);
-    udp_fixture_close(&fixture);
-    return result;
-}
-
-static int test_udp_error(void)
-{
-    udp_fixture_t probe;
-    udp_fixture_t fixture;
-    struct epoll_event output;
-    int epfd = -1;
-    int setup;
-    int result = -1;
-    int address_length;
-    int wait_count;
-
-    /* Reserve and release a loopback port, then connect a UDP socket to it.
-     * Windows normally reports the resulting ICMP port-unreachable as an
-     * asynchronous WSAECONNRESET/AFD abort; firewall policy may suppress it,
-     * in which case this mode is explicitly skipped. */
-    setup = make_udp_fixture(&probe, AF_INET);
-    if (setup != SETUP_OK)
-        return -1;
-    address_length = probe.address_length;
-    udp_fixture_close(&probe);
-
-    udp_fixture_init(&fixture);
-    fixture.family = AF_INET;
-    fixture.sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (fixture.sender == INVALID_SOCKET)
-        goto cleanup;
-    if (connect(fixture.sender, (const struct sockaddr *)&probe.address,
-                address_length) == SOCKET_ERROR ||
-        send(fixture.sender, "e", 1, 0) != 1) {
-        goto cleanup;
-    }
-    epfd = epoll_create1(0);
-    if (epfd < 0 || add_socket(epfd, fixture.sender,
-                               EPOLLERR | EPOLLIN, UINT64_C(0x55445045)) != 0)
-        goto cleanup;
-
-    wait_count = epoll_wait(epfd, &output, 1, 1500);
-    if (wait_count == 0) {
-        printf("UDP error readiness: SKIP (ICMP error suppressed)\n");
-        result = 1;
-        goto cleanup;
-    }
-    if (wait_count != 1 || output.data.u64 != UINT64_C(0x55445045) ||
-        (output.events & (EPOLLERR | EPOLLHUP)) == 0) {
-        fprintf(stderr, "UDP error event mismatch: count=%d errno=%d "
-                "WSA=%d events=0x%08lx\n", wait_count, errno,
-                WSAGetLastError(), (unsigned long)output.events);
-        goto cleanup;
-    }
-    result = 0;
-
-cleanup:
-    if (epfd >= 0)
-        (void)wepoll_close(epfd);
-    udp_fixture_close(&fixture);
-    return result;
-}
-
-/* ------------------------------------------------------------------------- */
 /* Registration lifecycle tests.                                             */
 /* ------------------------------------------------------------------------- */
 
@@ -1001,12 +893,6 @@ static int run_mode(const char *mode)
         return test_provider_fallback() == 0 &&
                test_real_base_resolution() == 0 ? 0 : -1;
     }
-    if (strcmp(mode, "udp-v4") == 0)
-        return test_udp_readiness(AF_INET);
-    if (strcmp(mode, "udp-v6") == 0)
-        return test_udp_readiness(AF_INET6);
-    if (strcmp(mode, "udp-error") == 0)
-        return test_udp_error();
     if (strcmp(mode, "del-add") == 0)
         return test_del_add_same_socket();
     if (strcmp(mode, "mod-before-wait") == 0)
@@ -1033,8 +919,8 @@ int main(int argc, char **argv)
         return 2;
     }
     if (argc != 2) {
-        fprintf(stderr, "usage: %s provider|udp-v4|udp-v6|udp-error|"
-                "del-add|mod-before-wait|oneshot-rearm-before-wait|"
+        fprintf(stderr, "usage: %s provider|del-add|mod-before-wait|"
+                "oneshot-rearm-before-wait|"
                 "two-epfds|idle-two-epfds|concurrent-ctl\n", argv[0]);
         WSACleanup();
         return 2;

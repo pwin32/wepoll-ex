@@ -2138,7 +2138,8 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
         }
 #endif
         delivered = ep_afd_to_epoll_events(
-            sock->afd_info->Handles[0].Events);
+            sock->afd_info->Handles[0].Events,
+            sock->afd_info->Handles[0].Status);
     } else if (sock->kind == EP_REG_WAITABLE) {
         /* Consumptive waits use the callback/immediate wait itself as the
          * readiness observation.  Persistent objects can be sampled safely;

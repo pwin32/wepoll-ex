@@ -630,7 +630,7 @@ int      ep_afd_open(HANDLE iocp, HANDLE *out);
 int      ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events,
                             int *pending_out);
 int      ep_afd_cancel(ep_sock_t *sock);
-uint32_t ep_afd_to_epoll_events(ULONG afd_events);
+uint32_t ep_afd_to_epoll_events(ULONG afd_events, NTSTATUS afd_status);
 uint32_t ep_epoll_to_afd_events(uint32_t epoll_events);
 #ifdef _WIN32
 /* Internal callback form used to test provider-chain resolution without

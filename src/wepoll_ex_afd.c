@@ -517,10 +517,12 @@ int ep_afd_cancel(ep_sock_t *sock)
 /* Translate AFD poll result events to Linux epoll events.             */
 /* --------------------------------------------------------------------- */
 
-uint32_t ep_afd_to_epoll_events(ULONG afd_events)
+uint32_t ep_afd_to_epoll_events(ULONG afd_events, NTSTATUS afd_status)
 {
     uint32_t out = 0;
 
+    if (afd_status < 0)
+        out |= EPOLLERR;
     if (afd_events & (AFD_POLL_RECEIVE | AFD_POLL_ACCEPT))
         out |= EPOLLIN | EPOLLRDNORM;
     if (afd_events & AFD_POLL_RECEIVE_EXPEDITED)
@@ -530,9 +532,9 @@ uint32_t ep_afd_to_epoll_events(ULONG afd_events)
     if (afd_events & AFD_POLL_DISCONNECT)
         out |= EPOLLIN | EPOLLRDNORM | EPOLLRDHUP;
     if (afd_events & AFD_POLL_ABORT)
-        out |= EPOLLHUP;
+        out |= EPOLLERR | EPOLLHUP;
     if (afd_events & AFD_POLL_CONNECT_FAIL)
-        out |= EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLRDNORM |
+        out |= EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDNORM |
                EPOLLWRNORM | EPOLLRDHUP;
     if (afd_events & AFD_POLL_LOCAL_CLOSE)
         out |= EPOLLHUP;

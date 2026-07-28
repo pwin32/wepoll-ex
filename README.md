@@ -110,6 +110,30 @@ If callback retirement first fails after consuming an auto-reset event,
 semaphore count, or mode-unknown wait, the consumed notification is preserved
 and replayed after cleanup succeeds.
 
+Windows socket event translation consumes both the AFD event bits and the
+per-handle completion status. A negative per-handle status reports
+`EPOLLERR`; abortive close reports unrequested `EPOLLERR | EPOLLHUP`; and a
+failed connect reports the requested readable/writable aliases plus
+unrequested `EPOLLERR | EPOLLHUP`. Graceful disconnect remains readable EOF
+and `EPOLLRDHUP`, without being promoted to an error. TCP urgent data maps the
+single AFD expedited-read class to `EPOLLPRI` and `EPOLLRDBAND`, filtered to
+the aliases requested by the registration. LT readiness persists until
+`recv(MSG_OOB)`, ET re-edges after the urgent level clears and reappears,
+ONESHOT requires MOD rearm, and MOD applies the latest mask/data. AFD likewise
+does not distinguish ordinary writable aliases: `EPOLLOUT`, `EPOLLWRNORM`,
+and `EPOLLWRBAND` describe one readiness class. `EPOLLMSG` is accepted as an
+event bit but is never produced on Windows, and `SO_OOBINLINE` behavior is not
+qualified.
+
+UDP error coverage has two layers. Deterministic internal completions verify
+that an AFD status such as port-unreachable reaches public delivery as
+`EPOLLERR`. A public connected-UDP probe enables `SIO_UDP_CONNRESET`, arms the
+poll before sending, and requires a delivered `EPOLLERR` to correspond to
+`recv() == WSAECONNRESET`; the probe still skips when the host suppresses ICMP
+or the provider does not implement the control. Some providers may accompany
+a UDP abort with `EPOLLHUP`; removing that over-reporting would require
+protocol-aware AFD translation.
+
 `EPOLLET` uses observed-readiness filtering with throttled re-sampling of an
 already-seen level. `EPOLLEXCLUSIVE` applies only to socket registrations and
 may be combined with `EPOLLET`, but not with `EPOLLONESHOT`, `EPOLLRDHUP`, or
@@ -127,8 +151,10 @@ prompt Linux extended-wait wakeup.
 Remaining platform limits are explicit: Windows signal masks and
 `EPOLLWAKEUP` have no native effect, `epoll_pwait2*` has millisecond timeout
 resolution, edge delivery is observed-level rather than Linux kernel queue
-semantics, exclusive-claim updates serialize through one process-wide mutex,
-and virtual epoll descriptors cannot be nested.
+semantics, AFD collapses the writable aliases into one readiness class,
+`EPOLLMSG` is never produced, `SO_OOBINLINE` and protocol-aware suppression of
+UDP `EPOLLHUP` remain unqualified, exclusive-claim updates serialize through
+one process-wide mutex, and virtual epoll descriptors cannot be nested.
 
 On Linux, `epoll_fd_count()` reports registrations owned by the extension
 metadata, including successful `epoll_ctl_batch` operations. Native
@@ -236,13 +262,14 @@ and the benchmark intentionally has no pass/fail latency thresholds.
 Linux qualification covers API contracts, close/wait/cancellation races,
 native `epoll_pwait2` where libc and the kernel provide it, plus a separately
 forced fallback build, signal-mask waits, metadata changes, reused-fd identity,
-the pool, and package consumption. The MinGW suite covers TCP and UDP
-readiness, IPv6, provider-handle fallback,
-multi-epfd waits, deferred ADD failure, pending MOD transitions, IOCP batch
-draining, timeout deadlines, fail-at-N injection, bounded close/quarantine
-cleanup, randomized lifecycle stress, and package consumers. MinGW
-final binaries select the static winpthreads archive, and CTest rejects an
-accidental `libwinpthread-1.dll` dependency. Record the exact command,
+the pool, and package consumption. The MinGW suite covers TCP/UDP IPv4 and
+IPv6 readiness; read, write, and urgent-data aliases; LT, ET, ONESHOT, and MOD
+transitions; per-handle AFD status errors; reset and refused-connect terminal
+flags; provider-handle fallback; multi-epfd waits; deferred ADD failure; IOCP
+batch draining; timeout deadlines; fail-at-N injection; bounded
+close/quarantine cleanup; randomized lifecycle stress; and package consumers.
+MinGW final binaries select the static winpthreads archive, and CTest rejects
+an accidental `libwinpthread-1.dll` dependency. Record the exact command,
 compiler, Windows version, and build flags for new results.
 
 The installed-package test builds and runs the default target plus every

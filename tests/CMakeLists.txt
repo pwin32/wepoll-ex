@@ -65,6 +65,12 @@ else()
         _WIN32_WINNT=0x0602
         WIN32_LEAN_AND_MEAN)
 
+    add_executable(test_wepoll_ex_windows_socket_events
+        test_windows_socket_events.c)
+    target_compile_definitions(test_wepoll_ex_windows_socket_events PRIVATE
+        _WIN32_WINNT=0x0602
+        WIN32_LEAN_AND_MEAN)
+
     if(WEPOLL_EX_BUILD_STATIC)
         target_link_libraries(test_wepoll_ex_windows PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
@@ -81,6 +87,8 @@ else()
         target_link_libraries(test_wepoll_ex_windows_waitable PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
         target_link_libraries(test_wepoll_ex_windows_pipe PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_socket_events PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
         add_executable(test_wepoll_ex_pool test_pool.c)
@@ -224,7 +232,7 @@ else()
                 PROPERTIES TIMEOUT 15)
         endforeach()
 
-        foreach(_events_mode IN ITEMS mapping fin spin)
+        foreach(_events_mode IN ITEMS mapping status fin spin)
             add_test(NAME wepoll_ex_windows_events_${_events_mode}
                 COMMAND test_wepoll_ex_windows_events ${_events_mode})
             set_tests_properties(wepoll_ex_windows_events_${_events_mode}
@@ -246,6 +254,8 @@ else()
         target_link_libraries(test_wepoll_ex_windows_waitable PRIVATE
             wepoll_ex::wepoll_ex ws2_32)
         target_link_libraries(test_wepoll_ex_windows_pipe PRIVATE
+            wepoll_ex::wepoll_ex ws2_32)
+        target_link_libraries(test_wepoll_ex_windows_socket_events PRIVATE
             wepoll_ex::wepoll_ex ws2_32)
     endif()
 
@@ -270,6 +280,33 @@ else()
         wepoll_ex_windows_ipv6
         wepoll_ex_windows_backpressure
         wepoll_ex_windows_stress)
+
+    foreach(_socket_event_mode IN ITEMS
+            aliases
+            oob-lt
+            oob-et
+            oob-oneshot
+            oob-mod
+            udp-v4
+            udp-v6
+            udp-error)
+        string(REPLACE "-" "_" _socket_event_name
+            "${_socket_event_mode}")
+        add_test(NAME wepoll_ex_windows_socket_events_${_socket_event_name}
+            COMMAND test_wepoll_ex_windows_socket_events
+                ${_socket_event_mode})
+        set_tests_properties(
+            wepoll_ex_windows_socket_events_${_socket_event_name}
+            PROPERTIES TIMEOUT 30)
+        if(_socket_event_mode STREQUAL "udp-v6" OR
+           _socket_event_mode STREQUAL "udp-error")
+            set_tests_properties(
+                wepoll_ex_windows_socket_events_${_socket_event_name}
+                PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+        list(APPEND _wepoll_ex_shared_runtime_tests
+            wepoll_ex_windows_socket_events_${_socket_event_name})
+    endforeach()
 
     foreach(_edge_mode IN ITEMS
             readable
@@ -360,9 +397,6 @@ else()
 
         foreach(_compat_mode IN ITEMS
                 provider
-                udp-v4
-                udp-v6
-                udp-error
                 del-add
                 mod-before-wait
                 oneshot-rearm-before-wait
@@ -374,11 +408,6 @@ else()
                 COMMAND test_wepoll_ex_windows_compat ${_compat_mode})
             set_tests_properties(wepoll_ex_windows_compat_${_compat_name}
                 PROPERTIES TIMEOUT 30)
-            if(_compat_mode STREQUAL "udp-v6" OR
-               _compat_mode STREQUAL "udp-error")
-                set_tests_properties(wepoll_ex_windows_compat_${_compat_name}
-                    PROPERTIES SKIP_RETURN_CODE 77)
-            endif()
         endforeach()
 
         foreach(_fault_mode IN ITEMS

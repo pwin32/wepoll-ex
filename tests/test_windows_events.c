@@ -5,6 +5,7 @@
  * its own CTest process:
  *
  *     test_wepoll_ex_windows_events mapping
+ *     test_wepoll_ex_windows_events status
  *     test_wepoll_ex_windows_events fin
  *     test_wepoll_ex_windows_events spin
  */
@@ -19,6 +20,10 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+
+#ifndef STATUS_PORT_UNREACHABLE
+#define STATUS_PORT_UNREACHABLE ((NTSTATUS)0xC000023F)
+#endif
 
 typedef struct tcp_pair {
     SOCKET client;
@@ -107,6 +112,69 @@ static int add_socket(int epfd, SOCKET socket, uint32_t events,
     return epoll_ctl(epfd, EPOLL_CTL_ADD, socket, &event);
 }
 
+static ep_sock_t *find_registered_socket(ep_port_t *port, SOCKET fd)
+{
+    ep_sock_t *result = NULL;
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    for (size_t i = 0; i < port->fd_table_size; i++) {
+        ep_sock_t *sock = port->fd_table[i];
+
+        if (sock != NULL && sock->fd == fd) {
+            result = sock;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+    return result;
+}
+
+static NTSTATUS NTAPI submit_pending_stub(
+    HANDLE file_handle,
+    HANDLE event,
+    PIO_APC_ROUTINE apc_routine,
+    PVOID apc_context,
+    PIO_STATUS_BLOCK io_status_block,
+    ULONG io_control_code,
+    PVOID input_buffer,
+    ULONG input_buffer_length,
+    PVOID output_buffer,
+    ULONG output_buffer_length)
+{
+    (void)file_handle;
+    (void)event;
+    (void)apc_routine;
+    (void)apc_context;
+    (void)io_status_block;
+    (void)io_control_code;
+    (void)input_buffer;
+    (void)input_buffer_length;
+    (void)output_buffer;
+    (void)output_buffer_length;
+    return STATUS_PENDING;
+}
+
+static SOCKET make_udp_socket(void)
+{
+    struct sockaddr_in address;
+    SOCKET socket_fd;
+
+    socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd == INVALID_SOCKET) {
+        return INVALID_SOCKET;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(0);
+    if (bind(socket_fd, (const struct sockaddr *)&address,
+             (int)sizeof(address)) == SOCKET_ERROR) {
+        closesocket(socket_fd);
+        return INVALID_SOCKET;
+    }
+    return socket_fd;
+}
+
 static int test_mapping(void)
 {
     const uint32_t always_afd =
@@ -121,31 +189,47 @@ static int test_mapping(void)
         AFD_POLL_ACCEPT | AFD_POLL_CONNECT_FAIL;
 
     if (check_mask("AFD receive",
-                   ep_afd_to_epoll_events(AFD_POLL_RECEIVE),
+                   ep_afd_to_epoll_events(AFD_POLL_RECEIVE,
+                                          STATUS_SUCCESS),
                    EPOLLIN | EPOLLRDNORM) != 0 ||
         check_mask("AFD accept",
-                   ep_afd_to_epoll_events(AFD_POLL_ACCEPT),
+                   ep_afd_to_epoll_events(AFD_POLL_ACCEPT,
+                                          STATUS_SUCCESS),
                    EPOLLIN | EPOLLRDNORM) != 0 ||
         check_mask("AFD expedited",
-                   ep_afd_to_epoll_events(AFD_POLL_RECEIVE_EXPEDITED),
+                   ep_afd_to_epoll_events(AFD_POLL_RECEIVE_EXPEDITED,
+                                          STATUS_SUCCESS),
                    EPOLLPRI | EPOLLRDBAND) != 0 ||
         check_mask("AFD send",
-                   ep_afd_to_epoll_events(AFD_POLL_SEND),
+                   ep_afd_to_epoll_events(AFD_POLL_SEND,
+                                          STATUS_SUCCESS),
                    EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND) != 0 ||
         check_mask("AFD disconnect",
-                   ep_afd_to_epoll_events(AFD_POLL_DISCONNECT),
+                   ep_afd_to_epoll_events(AFD_POLL_DISCONNECT,
+                                          STATUS_SUCCESS),
                    EPOLLIN | EPOLLRDNORM | EPOLLRDHUP) != 0 ||
         check_mask("AFD abort",
-                   ep_afd_to_epoll_events(AFD_POLL_ABORT),
-                   EPOLLHUP) != 0 ||
+                   ep_afd_to_epoll_events(AFD_POLL_ABORT,
+                                          STATUS_SUCCESS),
+                   EPOLLERR | EPOLLHUP) != 0 ||
         check_mask("AFD connect failure",
-                   ep_afd_to_epoll_events(AFD_POLL_CONNECT_FAIL),
-                   EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLRDNORM |
+                   ep_afd_to_epoll_events(AFD_POLL_CONNECT_FAIL,
+                                          STATUS_SUCCESS),
+                   EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDNORM |
                        EPOLLWRNORM | EPOLLRDHUP) != 0 ||
         check_mask("AFD local close",
-                   ep_afd_to_epoll_events(AFD_POLL_LOCAL_CLOSE),
+                   ep_afd_to_epoll_events(AFD_POLL_LOCAL_CLOSE,
+                                          STATUS_SUCCESS),
                    EPOLLHUP) != 0 ||
-        check_mask("AFD combined", ep_afd_to_epoll_events(all_afd),
+        check_mask("AFD status error",
+                   ep_afd_to_epoll_events(0, STATUS_PORT_UNREACHABLE),
+                   EPOLLERR) != 0 ||
+        check_mask("AFD abort status error",
+                   ep_afd_to_epoll_events(AFD_POLL_ABORT,
+                                          STATUS_PORT_UNREACHABLE),
+                   EPOLLERR | EPOLLHUP) != 0 ||
+        check_mask("AFD combined",
+                   ep_afd_to_epoll_events(all_afd, STATUS_SUCCESS),
                    all_epoll) != 0) {
         return -1;
     }
@@ -174,6 +258,145 @@ static int test_mapping(void)
     }
 
     puts("mapping: OK");
+    return 0;
+}
+
+static int run_status_delivery_case(const char *name, uint32_t interest,
+                                    ULONG afd_events, NTSTATUS afd_status,
+                                    uint32_t expected, uint64_t expected_data)
+{
+    ep_port_t *port = NULL;
+    ep_sock_t *sock = NULL;
+    epoll_data_t data;
+    epoll_event_ex ignored;
+    epoll_event_ex output;
+    PNtDeviceIoControlFile original_submit = NULL;
+    SOCKET socket_fd = INVALID_SOCKET;
+    int submit_stub_installed = 0;
+    int completion_posted = 0;
+    int synthetic_pending = 0;
+    int registered = 0;
+    int result = -1;
+    int wait_result;
+
+    memset(&data, 0, sizeof(data));
+    data.u64 = expected_data;
+    socket_fd = make_udp_socket();
+    if (socket_fd == INVALID_SOCKET || ep_port_create(0, 0, &port) != 0) {
+        fprintf(stderr, "%s: setup failed, errno=%d WSA=%d\n",
+                name, errno, WSAGetLastError());
+        goto cleanup;
+    }
+
+    original_submit = g_ntdll.NtDeviceIoControlFile;
+    g_ntdll.NtDeviceIoControlFile = submit_pending_stub;
+    submit_stub_installed = 1;
+    if (ep_port_register(port, socket_fd, interest, 0, data, NULL) != 0) {
+        fprintf(stderr, "%s: registration failed, errno=%d WSA=%d\n",
+                name, errno, WSAGetLastError());
+        goto cleanup;
+    }
+    registered = 1;
+    memset(&ignored, 0, sizeof(ignored));
+    if (ep_port_wait(port, &ignored, 1, 0, NULL) < 0) {
+        fprintf(stderr, "%s: deferred arm failed, errno=%d\n", name, errno);
+        goto cleanup;
+    }
+    synthetic_pending = 1;
+    g_ntdll.NtDeviceIoControlFile = original_submit;
+    submit_stub_installed = 0;
+
+    sock = find_registered_socket(port, socket_fd);
+    if (sock == NULL) {
+        fprintf(stderr, "%s: registration lookup failed\n", name);
+        goto cleanup;
+    }
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock->afd_info->NumberOfHandles = 1;
+    sock->afd_info->Handles[0].Events = afd_events;
+    sock->afd_info->Handles[0].Status = afd_status;
+    sock->io_status_block.Status = STATUS_SUCCESS;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!PostQueuedCompletionStatus(port->iocp, 0, 0,
+                                    (OVERLAPPED *)&sock->io_status_block)) {
+        fprintf(stderr, "%s: completion post failed, WSA=%lu\n",
+                name, (unsigned long)GetLastError());
+        goto cleanup;
+    }
+    completion_posted = 1;
+    synthetic_pending = 0;
+
+    memset(&output, 0, sizeof(output));
+    wait_result = ep_port_wait(port, &output, 1, 1000, NULL);
+    completion_posted = 0;
+    if (wait_result != 1 || output.data.u64 != expected_data ||
+        check_mask(name, output.events, expected) != 0) {
+        fprintf(stderr,
+                "%s: wait=%d errno=%d data=0x%llx events=0x%08lx\n",
+                name, wait_result, errno,
+                (unsigned long long)output.data.u64,
+                (unsigned long)output.events);
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (submit_stub_installed) {
+        g_ntdll.NtDeviceIoControlFile = original_submit;
+    }
+    if (port != NULL) {
+        if (sock == NULL && socket_fd != INVALID_SOCKET) {
+            sock = find_registered_socket(port, socket_fd);
+        }
+        if (sock != NULL && synthetic_pending) {
+            sock->io_status_block.Status = STATUS_CANCELLED;
+            if (PostQueuedCompletionStatus(
+                    port->iocp, 0, 0,
+                    (OVERLAPPED *)&sock->io_status_block)) {
+                completion_posted = 1;
+                synthetic_pending = 0;
+            }
+        }
+        if (sock != NULL && completion_posted) {
+            memset(&output, 0, sizeof(output));
+            (void)ep_port_wait(port, &output, 1, 1000, NULL);
+        }
+        if (registered) {
+            (void)ep_port_unregister(port, socket_fd);
+        }
+        (void)ep_port_destroy(port);
+    }
+    if (socket_fd != INVALID_SOCKET) {
+        closesocket(socket_fd);
+    }
+    return result;
+}
+
+static int test_status_delivery(void)
+{
+    if (run_status_delivery_case("status-only error", EPOLLIN, 0,
+                                 STATUS_PORT_UNREACHABLE, EPOLLERR,
+                                 UINT64_C(0x3001)) != 0 ||
+        run_status_delivery_case("abort terminal", EPOLLPRI,
+                                 AFD_POLL_ABORT, STATUS_SUCCESS,
+                                 EPOLLERR | EPOLLHUP,
+                                 UINT64_C(0x3002)) != 0 ||
+        run_status_delivery_case("connect failure", EPOLLOUT,
+                                 AFD_POLL_CONNECT_FAIL, STATUS_SUCCESS,
+                                 EPOLLOUT | EPOLLERR | EPOLLHUP,
+                                 UINT64_C(0x3003)) != 0 ||
+        run_status_delivery_case("connect failure filtered", EPOLLPRI,
+                                 AFD_POLL_CONNECT_FAIL, STATUS_SUCCESS,
+                                 EPOLLERR | EPOLLHUP,
+                                 UINT64_C(0x3004)) != 0 ||
+        run_status_delivery_case("read plus status", EPOLLIN,
+                                 AFD_POLL_RECEIVE,
+                                 STATUS_PORT_UNREACHABLE,
+                                 EPOLLIN | EPOLLERR,
+                                 UINT64_C(0x3005)) != 0) {
+        return -1;
+    }
+    puts("status: OK");
     return 0;
 }
 
@@ -361,6 +584,9 @@ static int run_mode(const char *mode)
     if (strcmp(mode, "mapping") == 0) {
         return test_mapping();
     }
+    if (strcmp(mode, "status") == 0) {
+        return test_status_delivery();
+    }
     if (strcmp(mode, "fin") == 0) {
         return test_fin_filters();
     }
@@ -371,11 +597,13 @@ static int run_mode(const char *mode)
         int failed = 0;
 
         failed |= test_mapping() != 0;
+        failed |= test_status_delivery() != 0;
         failed |= test_fin_filters() != 0;
         failed |= test_fin_spin() != 0;
         return failed ? -1 : 0;
     }
-    fprintf(stderr, "usage: test_windows_events [mapping|fin|spin|all]\n");
+    fprintf(stderr,
+            "usage: test_windows_events [mapping|status|fin|spin|all]\n");
     return -1;
 }
 
@@ -386,7 +614,8 @@ int main(int argc, char **argv)
     int result;
 
     if (argc > 2) {
-        fprintf(stderr, "usage: test_windows_events [mapping|fin|spin|all]\n");
+        fprintf(stderr,
+                "usage: test_windows_events [mapping|status|fin|spin|all]\n");
         return 2;
     }
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {

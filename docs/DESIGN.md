@@ -59,9 +59,10 @@ the nginx-embedded source build independent of a generated CMake header.
    reports the error synchronously. Best-effort mode accepts a provider that
    cannot expose an endpoint token, strict mode rejects it with
    `EOPNOTSUPP`, and synchronized mode omits token queries entirely.
-3. IOCP completions are translated to `EPOLL*` bits. Ready nodes snapshot the
-   data, context, socket number, and generation; they never retain a raw socket
-   pointer.
+3. Socket IOCP completions translate both the AFD per-handle `Events` bits and
+   its `Status`; a negative per-handle status contributes `EPOLLERR` even when
+   the event bitset is empty. Ready nodes snapshot the data, context, socket
+   number, and generation; they never retain a raw socket pointer.
 4. `epoll_wait*` serializes consumers because the ready queue is
    single-consumer, drains ready snapshots, waits for more IOCP packets, and
    skips stale generations. Lock acquisition is included in finite timeouts,
@@ -230,6 +231,24 @@ and metadata reference before unwinding.
 - `EPOLLONESHOT`, context delivery, RDHUP mapping, zero-timeout waits, native
   socket close cleanup and stable numeric reuse, and concurrent epoll close
   have regression coverage.
+- AFD receive and accept map to the ordinary readable class; send maps to the
+  ordinary writable class; and expedited receive maps to urgent data. The
+  public result is filtered to the requested aliases: `EPOLLIN` and
+  `EPOLLRDNORM` share one class, `EPOLLOUT`, `EPOLLWRNORM`, and `EPOLLWRBAND`
+  share one class, and `EPOLLPRI` and `EPOLLRDBAND` share one class. A graceful
+  disconnect reports readable EOF plus `EPOLLRDHUP` without `EPOLLERR` or
+  `EPOLLHUP`. An abortive close reports unrequested `EPOLLERR | EPOLLHUP`, and
+  connect failure reports the requested readable/writable aliases plus
+  unrequested `EPOLLERR | EPOLLHUP`. A negative AFD per-handle status reports
+  unrequested `EPOLLERR` independently of the event bits.
+- TCP urgent-data readiness is qualified for LT persistence until
+  `recv(MSG_OOB)`, observed ET suppression and re-edge, ONESHOT MOD rearm, and
+  MOD filtering/data replacement. `EPOLLMSG` is accepted but AFD has no event
+  class that produces it. `SO_OOBINLINE` is not qualified. UDP IPv4/IPv6
+  readiness is covered publicly; connected-UDP ICMP error delivery is also
+  checked when `SIO_UDP_CONNRESET`, the provider, and host firewall expose it.
+  Some providers represent that UDP error as an AFD abort and therefore add
+  `EPOLLHUP`; suppressing it would require protocol-aware translation.
 - Socket `EPOLLET` is implemented as an observed-edge filter over AFD level
   snapshots: each interest bit is delivered once while continuously true, then
   suppressed until it drops out of the latest level and reappears. Empty edge
@@ -299,23 +318,25 @@ and metadata reference before unwinding.
 
 ## Verification baseline
 
-On July 27, 2026, strict MinGW GCC 15.2 with
-`-O2 -Wall -Wextra -Wpedantic -Werror` completed 108 combined best-effort, 106
-static-only, 55 shared-only, 108 strict-identity, 55 strict shared-only, 108
-synchronized-lifetime, and 55 synchronized shared-only CTest entries. Their
-passed/skipped counts were 107/1, 105/1, 55/0, 107/1, 55/0, 103/5, and 51/4.
-Combined, static-only, strict, and synchronized each skipped the
-environment-dependent UDP/ICMP case; synchronized modes also skipped the four
-native-reuse identity cases owned by their DEL-before-close contract. Repeated
-API, backpressure, stress, and concurrent-control lanes passed in every
-applicable variant. The shared builds also passed exact public-export checks.
+On July 28, 2026, strict MinGW GCC 15.2 with
+`-O2 -Wall -Wextra -Wpedantic -Werror` completed 114 combined best-effort, 112
+static-only, 63 shared-only, 114 strict-identity, 63 strict shared-only, 114
+synchronized-lifetime, and 63 synchronized shared-only CTest entries. Their
+passed/skipped counts were 113/1, 111/1, 62/1, 113/1, 62/1, 109/5, and 58/5.
+All seven variants skipped the environment-dependent UDP/ICMP case;
+synchronized modes additionally skipped the four native-reuse identity cases
+owned by their DEL-before-close contract. Three repeats of every applicable API,
+backpressure, stress, concurrent-control, AFD mapping/status, socket-alias, and
+urgent-data LT/ET/ONESHOT/MOD lane passed. The shared builds also passed exact
+public-export checks.
 
-The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 4/4, repeated
-API/pool runs, an explicitly forced `epoll_pwait2` fallback CTest 4/4, and
-ASan/UBSan CTest 3/3. Clang 19.1.7 strict Release also passed 4/4. Coverage
-includes exact preview package compatibility, ELF SONAME and Linux/MinGW
-export surfaces; socket ET/exclusive read, write, mixed-class, and stale
-snapshot transitions; direction-aware pipe adapters; waitable terminal ET and
+The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 4/4, five
+repeats each of the API and pool executables, an explicitly forced
+`epoll_pwait2` fallback CTest 4/4, and ASan/UBSan CTest 3/3. Clang 19.1.7 strict
+Release also passed 4/4. Coverage includes exact preview package compatibility,
+ELF SONAME and Linux/MinGW export surfaces; socket alias, urgent-data,
+status/error, ET/exclusive read, write, mixed-class, and stale-snapshot
+transitions; direction-aware pipe adapters; waitable terminal ET and
 pending/queued MOD races; consumptive notification counts; auxiliary-disarm
 fault recovery and preserved consumptive retries; immediate auxiliary
 cancellation reclamation; IOCP post/close lease races and fatal-post wakeups;

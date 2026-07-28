@@ -37,6 +37,11 @@ must remain level-triggered on Windows unless a separate, tested drain/rearm
 state machine is implemented; copying nginx's Linux `EPOLLET` mask is
 incorrect.
 
+Abortive TCP reset delivery now guarantees both `EPOLLERR` and `EPOLLHUP`.
+The adapter's existing terminal-event path treats either bit as readable and
+writable so nginx can run both active handlers; graceful peer half-close stays
+on the readable/`EPOLLRDHUP` path instead of being promoted to an error.
+
 The embedded build selects its lifetime policy through
 `WEPOLL_EX_NGINX_LIFETIME_MODE=best-effort|strict|synchronized` at nginx
 configure time. The default is `best-effort`. `strict` rejects sockets whose

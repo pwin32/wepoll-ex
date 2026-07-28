@@ -429,7 +429,7 @@ static void test_remote_reset(void)
     char byte;
     int epfd;
 
-    TEST("remote reset reports unrequested HUP");
+    TEST("remote reset reports unrequested ERR and HUP");
     if (make_tcp_pair(&pair) != 0) {
         FAIL("make_tcp_pair");
         return;
@@ -453,7 +453,8 @@ static void test_remote_reset(void)
     closesocket(pair.client);
     pair.client = INVALID_SOCKET;
     if (epoll_wait(epfd, &output, 1, 1000) != 1 ||
-        (output.events & EPOLLHUP) == 0 ||
+        (output.events & (EPOLLERR | EPOLLHUP)) !=
+            (EPOLLERR | EPOLLHUP) ||
         recv(pair.server, &byte, 1, 0) != SOCKET_ERROR ||
         WSAGetLastError() != WSAECONNRESET ||
         epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL) != 0) {
@@ -482,7 +483,7 @@ static void test_connect_failure(void)
     int add_result;
     int epfd = -1;
 
-    TEST("refused connect reports OUT and ERR or strict identity rejection");
+    TEST("refused connect reports OUT, ERR, and HUP or strict rejection");
     reserved = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (reserved == INVALID_SOCKET) {
         FAIL("reserved socket");
@@ -553,8 +554,8 @@ static void test_connect_failure(void)
     }
     if (add_result != 0 ||
         epoll_wait(epfd, &output, 1, 5000) != 1 ||
-        (output.events & (EPOLLOUT | EPOLLERR)) !=
-            (EPOLLOUT | EPOLLERR) ||
+        (output.events & (EPOLLOUT | EPOLLERR | EPOLLHUP)) !=
+            (EPOLLOUT | EPOLLERR | EPOLLHUP) ||
         getsockopt(client, SOL_SOCKET, SO_ERROR, (char *)&socket_error,
                    &socket_error_length) == SOCKET_ERROR ||
         (!immediate_refusal && socket_error != WSAECONNREFUSED) ||
