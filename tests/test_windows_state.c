@@ -415,6 +415,423 @@ cleanup:
     return result;
 }
 
+static int test_waitable_zero_callback(void)
+{
+    ep_port_t *port = NULL;
+    ep_sock_t *sock = NULL;
+    HANDLE semaphore = NULL;
+    epoll_data_t data;
+    epoll_event_ex event;
+    SOCKET fd;
+    ULONGLONG deadline;
+    LONG previous = -1;
+    int state_ok;
+    int result = -1;
+
+    semaphore = CreateSemaphoreW(NULL, 0, 1, NULL);
+    if (semaphore == NULL || ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+    fd = (SOCKET)(uintptr_t)semaphore;
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x1112131415161718);
+    if (ep_port_register(port, fd, EPOLLIN, 0, data, NULL) != 0) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 0, NULL) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    state_ok = sock != NULL && sock->next == NULL &&
+        sock->kind == EP_REG_WAITABLE &&
+        sock->waitable_semantics == EP_WAITABLE_CONSUMPTIVE &&
+        port->pending_poll_count == 1 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 0;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok ||
+        !ReleaseSemaphore(semaphore, 1, &previous) || previous != 0) {
+        goto cleanup;
+    }
+
+    deadline = GetTickCount64() + 2000;
+    while (atomic_load_explicit(&sock->completion_posted,
+                                memory_order_acquire) == 0 &&
+           GetTickCount64() < deadline) {
+        Sleep(1);
+    }
+    if (atomic_load_explicit(&sock->completion_posted,
+                             memory_order_acquire) == 0 ||
+        WaitForSingleObject(semaphore, 0) != WAIT_TIMEOUT) {
+        goto cleanup;
+    }
+
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x2122232425262728);
+    if (ep_port_modify(port, fd, 0, 0, data, NULL) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = sock->user_events == 0 && sock->user_data.u64 == data.u64 &&
+        !sock->needs_rearm && !sock->et_holdoff &&
+        sock->wait_registration == NULL && port->pending_poll_count == 1 &&
+        port->needs_rearm_count == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_CANCELLED &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_REGISTERED &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 1 &&
+        atomic_load_explicit(&sock->completion_posted,
+                             memory_order_acquire) == 1 &&
+        ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok || pump_iocp(port, 1000) < 1) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = sock->user_events == 0 && !sock->needs_rearm &&
+        !sock->et_holdoff && sock->wait_registration == NULL &&
+        port->pending_poll_count == 0 && port->needs_rearm_count == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_REGISTERED &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 1 &&
+        atomic_load_explicit(&sock->completion_posted,
+                             memory_order_acquire) == 0 &&
+        atomic_load_explicit(&port->ready_queue.queued,
+                             memory_order_relaxed) == 0 &&
+        ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok) {
+        goto cleanup;
+    }
+
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x3132333435363738);
+    if (ep_port_modify(port, fd, EPOLLIN, 0, data, NULL) != 0) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 1000, NULL) != 1 ||
+        event.events != EPOLLIN || event.data.u64 != data.u64) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = atomic_load_explicit(&sock->waitable_notification_owned,
+                                    memory_order_acquire) == 0 &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok ||
+        ep_port_wait(port, &event, 1, 30, NULL) != 0 ||
+        WaitForSingleObject(semaphore, 0) != WAIT_TIMEOUT) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    if (semaphore != NULL) CloseHandle(semaphore);
+    return result;
+}
+
+static int test_waitable_zero_ready(void)
+{
+    ep_port_t *port = NULL;
+    ep_sock_t *sock = NULL;
+    HANDLE semaphore = NULL;
+    epoll_data_t data;
+    epoll_event_ex event;
+    SOCKET fd;
+    ULONGLONG deadline;
+    uint64_t stale_before;
+    LONG previous = -1;
+    int state_ok;
+    int result = -1;
+
+    semaphore = CreateSemaphoreW(NULL, 0, 1, NULL);
+    if (semaphore == NULL || ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+    fd = (SOCKET)(uintptr_t)semaphore;
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x4142434445464748);
+    if (ep_port_register(port, fd, EPOLLIN, 0, data, NULL) != 0) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 0, NULL) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    state_ok = sock != NULL && sock->next == NULL &&
+        sock->kind == EP_REG_WAITABLE &&
+        sock->waitable_semantics == EP_WAITABLE_CONSUMPTIVE &&
+        port->pending_poll_count == 1 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok ||
+        !ReleaseSemaphore(semaphore, 1, &previous) || previous != 0) {
+        goto cleanup;
+    }
+
+    deadline = GetTickCount64() + 2000;
+    while (atomic_load_explicit(&sock->completion_posted,
+                                memory_order_acquire) == 0 &&
+           GetTickCount64() < deadline) {
+        Sleep(1);
+    }
+    if (atomic_load_explicit(&sock->completion_posted,
+                             memory_order_acquire) == 0 ||
+        WaitForSingleObject(semaphore, 0) != WAIT_TIMEOUT ||
+        pump_iocp(port, 1000) < 1) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = port->pending_poll_count == 0 &&
+        sock->pending_events == EPOLLIN &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_READY &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 1 &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 0 &&
+        atomic_load_explicit(&port->ready_queue.queued,
+                             memory_order_relaxed) == 1 &&
+        ep_port_worklists_valid_locked(port);
+    stale_before = port->stale_events_dropped;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok) {
+        goto cleanup;
+    }
+
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x5152535455565758);
+    if (ep_port_modify(port, fd, 0, 0, data, NULL) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = sock->user_events == 0 && sock->user_data.u64 == data.u64 &&
+        sock->pending_events == 0 && !sock->needs_rearm &&
+        !sock->et_holdoff && port->pending_poll_count == 0 &&
+        port->needs_rearm_count == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_REGISTERED &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 1 &&
+        atomic_load_explicit(&port->ready_queue.queued,
+                             memory_order_relaxed) == 1 &&
+        ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok) {
+        goto cleanup;
+    }
+
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 0, NULL) != 0) {
+        goto cleanup;
+    }
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = port->stale_events_dropped == stale_before + 1 &&
+        atomic_load_explicit(&port->ready_queue.queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 1 &&
+        !sock->needs_rearm && ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok) {
+        goto cleanup;
+    }
+
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x6162636465666768);
+    if (ep_port_modify(port, fd, EPOLLIN, 0, data, NULL) != 0) {
+        goto cleanup;
+    }
+    if (ep_port_wait(port, &event, 1, 1000, NULL) != 1 ||
+        event.events != EPOLLIN || event.data.u64 != data.u64) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = atomic_load_explicit(&sock->waitable_notification_owned,
+                                    memory_order_acquire) == 0 &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok ||
+        ep_port_wait(port, &event, 1, 30, NULL) != 0 ||
+        WaitForSingleObject(semaphore, 0) != WAIT_TIMEOUT) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    if (semaphore != NULL) CloseHandle(semaphore);
+    return result;
+}
+
+static int test_waitable_queued_rearm(void)
+{
+    ep_port_t *port = NULL;
+    ep_sock_t *sock = NULL;
+    HANDLE semaphore = NULL;
+    epoll_data_t data;
+    epoll_event_ex event;
+    SOCKET fd;
+    ULONGLONG deadline;
+    uint64_t old_generation;
+    uint64_t stale_before;
+    LONG previous = -1;
+    int context = 1;
+    int state_ok;
+    int result = -1;
+
+    semaphore = CreateSemaphoreW(NULL, 0, 1, NULL);
+    if (semaphore == NULL || ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+    fd = (SOCKET)(uintptr_t)semaphore;
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x7172737475767778);
+    if (ep_port_register(port, fd, EPOLLIN | EPOLLONESHOT,
+                         EPOLLONESHOT, data, &context) != 0) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 0, NULL) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    state_ok = sock != NULL && sock->next == NULL &&
+        sock->kind == EP_REG_WAITABLE &&
+        sock->waitable_semantics == EP_WAITABLE_CONSUMPTIVE &&
+        port->pending_poll_count == 1 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok ||
+        !ReleaseSemaphore(semaphore, 1, &previous) || previous != 0) {
+        goto cleanup;
+    }
+
+    deadline = GetTickCount64() + 2000;
+    while (atomic_load_explicit(&sock->completion_posted,
+                                memory_order_acquire) == 0 &&
+           GetTickCount64() < deadline) {
+        Sleep(1);
+    }
+    if (atomic_load_explicit(&sock->completion_posted,
+                             memory_order_acquire) == 0 ||
+        WaitForSingleObject(semaphore, 0) != WAIT_TIMEOUT ||
+        pump_iocp(port, 1000) < 1) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = sock->oneshot_fired != 0 &&
+        port->oneshot_fired_count == 1 && sock->pending_events == EPOLLIN &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_READY &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 1 &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 0 &&
+        atomic_load_explicit(&port->ready_queue.queued,
+                             memory_order_relaxed) == 1 &&
+        ep_port_worklists_valid_locked(port);
+    old_generation = sock->generation;
+    stale_before = port->stale_events_dropped;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok || ep_port_rearm(port, fd) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = sock->generation != old_generation &&
+        sock->oneshot_fired == 0 && port->oneshot_fired_count == 0 &&
+        sock->pending_events == 0 && sock->needs_rearm &&
+        port->needs_rearm_count == 1 && port->rearm_head == sock &&
+        port->rearm_tail == sock &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 1 &&
+        atomic_load_explicit(&port->ready_queue.queued,
+                             memory_order_relaxed) == 1 &&
+        ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok) {
+        goto cleanup;
+    }
+
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 1000, NULL) != 1 ||
+        event.events != EPOLLIN || event.data.u64 != data.u64 ||
+        event.user_ctx != &context ||
+        (event.flags & WEPOLL_FLAG_ONESHOT_FIRED) == 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = port->stale_events_dropped == stale_before + 1 &&
+        sock->oneshot_fired != 0 && port->oneshot_fired_count == 1 &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 0 &&
+        atomic_load_explicit(&port->ready_queue.queued,
+                             memory_order_relaxed) == 0 &&
+        ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok ||
+        ep_port_wait(port, &event, 1, 30, NULL) != 0 ||
+        WaitForSingleObject(semaphore, 0) != WAIT_TIMEOUT) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    if (semaphore != NULL) CloseHandle(semaphore);
+    return result;
+}
+
 static int register_events(state_fixture_t *fixture, uint32_t events,
                            uint32_t flags, uint64_t value, void *context)
 {
@@ -1605,6 +2022,12 @@ int main(int argc, char **argv)
         result = test_transitional_idle();
     } else if (strcmp(argv[1], "aux-posted-cancel") == 0) {
         result = test_aux_posted_cancel();
+    } else if (strcmp(argv[1], "waitable-zero-callback") == 0) {
+        result = test_waitable_zero_callback();
+    } else if (strcmp(argv[1], "waitable-zero-ready") == 0) {
+        result = test_waitable_zero_ready();
+    } else if (strcmp(argv[1], "waitable-queued-rearm") == 0) {
+        result = test_waitable_queued_rearm();
     } else if (strcmp(argv[1], "aux-post-close-lease") == 0) {
         result = test_aux_post_close_lease();
     } else if (strcmp(argv[1], "pipe-invalid-et") == 0) {

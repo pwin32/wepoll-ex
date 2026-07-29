@@ -235,6 +235,9 @@ else()
                 pending-expansion-mod
                 transitional-idle
                 aux-posted-cancel
+                waitable-zero-callback
+                waitable-zero-ready
+                waitable-queued-rearm
                 aux-post-close-lease
                 pipe-invalid-et)
             string(REPLACE "-" "_" _state_name "${_state_mode}")
@@ -353,6 +356,11 @@ else()
             auto-reset-et
             semaphore
             semaphore-et
+            zero-semaphore
+            zero-pending
+            zero-callback
+            zero-ready
+            queued-rearm
             pending-mod
             ready-mod
             timer-ready-mod
@@ -360,6 +368,7 @@ else()
             job
             access
             process-thread
+            zero-thread
             thread-et
             exclusive
             mutex
@@ -467,6 +476,8 @@ else()
                 aux-post
                 aux-post-immediate
                 ready-node-alloc
+                waitable-ready-node-alloc
+                waitable-zero-disarm
                 aux-waitable-disarm
                 aux-waitable-disarm-repeat
                 aux-consumptive-disarm

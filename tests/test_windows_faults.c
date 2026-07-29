@@ -1062,6 +1062,199 @@ cleanup:
     return result;
 }
 
+static int test_waitable_zero_disarm(void)
+{
+    ep_port_t *port = NULL;
+    ep_sock_t *sock = NULL;
+    HANDLE event_handle = NULL;
+    HANDLE old_wait_registration = NULL;
+    epoll_data_t old_data;
+    epoll_data_t new_data;
+    epoll_event_ex event;
+    SOCKET fd;
+    uint64_t old_generation = 0;
+    int old_context = 1;
+    int new_context = 2;
+    int state_ok;
+    int result = -1;
+
+    ep_fault_reset();
+    memset(&old_data, 0, sizeof(old_data));
+    memset(&new_data, 0, sizeof(new_data));
+    memset(&event, 0, sizeof(event));
+    old_data.u64 = UINT64_C(0x1020304050607080);
+    new_data.u64 = UINT64_C(0x8070605040302010);
+    event_handle = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (event_handle == NULL || ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+    fd = (SOCKET)(uintptr_t)event_handle;
+    if (ep_port_register(port, fd, EPOLLIN, 0,
+                         old_data, &old_context) != 0 ||
+        ep_port_wait(port, &event, 1, 0, NULL) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    state_ok = sock != NULL && sock->next == NULL &&
+        sock->kind == EP_REG_WAITABLE &&
+        sock->waitable_semantics == EP_WAITABLE_CONSUMPTIVE &&
+        sock->user_events == EPOLLIN && sock->user_flags == 0 &&
+        sock->user_data.u64 == old_data.u64 &&
+        sock->user_ctx == &old_context &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_POLLING &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->completion_posted,
+                             memory_order_acquire) == 0 &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 0 &&
+        sock->wait_registration != NULL && !sock->needs_rearm &&
+        !sock->et_holdoff && port->pending_poll_count == 1 &&
+        port->needs_rearm_count == 0;
+    if (sock != NULL) {
+        old_generation = sock->generation;
+        old_wait_registration = sock->wait_registration;
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok ||
+        ep_fault_configure(EP_FAULT_AUX_DISARM, 1, EBUSY) != 0) {
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (ep_port_modify(port, fd, 0, 0,
+                       new_data, &new_context) != -1 ||
+        errno != EBUSY || ep_fault_hits(EP_FAULT_AUX_DISARM) != 1) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = port->fd_table_count == 1 &&
+        port->sock_list_head == sock && sock->next == NULL &&
+        sock->user_events == EPOLLIN && sock->user_flags == 0 &&
+        sock->user_data.u64 == old_data.u64 &&
+        sock->user_ctx == &old_context &&
+        sock->generation == old_generation &&
+        sock->wait_registration == old_wait_registration &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_POLLING &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->completion_posted,
+                             memory_order_acquire) == 0 &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 0 &&
+        !sock->needs_rearm && !sock->et_holdoff &&
+        port->pending_poll_count == 1 && port->needs_rearm_count == 0;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok || !SetEvent(event_handle)) {
+        goto cleanup;
+    }
+
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 2000, NULL) != 1 ||
+        (event.events & EPOLLIN) == 0 ||
+        event.data.u64 != old_data.u64 || event.user_ctx != &old_context ||
+        ep_fault_hits(EP_FAULT_AUX_DISARM) != 2 ||
+        WaitForSingleObject(event_handle, 0) != WAIT_TIMEOUT ||
+        ep_port_wait(port, &event, 1, 50, NULL) != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    if (event_handle != NULL) CloseHandle(event_handle);
+    return result;
+}
+
+static int test_waitable_ready_node_alloc(void)
+{
+    ep_port_t *port = NULL;
+    ep_sock_t *sock = NULL;
+    HANDLE event_handle = NULL;
+    epoll_data_t data;
+    epoll_event_ex event;
+    SOCKET fd;
+    int context = 1;
+    int state_ok;
+    int result = -1;
+
+    ep_fault_reset();
+    memset(&data, 0, sizeof(data));
+    memset(&event, 0, sizeof(event));
+    data.u64 = UINT64_C(0xabcdef0123456789);
+    event_handle = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (event_handle == NULL || ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+    fd = (SOCKET)(uintptr_t)event_handle;
+    if (ep_port_register(port, fd, EPOLLIN, 0, data, &context) != 0 ||
+        ep_port_wait(port, &event, 1, 0, NULL) != 0 ||
+        ep_fault_configure(EP_FAULT_READY_NODE_ALLOC, 1, ENOMEM) != 0 ||
+        !SetEvent(event_handle)) {
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (ep_port_wait(port, &event, 1, 2000, NULL) != -1 ||
+        errno != ENOMEM ||
+        ep_fault_hits(EP_FAULT_READY_NODE_ALLOC) != 1 ||
+        WaitForSingleObject(event_handle, 0) != WAIT_TIMEOUT) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    state_ok = sock != NULL && sock->next == NULL &&
+        sock->kind == EP_REG_WAITABLE &&
+        sock->waitable_semantics == EP_WAITABLE_CONSUMPTIVE &&
+        sock->user_events == EPOLLIN && sock->user_flags == 0 &&
+        sock->user_data.u64 == data.u64 && sock->user_ctx == &context &&
+        sock->wait_registration == NULL &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->completion_posted,
+                             memory_order_acquire) == 0 &&
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) == 1 &&
+        sock->needs_rearm && port->pending_poll_count == 0 &&
+        port->needs_rearm_count == 1 && port->rearm_head == sock &&
+        port->rearm_tail == sock && port->asynchronous_errors != 0;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok) {
+        goto cleanup;
+    }
+
+    ep_fault_reset();
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 2000, NULL) != 1 ||
+        (event.events & EPOLLIN) == 0 || event.data.u64 != data.u64 ||
+        event.user_ctx != &context ||
+        atomic_load_explicit(&sock->waitable_notification_owned,
+                             memory_order_acquire) != 0 ||
+        ep_port_wait(port, &event, 1, 50, NULL) != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    if (event_handle != NULL) CloseHandle(event_handle);
+    return result;
+}
+
 static int test_aux_waitable_disarm(void)
 {
     HANDLE event_handle = NULL;
@@ -1400,6 +1593,8 @@ static const fault_test_case_t g_tests[] = {
     { "aux-post", test_aux_post_failure },
     { "aux-post-immediate", test_aux_post_immediate_failure },
     { "ready-node-alloc", test_ready_node_alloc },
+    { "waitable-ready-node-alloc", test_waitable_ready_node_alloc },
+    { "waitable-zero-disarm", test_waitable_zero_disarm },
     { "aux-waitable-disarm", test_aux_waitable_disarm },
     { "aux-waitable-disarm-repeat", test_aux_waitable_disarm_repeat },
     { "aux-consumptive-disarm", test_aux_consumptive_disarm },
@@ -1455,6 +1650,7 @@ int main(int argc, char **argv)
             "afd-open|afd-submit|afd-cancel|endpoint-identity|"
             "endpoint-policy|iocp-create|iocp-post|iocp-dequeue|"
             "aux-closed-iocp|aux-post|aux-post-immediate|ready-node-alloc|"
+            "waitable-ready-node-alloc|waitable-zero-disarm|"
             "aux-waitable-disarm|"
             "aux-waitable-disarm-repeat|aux-consumptive-disarm|"
             "aux-pipe-disarm|timeout-init|timeout-arm|timeout-post]\n",

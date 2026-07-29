@@ -189,25 +189,37 @@ metadata reference before unwinding.
   error is surfaced asynchronously, and a later wait/DEL/close retries; a
   persistent close-time failure follows the existing quarantine path. A
   consumed auto-reset event, semaphore count, or mode-unknown notification is
-  preserved across that retry. Successful retry re-posts the observation
-  rather than probing an object whose state may already have been consumed.
+  preserved across that retry. The registration owns such a notification from
+  before an immediate consumptive probe or callback post until a ready node is
+  queued. Cancellation, callback retirement, ready-node allocation failure,
+  and metadata rollback do not clear that ownership; a retry re-posts the
+  observation before probing an object whose state may already have been
+  consumed.
   Manual-reset events and process/thread termination provide persistent
   level behavior. Manual-reset event ET uses throttled reset detection;
   process/thread termination is monotonic, so its delivered ET registration
   stays idle until a later MOD rather than polling a level that cannot clear.
   Auto-reset events and semaphore counts are consumed once per delivered
   readiness notification, including one ET notification per consumed
-  signal/count. A pending waitable or pipe operation covers every MOD mask and
-  completes against the latest metadata. If MOD races a ready notification
-  from a known-consumptive or mode-unknown waitable, the old queued generation
-  is replaced before rearming so a consumed signal/count/timer expiration is
-  still delivered with current metadata. The conservative mode-unknown case
-  covers synchronization timers and events whose reset mode could not be
-  queried. Queued pipe readiness need not be preserved this way: it consumes
-  no state and is re-evaluated from the current level after the stale snapshot
-  is discarded.
-  Waitable-timer ET and ET on an event whose reset mode cannot be queried are
-  rejected with `EINVAL`; LT remains supported.
+  signal/count. A waitable whose effective readiness interest is zero is
+  dormant: it has no probe, registered wait, rearm work, or ET holdoff. MOD from
+  active interest to zero synchronously disarms the wait and is transactional
+  if disarm fails. A callback can win just before that MOD linearizes; Windows
+  cannot restore the signal/count to the object, so the logically dormant
+  registration retains ownership and replays it if interest is enabled later.
+  A posted canceled packet may outlive logical dormancy only long enough to
+  retire IOCP accounting. If MOD or an early `epoll_rearm()` invalidates a
+  queued consumptive/mode-unknown ready node, ownership returns to the
+  registration; the next active generation replays it with current metadata
+  before any new HANDLE probe. Other pending waitable or pipe operations cover
+  every MOD mask and complete against the latest metadata. The conservative
+  mode-unknown case covers synchronization
+  timers and events whose reset mode could not be queried. Queued pipe readiness
+  need not be preserved this way: it consumes no state and is re-evaluated from
+  the current level after the stale snapshot is discarded. Flags-only
+  `EPOLLET` is accepted while such a waitable is dormant. Waitable-timer ET and
+  ET on an event whose reset mode cannot be queried are rejected with `EINVAL`
+  once nonzero interest is requested; LT remains supported.
 - Pipes use short timer-queue polls because anonymous pipe handles are not
   reliably waitable. Each poll combines
   `NtQueryInformationFile(FilePipeLocalInformation)` state, readable-byte, and

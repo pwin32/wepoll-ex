@@ -103,6 +103,17 @@ GCC 14.2 native and forced-fallback strict Release passed 4/4 each, repeated
 API/pool tests passed five times, ASan/UBSan passed 3/3, and Clang 19.1.7
 strict Release passed 4/4.
 
+The later July 29, 2026 zero-interest waitable qualification used MinGW GCC
+15.2 with the same strict flags. The seven best-effort combined, static-only,
+shared-only, strict combined, strict shared-only, synchronized combined, and
+synchronized shared-only lanes completed 149, 147, 84, 149, 84, 149, and 84
+CTest entries respectively, plus three repeats of every applicable API,
+stress, backpressure, control-race, socket-event, pipe, waitable dormancy,
+ownership-replay, and fault-injection lane. Only the documented host-dependent
+UDP/ICMP probe and synchronized-lifetime native-reuse cases skipped. Linux/WSL
+GCC 14.2 native and forced-fallback strict Release passed 4/4 each, API/pool
+tests passed five repeats, and ASan/UBSan passed 3/3.
+
 On Windows 10.0.19044, the deterministic long stress profile completed all
 250,000 operations on 128 sockets with 59,906 sends, 4,960 epoll rotations,
 and zero backpressure in combined best-effort and best-effort, strict, and
@@ -167,11 +178,21 @@ are classified without a destructive wait; jobs and mutexes return `EPERM`,
 HANDLEs lacking `SYNCHRONIZE` return `EACCES`, and `EPOLLEXCLUSIVE` is rejected
 for non-socket registrations.
 Auto-reset events and semaphores consume exactly one signal/count per delivered
-notification, including ET delivery; waitable-timer ET is rejected because the
-reset mode cannot be recovered from an arbitrary HANDLE. Auxiliary callback
-retirement failures now keep storage and pending accounting pinned, surface an
-asynchronous error, and retry through wait/DEL/close rather than permitting a
-stale cookie or premature free.
+notification, including ET delivery. Zero-interest waitables are now truly
+dormant: they do not probe, register a wait, enter the rearm queue, consume a
+notification, or spin on a terminal object. MOD-to-zero synchronously disarms
+an active callback and rolls back on disarm failure. A callback-consumed,
+MOD-hidden, early-`epoll_rearm()`-invalidated, or allocation-failure
+notification remains owned until it can be replayed with current metadata
+before a new probe. An already-posted canceled packet may remain pending only
+until IOCP dequeue; Windows cannot un-consume a callback that wins immediately
+before MOD-to-zero linearizes. Flags-only ET is accepted for a dormant timer or
+mode-unknown event,
+while nonzero-interest ET remains rejected because the reset mode cannot be
+recovered from an arbitrary HANDLE. Auxiliary callback retirement failures now
+keep storage and pending accounting pinned, surface an asynchronous error, and
+retry through wait/DEL/close rather than permitting a stale cookie or premature
+free.
 
 Auxiliary cancellation no longer manufactures an IOCP cancellation packet
 when blocking disarm proves that no callback or queued packet can reference the

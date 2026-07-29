@@ -617,6 +617,15 @@ static VOID CALLBACK ep_waitable_callback(PVOID parameter, BOOLEAN timer_or_wait
         return;
     }
     atomic_store_explicit(&sock->callback_active, 1, memory_order_release);
+    if (sock->waitable_semantics != EP_WAITABLE_PERSISTENT &&
+        sock->waitable_semantics != EP_WAITABLE_TERMINAL) {
+        /* Auto-reset events, semaphores, and mode-unknown waitables may have
+         * been consumed by the wait that entered this callback.  Publish
+         * ownership before the IOCP packet so MOD/cancellation cannot lose
+         * the observation. */
+        atomic_store_explicit(&sock->waitable_notification_owned, 1,
+                              memory_order_release);
+    }
     if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
         /* Best-effort wake; close/drain paths recover outstanding state. */
     }
@@ -742,18 +751,27 @@ static int ep_handle_waitability(HANDLE handle, DWORD file_type,
 
 static uint32_t ep_waitable_interest_events(uint32_t user_events)
 {
-    uint32_t interest = user_events &
+    return user_events &
         (EPOLLIN | EPOLLOUT | EPOLLPRI | EPOLLRDNORM | EPOLLWRNORM |
          EPOLLRDBAND | EPOLLWRBAND | EPOLLRDHUP);
-    if (interest == 0) {
-        interest = EPOLLIN;
-    }
-    return interest;
 }
 
 static uint32_t ep_waitable_level_events(const ep_sock_t *sock)
 {
     return ep_waitable_interest_events(sock->user_events);
+}
+
+static int ep_waitable_may_consume(const ep_sock_t *sock)
+{
+    return sock->kind == EP_REG_WAITABLE &&
+        sock->waitable_semantics != EP_WAITABLE_PERSISTENT &&
+        sock->waitable_semantics != EP_WAITABLE_TERMINAL;
+}
+
+static int ep_waitable_is_dormant(const ep_sock_t *sock)
+{
+    return sock->kind == EP_REG_WAITABLE &&
+        ep_waitable_interest_events(sock->user_events) == 0;
 }
 
 static int ep_socket_select_ready(SOCKET fd, int writable)
@@ -1963,6 +1981,7 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
     atomic_init(&sock->ready_queued, 0);
     atomic_init(&sock->callback_active, 0);
     atomic_init(&sock->completion_posted, 0);
+    atomic_init(&sock->waitable_notification_owned, 0);
     return sock;
 }
 
@@ -2061,6 +2080,20 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
         atomic_load_explicit(&sock->ready_queued, memory_order_relaxed)) {
         return 0;
     }
+    if (ep_waitable_is_dormant(sock)) {
+        if (poll_status == EP_POLL_PENDING &&
+            ep_sock_cancel_locked(sock) != 0) {
+            return -1;
+        }
+        ep_sock_set_needs_rearm_locked(sock, 0);
+        sock->et_holdoff = 0;
+        if (atomic_load_explicit(&sock->poll_status,
+                                 memory_order_relaxed) == EP_POLL_IDLE) {
+            atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                  memory_order_relaxed);
+        }
+        return 0;
+    }
     if ((sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) &&
         poll_status == EP_POLL_PENDING && sock->needs_rearm) {
         int error;
@@ -2085,22 +2118,6 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
          * have raced the blocking auxiliary disarm above, so do not arm a new
          * callback after close has started. */
         if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
-            return 0;
-        }
-        if (sock->aux_consumed_pending) {
-            /* A one-shot wait consumed this signal/count before callback
-             * retirement failed.  Re-post the preserved observation instead
-             * of probing the now-unsignaled object and losing readiness. */
-            if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
-                ep_set_errno(ep_winerr_to_errno(GetLastError()));
-                return -1;
-            }
-            ep_sock_set_needs_rearm_locked(sock, 0);
-            atomic_store_explicit(&sock->poll_status, EP_POLL_PENDING,
-                                  memory_order_relaxed);
-            atomic_store_explicit(&sock->state, EP_SOCK_POLLING,
-                                  memory_order_relaxed);
-            port->pending_poll_count++;
             return 0;
         }
     }
@@ -2130,6 +2147,7 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
 
     if (sock->kind == EP_REG_WAITABLE) {
         DWORD wait_result;
+        int may_consume;
 
         if (sock->oneshot_fired) {
             /* Do not probe while oneshot is disabled: a zero-time wait would
@@ -2140,10 +2158,38 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
             return 0;
         }
         sock->et_holdoff = 0;
+        if (atomic_load_explicit(&sock->waitable_notification_owned,
+                                 memory_order_acquire) != 0) {
+            /* A prior callback/probe consumed this notification, but no live
+             * ready node represents it.  Replay ownership before touching the
+             * HANDLE again so a later signal/count cannot overtake it. */
+            if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
+                ep_set_errno(ep_winerr_to_errno(GetLastError()));
+                return -1;
+            }
+            ep_sock_set_needs_rearm_locked(sock, 0);
+            atomic_store_explicit(&sock->poll_status, EP_POLL_PENDING,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&sock->state, EP_SOCK_POLLING,
+                                  memory_order_relaxed);
+            port->pending_poll_count++;
+            return 0;
+        }
+        may_consume = ep_waitable_may_consume(sock);
+        if (may_consume) {
+            /* Claim ownership before the zero-time wait can consume an
+             * auto-reset signal, semaphore count, or mode-unknown object. */
+            atomic_store_explicit(&sock->waitable_notification_owned, 1,
+                                  memory_order_release);
+        }
         wait_result = WaitForSingleObject((HANDLE)sock->fd, 0);
         if (wait_result == WAIT_FAILED) {
             DWORD error = GetLastError();
 
+            if (may_consume) {
+                atomic_store_explicit(&sock->waitable_notification_owned, 0,
+                                      memory_order_release);
+            }
             if (error == ERROR_INVALID_HANDLE) {
                 ep_sock_drop_closed_locked(port, sock);
                 ep_set_errno(EBADF);
@@ -2151,6 +2197,10 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
             }
             ep_set_errno(ep_winerr_to_errno(error));
             return -1;
+        }
+        if (wait_result != WAIT_OBJECT_0 && may_consume) {
+            atomic_store_explicit(&sock->waitable_notification_owned, 0,
+                                  memory_order_release);
         }
         if (wait_result != WAIT_OBJECT_0 &&
             (sock->user_flags & EPOLLET) != 0) {
@@ -2465,6 +2515,14 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
         pthread_mutex_unlock(&port->fd_table_lock);
         return;
     }
+    if (old_poll_status == EP_POLL_PENDING && status >= 0 &&
+        ep_waitable_may_consume(sock)) {
+        /* Callback and immediate-probe paths publish this before posting.  Set
+         * it defensively here as well so every successful consumptive packet
+         * retains ownership until a ready node accepts the notification. */
+        atomic_store_explicit(&sock->waitable_notification_owned, 1,
+                              memory_order_release);
+    }
     if (sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) {
         int disarm_result = sock->kind == EP_REG_WAITABLE
             ? ep_waitable_unregister_locked(sock)
@@ -2479,12 +2537,6 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
              * already have consumed before this cleanup failure. */
             atomic_store_explicit(&sock->completion_posted, 0,
                                   memory_order_release);
-            if (old_poll_status == EP_POLL_PENDING && status >= 0 &&
-                sock->kind == EP_REG_WAITABLE &&
-                sock->waitable_semantics != EP_WAITABLE_PERSISTENT &&
-                sock->waitable_semantics != EP_WAITABLE_TERMINAL) {
-                sock->aux_consumed_pending = 1;
-            }
             ep_port_record_async_error_locked(port, error);
             if (atomic_load_explicit(&sock->delete_pending,
                                      memory_order_relaxed) ||
@@ -2510,7 +2562,6 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
         }
         atomic_store_explicit(&sock->completion_posted, 0,
                               memory_order_release);
-        sock->aux_consumed_pending = 0;
     }
     if (ep_sock_complete_pending_locked(sock) != 0) {
         if (atomic_load_explicit(&sock->delete_pending,
@@ -2539,6 +2590,18 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
             ep_sock_set_needs_rearm_locked(sock, 1);
             ep_port_record_async_error_locked(port, error);
         }
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return;
+    }
+
+    if (ep_waitable_is_dormant(sock)) {
+        /* MOD-to-zero may have linearized after the wait consumed a
+         * notification.  Logical dormancy starts immediately even though its
+         * already-posted packet still had to retire the pending accounting. */
+        ep_sock_set_needs_rearm_locked(sock, 0);
+        sock->et_holdoff = 0;
+        atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                              memory_order_relaxed);
         pthread_mutex_unlock(&port->fd_table_lock);
         return;
     }
@@ -2748,6 +2811,11 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     atomic_store_explicit(&sock->ready_queued, 1, memory_order_relaxed);
     atomic_store_explicit(&sock->state, EP_SOCK_READY, memory_order_relaxed);
     ep_ready_push(&port->ready_queue, node);
+    if (ep_waitable_may_consume(sock)) {
+        /* The ready node now owns the consumed notification. */
+        atomic_store_explicit(&sock->waitable_notification_owned, 0,
+                              memory_order_release);
+    }
     pthread_mutex_unlock(&port->fd_table_lock);
 }
 
@@ -3376,6 +3444,7 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
     }
     if (sock->kind == EP_REG_WAITABLE &&
         (flags & EPOLLET) != 0 &&
+        ep_waitable_interest_events(events) != 0 &&
         sock->waitable_semantics == EP_WAITABLE_ET_UNSUPPORTED) {
         free(sock);
         pthread_mutex_unlock(&port->fd_table_lock);
@@ -3392,18 +3461,21 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
         return -1;
     }
     ep_sock_list_add_locked(port, sock);
-    ep_sock_set_needs_rearm_locked(sock, 1);
+    if (!ep_waitable_is_dormant(sock)) {
+        ep_sock_set_needs_rearm_locked(sock, 1);
+    }
 
     /* When no waiter is blocked, defer the AFD request until the next wait.
      * This coalesces registration changes and, critically, lets independent
      * epoll instances arm the same socket from their own wait paths.  A port
      * with an active waiter must arm immediately so future readiness can wake
      * the already-blocked GetQueuedCompletionStatusEx call. */
-    if (atomic_load_explicit(&port->waiter_active, memory_order_acquire)
+    if (!ep_waitable_is_dormant(sock) &&
+        (atomic_load_explicit(&port->waiter_active, memory_order_acquire)
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
         || sock->endpoint_id_state == EP_SOCKET_ID_TRANSITIONAL
 #endif
-        ) {
+        )) {
         int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
         if (submit_result < 0) {
             ep_fd_table_remove(port, sock);
@@ -3434,6 +3506,7 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     uint32_t old_user_events;
     uint32_t old_user_flags;
     uint32_t new_afd_events;
+    uint32_t new_waitable_interest = 0;
     uint32_t poll_status;
     epoll_data_t old_user_data;
     void *old_user_ctx;
@@ -3447,7 +3520,9 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     uint8_t old_oneshot_fired;
     uint8_t old_pipe_terminal_delivered;
     uint8_t old_et_holdoff;
+    uint32_t old_waitable_notification_owned;
     int pending_poll_covers_request = 0;
+    int new_waitable_dormant = 0;
 
     pthread_mutex_lock(&port->fd_table_lock);
     ep_sock_t *sock = ep_fd_table_lookup(port, fd);
@@ -3465,19 +3540,32 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
         ep_set_errno(EINVAL);
         return -1;
     }
-    if (sock->kind == EP_REG_WAITABLE &&
-        (flags & EPOLLET) != 0 &&
-        sock->waitable_semantics == EP_WAITABLE_ET_UNSUPPORTED) {
-        pthread_mutex_unlock(&port->fd_table_lock);
-        ep_set_errno(EINVAL);
-        return -1;
+    if (sock->kind == EP_REG_WAITABLE) {
+        new_waitable_interest = ep_waitable_interest_events(events);
+        new_waitable_dormant = new_waitable_interest == 0;
+        if ((flags & EPOLLET) != 0 && !new_waitable_dormant &&
+            sock->waitable_semantics == EP_WAITABLE_ET_UNSUPPORTED) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            ep_set_errno(EINVAL);
+            return -1;
+        }
     }
 
     new_afd_events = ep_sock_afd_events_locked(sock, events);
     poll_status = atomic_load_explicit(&sock->poll_status,
                                        memory_order_relaxed);
     if (poll_status == EP_POLL_PENDING) {
-        if (sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) {
+        if (sock->kind == EP_REG_WAITABLE && new_waitable_dormant) {
+            /* A zero-interest waitable is logically dormant.  Join and disarm
+             * a registered callback before publishing the new mask.  If a
+             * callback already posted, cancellation leaves only its IOCP
+             * accounting pending and preserves any consumed notification. */
+            if (ep_sock_cancel_locked(sock) != 0) {
+                pthread_mutex_unlock(&port->fd_table_lock);
+                return -1;
+            }
+        } else if (sock->kind == EP_REG_WAITABLE ||
+                   sock->kind == EP_REG_PIPE) {
             /* Auxiliary waits observe generic HANDLE/pipe readiness and
              * translate it only after completion.  Their in-flight operation
              * therefore covers every MOD mask.  Keeping it alive is also
@@ -3507,6 +3595,8 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     old_needs_rearm = sock->needs_rearm;
     old_pipe_terminal_delivered = sock->pipe_terminal_delivered;
     old_et_holdoff = sock->et_holdoff;
+    old_waitable_notification_owned = atomic_load_explicit(
+        &sock->waitable_notification_owned, memory_order_acquire);
     old_base_socket = sock->base_socket;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     old_endpoint_id = sock->endpoint_id;
@@ -3520,13 +3610,13 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     ep_ready_node_t *replacement_node = NULL;
     uint32_t replacement_events = 0;
     int preserve_waitable_ready = 0;
+    int transfer_waitable_notification = 0;
 
     if (old_ready_queued && sock->kind == EP_REG_WAITABLE &&
         sock->waitable_semantics != EP_WAITABLE_PERSISTENT &&
         sock->waitable_semantics != EP_WAITABLE_TERMINAL &&
         (old_pending_events & ~(EPOLLERR | EPOLLHUP)) != 0) {
-        replacement_events = ep_waitable_interest_events(events) &
-            (events | EPOLLERR | EPOLLHUP);
+        replacement_events = new_waitable_interest;
         if (replacement_events != 0) {
             replacement_node = ep_ready_node_alloc(port);
             if (replacement_node == NULL) {
@@ -3534,6 +3624,11 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
                 return -1;
             }
             preserve_waitable_ready = 1;
+        } else {
+            /* Invalidating the old generation removes the only ready node that
+             * represents this consumed notification.  Return ownership to the
+             * dormant registration for replay when interest is restored. */
+            transfer_waitable_notification = 1;
         }
     }
 
@@ -3548,7 +3643,13 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     sock->pipe_terminal_delivered = 0;
     sock->et_holdoff = 0;
     ep_sock_set_oneshot_fired_locked(sock, 0);
-    if (preserve_waitable_ready) {
+    if (transfer_waitable_notification) {
+        atomic_store_explicit(&sock->waitable_notification_owned, 1,
+                              memory_order_release);
+    }
+    if (new_waitable_dormant) {
+        ep_sock_set_needs_rearm_locked(sock, 0);
+    } else if (preserve_waitable_ready) {
         ep_sock_set_needs_rearm_locked(sock, 0);
     } else if (!pending_poll_covers_request) {
         ep_sock_set_needs_rearm_locked(sock, 1);
@@ -3587,9 +3688,13 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
         }
         replacement_node->timestamp = ep_now_ns();
         ep_ready_push(&port->ready_queue, replacement_node);
+    } else if (new_waitable_dormant) {
+        atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                              memory_order_relaxed);
     }
 
-    if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
+    if (!new_waitable_dormant &&
+        atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
             EP_POLL_IDLE &&
         atomic_load_explicit(&port->waiter_active, memory_order_acquire)) {
         int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
@@ -3611,6 +3716,9 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
             ep_sock_set_needs_rearm_locked(sock, old_needs_rearm);
             sock->pipe_terminal_delivered = old_pipe_terminal_delivered;
             sock->et_holdoff = old_et_holdoff;
+            atomic_store_explicit(&sock->waitable_notification_owned,
+                                  old_waitable_notification_owned,
+                                  memory_order_release);
             sock->base_socket = old_base_socket;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
             sock->endpoint_id = old_endpoint_id;
@@ -3692,6 +3800,7 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     uint8_t old_oneshot_fired;
     uint8_t old_pipe_terminal_delivered;
     uint8_t old_et_holdoff;
+    uint32_t old_waitable_notification_owned;
 
     pthread_mutex_lock(&port->fd_table_lock);
     ep_sock_t *sock = ep_fd_table_lookup(port, fd);
@@ -3715,6 +3824,8 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     old_needs_rearm = sock->needs_rearm;
     old_pipe_terminal_delivered = sock->pipe_terminal_delivered;
     old_et_holdoff = sock->et_holdoff;
+    old_waitable_notification_owned = atomic_load_explicit(
+        &sock->waitable_notification_owned, memory_order_acquire);
     old_base_socket = sock->base_socket;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     old_endpoint_id = sock->endpoint_id;
@@ -3725,6 +3836,14 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
                                              memory_order_relaxed);
     old_state = atomic_load_explicit(&sock->state, memory_order_relaxed);
 
+    if (old_ready_queued && ep_waitable_may_consume(sock) &&
+        (old_pending_events & ~(EPOLLERR | EPOLLHUP)) != 0) {
+        /* Rearming before the queued ONESHOT node is drained invalidates that
+         * node's generation.  Return its consumed notification to the live
+         * registration so the rearmed generation can replay it exactly once. */
+        atomic_store_explicit(&sock->waitable_notification_owned, 1,
+                              memory_order_release);
+    }
     ep_sock_set_oneshot_fired_locked(sock, 0);
     sock->pending_events = 0;
     sock->observed_events = 0;
@@ -3753,6 +3872,9 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
         ep_sock_set_needs_rearm_locked(sock, old_needs_rearm);
         sock->pipe_terminal_delivered = old_pipe_terminal_delivered;
         sock->et_holdoff = old_et_holdoff;
+        atomic_store_explicit(&sock->waitable_notification_owned,
+                              old_waitable_notification_owned,
+                              memory_order_release);
         sock->base_socket = old_base_socket;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
         sock->endpoint_id = old_endpoint_id;

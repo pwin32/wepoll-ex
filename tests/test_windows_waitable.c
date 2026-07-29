@@ -420,6 +420,425 @@ fail:
     return 1;
 }
 
+static int test_zero_interest_semaphore(void)
+{
+    HANDLE semaphore = NULL;
+    struct epoll_event event;
+    struct epoll_event output;
+    wepoll_ex_stats stats = {0};
+    int epfd = -1;
+    int n;
+
+    semaphore = CreateSemaphoreW(NULL, 1, 1, NULL);
+    if (semaphore == NULL)
+        return 1;
+    epfd = epoll_create1(0);
+    if (epfd < 0)
+        goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.data.u64 = 20;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)semaphore, &event) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 30);
+    if (n != 0 || !wait_for_semaphore_count(semaphore, 1, 1000) ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.pending_polls != 0 || stats.rearm_queue_depth != 0 ||
+        stats.ready_queue_depth != 0) {
+        fprintf(stderr,
+                "waitable-zero-semaphore: dormant n=%d pending=%llu "
+                "rearm=%llu ready=%llu errno=%d\n",
+                n, (unsigned long long)stats.pending_polls,
+                (unsigned long long)stats.rearm_queue_depth,
+                (unsigned long long)stats.ready_queue_depth, errno);
+        goto fail;
+    }
+
+    event.events = EPOLLIN;
+    event.data.u64 = 21;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)semaphore, &event) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || (output.events & EPOLLIN) == 0 ||
+        output.data.u64 != 21 ||
+        !wait_for_semaphore_count(semaphore, 0, 1000)) {
+        fprintf(stderr,
+                "waitable-zero-semaphore: re-enable n=%d events=%u "
+                "data=%llu errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0), errno);
+        goto fail;
+    }
+    if (epoll_wait(epfd, &output, 1, 30) != 0)
+        goto fail;
+
+    (void)wepoll_close(epfd);
+    CloseHandle(semaphore);
+    puts("waitable-zero-semaphore: OK");
+    return 0;
+
+fail:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (semaphore) CloseHandle(semaphore);
+    return 1;
+}
+
+static int test_pending_wait_to_zero(void)
+{
+    HANDLE semaphore = NULL;
+    struct epoll_event event;
+    struct epoll_event output;
+    wepoll_ex_stats stats = {0};
+    LONG previous = -1;
+    int epfd = -1;
+    int n;
+
+    semaphore = CreateSemaphoreW(NULL, 0, 1, NULL);
+    if (semaphore == NULL)
+        return 1;
+    epfd = epoll_create1(0);
+    if (epfd < 0)
+        goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = 30;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)semaphore, &event) != 0 ||
+        epoll_wait(epfd, &output, 1, 0) != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.pending_polls != 1) {
+        fprintf(stderr,
+                "waitable-zero-pending: arm pending=%llu errno=%d\n",
+                (unsigned long long)stats.pending_polls, errno);
+        goto fail;
+    }
+
+    event.events = 0;
+    event.data.u64 = 31;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)semaphore, &event) != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.pending_polls != 0 || stats.rearm_queue_depth != 0) {
+        fprintf(stderr,
+                "waitable-zero-pending: disarm pending=%llu rearm=%llu "
+                "errno=%d\n",
+                (unsigned long long)stats.pending_polls,
+                (unsigned long long)stats.rearm_queue_depth, errno);
+        goto fail;
+    }
+
+    if (!ReleaseSemaphore(semaphore, 1, &previous) || previous != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 30);
+    if (n != 0 || !wait_for_semaphore_count(semaphore, 1, 1000) ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.pending_polls != 0 || stats.ready_queue_depth != 0) {
+        fprintf(stderr,
+                "waitable-zero-pending: dormant signal n=%d pending=%llu "
+                "ready=%llu errno=%d\n",
+                n, (unsigned long long)stats.pending_polls,
+                (unsigned long long)stats.ready_queue_depth, errno);
+        goto fail;
+    }
+
+    event.events = EPOLLIN;
+    event.data.u64 = 32;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)semaphore, &event) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || (output.events & EPOLLIN) == 0 ||
+        output.data.u64 != 32 ||
+        !wait_for_semaphore_count(semaphore, 0, 1000)) {
+        fprintf(stderr,
+                "waitable-zero-pending: replay n=%d events=%u data=%llu "
+                "errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0), errno);
+        goto fail;
+    }
+
+    (void)wepoll_close(epfd);
+    CloseHandle(semaphore);
+    puts("waitable-zero-pending: OK");
+    return 0;
+
+fail:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (semaphore) CloseHandle(semaphore);
+    return 1;
+}
+
+static int test_callback_consumed_to_zero(void)
+{
+    HANDLE semaphore = NULL;
+    struct epoll_event event;
+    struct epoll_event output;
+    wepoll_ex_stats stats = {0};
+    LONG previous = -1;
+    int epfd = -1;
+    int n;
+
+    semaphore = CreateSemaphoreW(NULL, 0, 2, NULL);
+    if (semaphore == NULL)
+        return 1;
+    epfd = epoll_create1(0);
+    if (epfd < 0)
+        goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = 40;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)semaphore, &event) != 0 ||
+        epoll_wait(epfd, &output, 1, 0) != 0)
+        goto fail;
+    if (!ReleaseSemaphore(semaphore, 1, &previous) || previous != 0 ||
+        !wait_for_semaphore_count(semaphore, 0, 1000)) {
+        fputs("waitable-zero-callback: callback did not consume count\n",
+              stderr);
+        goto fail;
+    }
+    Sleep(10);
+
+    event.events = 0;
+    event.data.u64 = 41;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)semaphore, &event) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 30);
+    if (n != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.pending_polls != 0 || stats.ready_queue_depth != 0 ||
+        stats.rearm_queue_depth != 0) {
+        fprintf(stderr,
+                "waitable-zero-callback: dormant n=%d pending=%llu "
+                "ready=%llu rearm=%llu errno=%d\n",
+                n, (unsigned long long)stats.pending_polls,
+                (unsigned long long)stats.ready_queue_depth,
+                (unsigned long long)stats.rearm_queue_depth, errno);
+        goto fail;
+    }
+    if (!ReleaseSemaphore(semaphore, 1, &previous) || previous != 0 ||
+        !wait_for_semaphore_count(semaphore, 1, 1000)) {
+        fputs("waitable-zero-callback: dormant count was consumed\n",
+              stderr);
+        goto fail;
+    }
+
+    event.events = EPOLLIN;
+    event.data.u64 = 42;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)semaphore, &event) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || (output.events & EPOLLIN) == 0 ||
+        output.data.u64 != 42) {
+        fprintf(stderr,
+                "waitable-zero-callback: replay n=%d events=%u data=%llu "
+                "errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0), errno);
+        goto fail;
+    }
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || (output.events & EPOLLIN) == 0 ||
+        output.data.u64 != 42 ||
+        !wait_for_semaphore_count(semaphore, 0, 1000)) {
+        fprintf(stderr,
+                "waitable-zero-callback: accumulated count n=%d events=%u "
+                "data=%llu errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0), errno);
+        goto fail;
+    }
+    if (epoll_wait(epfd, &output, 1, 30) != 0) {
+        fputs("waitable-zero-callback: delivered a third notification\n",
+              stderr);
+        goto fail;
+    }
+
+    (void)wepoll_close(epfd);
+    CloseHandle(semaphore);
+    puts("waitable-zero-callback: OK");
+    return 0;
+
+fail:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (semaphore) CloseHandle(semaphore);
+    return 1;
+}
+
+static int test_queued_consumed_to_zero(void)
+{
+    HANDLE semaphores[2] = { NULL, NULL };
+    struct epoll_event event;
+    struct epoll_event output;
+    wepoll_ex_stats stats = {0};
+    int epfd = -1;
+    int other;
+    int n;
+
+    semaphores[0] = CreateSemaphoreW(NULL, 1, 1, NULL);
+    semaphores[1] = CreateSemaphoreW(NULL, 1, 1, NULL);
+    if (semaphores[0] == NULL || semaphores[1] == NULL)
+        goto fail;
+    epfd = epoll_create1(0);
+    if (epfd < 0)
+        goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = 1;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)semaphores[0], &event) != 0)
+        goto fail;
+    event.data.u64 = 2;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)semaphores[1], &event) != 0)
+        goto fail;
+
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || (output.data.u64 != 1 && output.data.u64 != 2) ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.ready_queue_depth != 1) {
+        fprintf(stderr,
+                "waitable-zero-ready: queue n=%d data=%llu ready=%llu "
+                "errno=%d\n",
+                n, (unsigned long long)(n > 0 ? output.data.u64 : 0),
+                (unsigned long long)stats.ready_queue_depth, errno);
+        goto fail;
+    }
+    other = output.data.u64 == 1 ? 1 : 0;
+
+    event.events = 0;
+    event.data.u64 = 50;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)semaphores[other], &event) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 30);
+    if (n != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.ready_queue_depth != 0) {
+        fprintf(stderr,
+                "waitable-zero-ready: dormant n=%d ready=%llu errno=%d\n",
+                n, (unsigned long long)stats.ready_queue_depth, errno);
+        goto fail;
+    }
+
+    event.events = EPOLLIN;
+    event.data.u64 = 51;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)semaphores[other], &event) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || (output.events & EPOLLIN) == 0 ||
+        output.data.u64 != 51 ||
+        !wait_for_semaphore_count(semaphores[other], 0, 1000)) {
+        fprintf(stderr,
+                "waitable-zero-ready: replay n=%d events=%u data=%llu "
+                "errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0), errno);
+        goto fail;
+    }
+    if (epoll_wait(epfd, &output, 1, 30) != 0) {
+        fputs("waitable-zero-ready: replayed notification twice\n", stderr);
+        goto fail;
+    }
+
+    (void)wepoll_close(epfd);
+    CloseHandle(semaphores[0]);
+    CloseHandle(semaphores[1]);
+    puts("waitable-zero-ready: OK");
+    return 0;
+
+fail:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (semaphores[0]) CloseHandle(semaphores[0]);
+    if (semaphores[1]) CloseHandle(semaphores[1]);
+    return 1;
+}
+
+static int test_queued_consumptive_rearm(void)
+{
+    HANDLE semaphores[2] = { NULL, NULL };
+    struct epoll_event event;
+    struct epoll_event output;
+    wepoll_ex_stats stats = {0};
+    uint64_t expected_data;
+    int epfd = -1;
+    int other;
+    int n;
+
+    semaphores[0] = CreateSemaphoreW(NULL, 1, 1, NULL);
+    semaphores[1] = CreateSemaphoreW(NULL, 1, 1, NULL);
+    if (semaphores[0] == NULL || semaphores[1] == NULL)
+        goto fail;
+    epfd = epoll_create1(0);
+    if (epfd < 0)
+        goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLONESHOT;
+    event.data.u64 = 1;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)semaphores[0], &event) != 0)
+        goto fail;
+    event.data.u64 = 2;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)semaphores[1], &event) != 0)
+        goto fail;
+
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || (output.data.u64 != 1 && output.data.u64 != 2) ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.ready_queue_depth != 1) {
+        fprintf(stderr,
+                "waitable-queued-rearm: queue n=%d data=%llu ready=%llu "
+                "errno=%d\n",
+                n, (unsigned long long)(n > 0 ? output.data.u64 : 0),
+                (unsigned long long)stats.ready_queue_depth, errno);
+        goto fail;
+    }
+    other = output.data.u64 == 1 ? 1 : 0;
+    expected_data = other == 0 ? UINT64_C(1) : UINT64_C(2);
+
+    if (epoll_rearm(epfd, (epoll_fd_t)semaphores[other]) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || (output.events & EPOLLIN) == 0 ||
+        output.data.u64 != expected_data ||
+        !wait_for_semaphore_count(semaphores[other], 0, 1000)) {
+        fprintf(stderr,
+                "waitable-queued-rearm: replay n=%d events=%u data=%llu "
+                "expected=%llu errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0),
+                (unsigned long long)expected_data, errno);
+        goto fail;
+    }
+    if (epoll_wait(epfd, &output, 1, 30) != 0) {
+        fputs("waitable-queued-rearm: replayed notification twice\n", stderr);
+        goto fail;
+    }
+
+    (void)wepoll_close(epfd);
+    CloseHandle(semaphores[0]);
+    CloseHandle(semaphores[1]);
+    puts("waitable-queued-rearm: OK");
+    return 0;
+
+fail:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (semaphores[0]) CloseHandle(semaphores[0]);
+    if (semaphores[1]) CloseHandle(semaphores[1]);
+    return 1;
+}
+
 static int test_waitable_pending_mod(void)
 {
     HANDLE semaphore = NULL;
@@ -617,61 +1036,102 @@ fail:
     return 1;
 }
 
-static int test_timer_et_rejected(void)
+static int test_timer_et_dormant(void)
 {
-    HANDLE timer = NULL;
+    HANDLE timers[2] = { NULL, NULL };
     LARGE_INTEGER due;
     struct epoll_event event;
-    uint32_t events = 0;
+    struct epoll_event output;
+    wepoll_ex_stats stats = {0};
     int epfd = -1;
     int n;
 
-    timer = CreateWaitableTimerW(NULL, FALSE, NULL);
-    if (timer == NULL)
-        return 1;
+    timers[0] = CreateWaitableTimerW(NULL, FALSE, NULL);
+    timers[1] = CreateWaitableTimerW(NULL, FALSE, NULL);
+    if (timers[0] == NULL || timers[1] == NULL)
+        goto fail;
     epfd = epoll_create1(0);
     if (epfd < 0)
         goto fail;
 
     memset(&event, 0, sizeof(event));
+    event.events = EPOLLET;
+    event.data.u64 = 60;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)timers[0], &event) != 0 ||
+        epoll_wait(epfd, &output, 1, 0) != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.pending_polls != 0 || stats.rearm_queue_depth != 0 ||
+        stats.ready_queue_depth != 0) {
+        fprintf(stderr,
+                "waitable-timer-et: dormant ADD pending=%llu rearm=%llu "
+                "ready=%llu errno=%d\n",
+                (unsigned long long)stats.pending_polls,
+                (unsigned long long)stats.rearm_queue_depth,
+                (unsigned long long)stats.ready_queue_depth, errno);
+        goto fail;
+    }
+
     event.events = EPOLLIN | EPOLLET;
     errno = 0;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, (epoll_fd_t)timer, &event) != -1 ||
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)timers[1], &event) != -1 ||
         errno != EINVAL) {
         fprintf(stderr, "waitable-timer-et: ADD errno=%d\n", errno);
         goto fail;
     }
 
-    event.events = EPOLLIN;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, (epoll_fd_t)timer, &event) != 0)
-        goto fail;
     event.events = EPOLLIN | EPOLLET;
+    event.data.u64 = 61;
     errno = 0;
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, (epoll_fd_t)timer, &event) != -1 ||
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)timers[0], &event) != -1 ||
         errno != EINVAL) {
         fprintf(stderr, "waitable-timer-et: MOD errno=%d\n", errno);
         goto fail;
     }
 
     due.QuadPart = -10000;
-    if (!SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+    if (!SetWaitableTimer(timers[0], &due, 0, NULL, NULL, FALSE))
         goto fail;
-    n = wait_one(epfd, 1000, &events);
-    if (n != 1 || (events & EPOLLIN) == 0) {
+    n = epoll_wait(epfd, &output, 1, 30);
+    if (n != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.pending_polls != 0 || stats.ready_queue_depth != 0) {
         fprintf(stderr,
-                "waitable-timer-et: failed MOD changed LT registration n=%d\n",
-                n);
+                "waitable-timer-et: dormant signal n=%d pending=%llu "
+                "ready=%llu errno=%d\n",
+                n, (unsigned long long)stats.pending_polls,
+                (unsigned long long)stats.ready_queue_depth, errno);
+        goto fail;
+    }
+
+    event.events = EPOLLIN;
+    event.data.u64 = 62;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)timers[0], &event) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || (output.events & EPOLLIN) == 0 ||
+        output.data.u64 != 62) {
+        fprintf(stderr,
+                "waitable-timer-et: re-enable n=%d events=%u data=%llu "
+                "errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0), errno);
         goto fail;
     }
 
     (void)wepoll_close(epfd);
-    CloseHandle(timer);
+    CloseHandle(timers[0]);
+    CloseHandle(timers[1]);
     puts("waitable-timer-et: OK");
     return 0;
 
 fail:
     if (epfd >= 0) (void)wepoll_close(epfd);
-    if (timer) CloseHandle(timer);
+    if (timers[0]) CloseHandle(timers[0]);
+    if (timers[1]) CloseHandle(timers[1]);
     return 1;
 }
 
@@ -814,6 +1274,99 @@ fail:
         CloseHandle(thread);
     }
     if (process != NULL) CloseHandle(process);
+    return 1;
+}
+
+static int test_thread_handle_dormant(void)
+{
+    HANDLE thread = NULL;
+    struct epoll_event event;
+    struct epoll_event output;
+    wepoll_ex_stats stats = {0};
+    int epfd = -1;
+    int n;
+
+    thread = CreateThread(NULL, 0, exit_thread, NULL, CREATE_SUSPENDED, NULL);
+    if (thread == NULL)
+        return 1;
+    epfd = epoll_create1(0);
+    if (epfd < 0)
+        goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = 70;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)thread, &event) != 0 ||
+        epoll_wait(epfd, &output, 1, 0) != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.pending_polls != 1) {
+        fprintf(stderr,
+                "waitable-zero-thread: arm pending=%llu errno=%d\n",
+                (unsigned long long)stats.pending_polls, errno);
+        goto fail;
+    }
+
+    event.events = 0;
+    event.data.u64 = 71;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)thread, &event) != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.pending_polls != 0 || stats.rearm_queue_depth != 0) {
+        fprintf(stderr,
+                "waitable-zero-thread: disarm pending=%llu rearm=%llu "
+                "errno=%d\n",
+                (unsigned long long)stats.pending_polls,
+                (unsigned long long)stats.rearm_queue_depth, errno);
+        goto fail;
+    }
+
+    if (ResumeThread(thread) == (DWORD)-1 ||
+        WaitForSingleObject(thread, 1000) != WAIT_OBJECT_0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 30);
+    if (n != 0 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.pending_polls != 0 || stats.ready_queue_depth != 0 ||
+        stats.rearm_queue_depth != 0) {
+        fprintf(stderr,
+                "waitable-zero-thread: dormant exit n=%d pending=%llu "
+                "ready=%llu rearm=%llu errno=%d\n",
+                n, (unsigned long long)stats.pending_polls,
+                (unsigned long long)stats.ready_queue_depth,
+                (unsigned long long)stats.rearm_queue_depth, errno);
+        goto fail;
+    }
+
+    event.events = EPOLLIN;
+    event.data.u64 = 72;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)thread, &event) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || (output.events & EPOLLIN) == 0 ||
+        output.data.u64 != 72 ||
+        epoll_wait(epfd, &output, 1, 30) != 1) {
+        fprintf(stderr,
+                "waitable-zero-thread: re-enable n=%d events=%u data=%llu "
+                "errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0), errno);
+        goto fail;
+    }
+
+    (void)wepoll_close(epfd);
+    CloseHandle(thread);
+    puts("waitable-zero-thread: OK");
+    return 0;
+
+fail:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (thread != NULL) {
+        (void)ResumeThread(thread);
+        (void)WaitForSingleObject(thread, 1000);
+        CloseHandle(thread);
+    }
     return 1;
 }
 
@@ -1174,6 +1727,16 @@ static int run_mode(const char *mode)
         return test_semaphore_handle();
     if (strcmp(mode, "semaphore-et") == 0)
         return test_semaphore_handle_et();
+    if (strcmp(mode, "zero-semaphore") == 0)
+        return test_zero_interest_semaphore();
+    if (strcmp(mode, "zero-pending") == 0)
+        return test_pending_wait_to_zero();
+    if (strcmp(mode, "zero-callback") == 0)
+        return test_callback_consumed_to_zero();
+    if (strcmp(mode, "zero-ready") == 0)
+        return test_queued_consumed_to_zero();
+    if (strcmp(mode, "queued-rearm") == 0)
+        return test_queued_consumptive_rearm();
     if (strcmp(mode, "pending-mod") == 0)
         return test_waitable_pending_mod();
     if (strcmp(mode, "ready-mod") == 0)
@@ -1181,13 +1744,15 @@ static int run_mode(const char *mode)
     if (strcmp(mode, "timer-ready-mod") == 0)
         return test_timer_ready_mod();
     if (strcmp(mode, "timer-et") == 0)
-        return test_timer_et_rejected();
+        return test_timer_et_dormant();
     if (strcmp(mode, "job") == 0)
         return test_job_rejected();
     if (strcmp(mode, "access") == 0)
         return test_waitable_access_rejected();
     if (strcmp(mode, "process-thread") == 0)
         return test_process_and_thread_handles();
+    if (strcmp(mode, "zero-thread") == 0)
+        return test_thread_handle_dormant();
     if (strcmp(mode, "thread-et") == 0)
         return test_thread_handle_et_terminal();
     if (strcmp(mode, "exclusive") == 0)
@@ -1210,9 +1775,12 @@ int main(int argc, char **argv)
     int failures = 0;
     const char *modes[] = {
         "event", "event-et", "auto-reset", "auto-reset-et", "semaphore",
-        "semaphore-et", "pending-mod", "ready-mod", "timer-ready-mod",
-        "timer-et", "job", "access", "process-thread", "thread-et",
-        "exclusive", "mutex", "cleanup", "cancel", "cancel-batch"
+        "semaphore-et", "zero-semaphore", "zero-pending", "zero-callback",
+        "zero-ready", "queued-rearm", "pending-mod", "ready-mod",
+        "timer-ready-mod",
+        "timer-et", "job", "access", "process-thread", "zero-thread",
+        "thread-et", "exclusive", "mutex", "cleanup", "cancel",
+        "cancel-batch"
     };
     size_t i;
 

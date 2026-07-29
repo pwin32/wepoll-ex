@@ -386,7 +386,11 @@ struct ep_sock {
      * ensure cancellation produces exactly one completion packet. */
     _Atomic uint32_t callback_active;
     _Atomic uint32_t completion_posted;
-    uint8_t aux_consumed_pending;
+    /* One consumptive/mode-unknown waitable notification that has already
+     * been removed from the kernel object but is not represented by a ready
+     * node.  Callback, cancellation, dormancy, and allocation-failure paths
+     * preserve this ownership until a replacement ready node is queued. */
+    _Atomic uint32_t waitable_notification_owned;
     uint8_t oneshot_fired;
     uint8_t needs_rearm;
     /* A final-shape pipe ET snapshot reached the user-ready drain.  If its

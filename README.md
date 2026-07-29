@@ -126,17 +126,25 @@ filtering;
 auto-reset events and semaphores deliver one ET notification per consumed
 signal/count. Terminated process/thread handles deliver their terminal ET edge
 once and then stay idle instead of entering the reset-detection retry loop.
-MOD preserves an in-flight waitable/pipe operation and applies the latest
-mask/data when it completes. A queued notification from a known-consumptive or
-mode-unknown waitable is replaced with an equivalent current-generation
-snapshot so MOD cannot discard a signal or timer expiration that the
-underlying wait may already have consumed. ET is rejected for waitable timers
-because an arbitrary timer HANDLE does not expose its reset mode. Blocking
-auxiliary cancellation retires an unsignaled registration immediately when no
-packet was posted; an already-posted packet keeps storage pinned until dequeue.
-If callback retirement first fails after consuming an auto-reset event,
-semaphore count, or mode-unknown wait, the consumed notification is preserved
-and replayed after cleanup succeeds.
+A waitable with no requested readiness aliases is dormant: ADD and wait do not
+probe it, register a callback, queue rearm work, or consume a signal/count.
+MOD from active interest to zero synchronously disarms the callback before the
+new mask becomes visible. An already-posted packet may remain physically
+pending until dequeue, but it owns no active wait. If its callback already
+consumed an auto-reset event, semaphore count, or mode-unknown notification,
+that observation remains owned across dormancy and is replayed before probing
+when interest is restored. The same transfer preserves a consumptive ready
+node invalidated by MOD-to-zero or an early `epoll_rearm()`, and a notification
+whose ready-node allocation failed. A callback that wins immediately before
+MOD-to-zero linearizes cannot be un-consumed from the underlying Windows
+object. Flags-only `EPOLLET` is
+therefore accepted for an otherwise dormant timer or mode-unknown waitable;
+adding nonzero interest while ET remains set is rejected because an arbitrary
+HANDLE does not expose its reset mode. Other MOD operations preserve an
+in-flight waitable/pipe operation and apply the latest mask/data when it
+completes. Blocking auxiliary cancellation retires an unsignaled registration
+immediately when no packet was posted; an already-posted packet keeps storage
+pinned until dequeue.
 
 Windows socket event translation consumes both the AFD event bits and the
 per-handle completion status. A negative per-handle status reports
