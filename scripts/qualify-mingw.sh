@@ -67,7 +67,7 @@ configure_and_test()
     cmake --build "$build_dir" --parallel "$jobs"
     ctest --test-dir "$build_dir" --output-on-failure
     "$script_dir/repeat-ctest.sh" "$build_dir" "$repeat_count" \
-        'wepoll_ex_windows_(api|stress|backpressure|compat_concurrent_ctl|pwait2_(conversion|generation_deadline|readiness_wins|close|fallback)|socket_events_(aliases|oob_(lt|et|oneshot|mod|inline_(lt|et)))|events_(mapping|status))$'
+        'wepoll_ex_windows_(api|stress|backpressure|compat_concurrent_ctl|pwait2_(conversion|generation_deadline|readiness_wins|close|fallback)|pipe_.*|socket_events_(aliases|oob_(lt|et|oneshot|mod|inline_(lt|et)))|events_(mapping|status))$'
 }
 
 if variant_enabled combined; then

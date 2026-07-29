@@ -235,7 +235,8 @@ else()
                 pending-expansion-mod
                 transitional-idle
                 aux-posted-cancel
-                aux-post-close-lease)
+                aux-post-close-lease
+                pipe-invalid-et)
             string(REPLACE "-" "_" _state_name "${_state_mode}")
             add_test(NAME wepoll_ex_windows_state_${_state_name}
                 COMMAND test_wepoll_ex_windows_state ${_state_mode})
@@ -382,6 +383,19 @@ else()
             oneshot
             named
             hup
+            exact-eof
+            aliases
+            broken-writer
+            broken-writer-et
+            terminal-oneshot
+            terminal-oneshot-rearm
+            et-hup
+            write-lt
+            write-et
+            named-overlapped
+            named-outbound-fallback
+            named-reconnect-et
+            named-duplex-et-mixed
             mod
             exclusive
             cancel

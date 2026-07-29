@@ -208,15 +208,48 @@ metadata reference before unwinding.
   is discarded.
   Waitable-timer ET and ET on an event whose reset mode cannot be queried are
   rejected with `EINVAL`; LT remains supported.
-- Pipes use short timer-queue polls with `PeekNamedPipe` because anonymous pipe
-  handles are not reliably waitable. This supports read readiness, EOF/HUP,
-  level, observed-edge, oneshot, pending MOD, and both anonymous and named pipe
-  handles. Read/write readiness is filtered through the HANDLE's granted data
-  access, so a read-only endpoint cannot report writable and a write-only
-  endpoint cannot report readable. Writable readiness is still advisory on
-  Windows because `PeekNamedPipe` does not expose exact remaining write quota.
-  Polling is a compatibility path, not a high-scale substitute for overlapped
-  application I/O. Pipe and waitable registrations reject `EPOLLEXCLUSIVE`.
+- Pipes use short timer-queue polls because anonymous pipe handles are not
+  reliably waitable. Each poll combines
+  `NtQueryInformationFile(FilePipeLocalInformation)` state, readable-byte, and
+  writable-quota fields with the existing `PeekNamedPipe` fallback and the
+  ADD-time granted-access classification. Readable data produces only the
+  requested `EPOLLIN`/`EPOLLRDNORM` aliases. A read endpoint whose writer has
+  closed retains those aliases while buffered data remains and adds unrequested
+  `EPOLLHUP`; after the buffer drains, or when EOF starts empty, the result is
+  `EPOLLHUP` alone. A connected write endpoint reports the requested
+  `EPOLLOUT`/`EPOLLWRNORM` aliases while quota remains; a write endpoint whose
+  reader has closed retains those requested aliases and adds unrequested
+  `EPOLLERR`, without `EPOLLHUP`. Pipes do not produce `EPOLLRDBAND` or
+  `EPOLLWRBAND`.
+- Pipe ET normally reports only readiness aliases that rose since the previous
+  valid sample, so a duplex registration does not repeat `OUT` merely because
+  `IN` appeared or disappeared. A newly raised terminal condition includes the
+  current normal aliases, and draining buffered EOF produces one final HUP
+  snapshot; together these preserve `IN` -> `IN|HUP` -> `HUP` and
+  `OUT` -> `OUT|ERR`. A rejected or unavailable native metadata sample does not
+  clear the edge latch. A natively identified terminal client end stops polling
+  after its stable final snapshot has been delivered. A named-pipe server end
+  remains eligible for resampling because one HANDLE can serve another client
+  after `DisconnectNamedPipe()` and `ConnectNamedPipe()`; readiness on the
+  replacement client forms a fresh edge without MOD. Fallback-derived ends are
+  also sampled conservatively because their client/server role is unknown. A
+  peer-closed ONESHOT registration remains installed so MOD or `epoll_rearm()`
+  can rearm it. Pending MOD and both anonymous and named pipe handles remain
+  supported.
+  Read/write readiness is filtered through the HANDLE's granted data access, so
+  a read-only endpoint cannot report writable and a write-only endpoint cannot
+  report readable.
+- Writable backpressure and restoration normally follow quota exhaustion in
+  `FILE_PIPE_LOCAL_INFORMATION`. If the native query is unavailable or returns
+  `STATUS_ACCESS_DENIED`, the adapter uses `PeekNamedPipe`; write-only handles
+  can then retain advisory writable readiness and peer closure may be
+  indistinguishable. Pure write-only outbound named-pipe server handles are the
+  known access-denied case. Other native-query errors produce no fabricated
+  readiness and are retried by the timer path. Overlapped pipe HANDLEs use the
+  same synchronous metadata snapshots, independently of application
+  `OVERLAPPED` operations. Polling is a compatibility path, not a high-scale
+  substitute for overlapped application I/O. Pipe and waitable registrations
+  reject `EPOLLEXCLUSIVE`.
 - Applications must issue DEL before `CloseHandle()` for a registered pipe or
   waitable object. The socket identity policies do not extend to arbitrary
   HANDLE reuse.

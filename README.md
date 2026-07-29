@@ -97,11 +97,32 @@ selected waitable HANDLEs (events, semaphores, waitable timers, processes,
 and threads). Waitable HANDLEs must grant `SYNCHRONIZE`; otherwise ADD returns
 `EACCES`. Mutexes, jobs, ordinary disk files, and other unsupported object
 types are rejected with Linux-compatible `EPERM`. Pipe readiness uses short
-`PeekNamedPipe` timer polls and respects the HANDLE's granted read/write access;
-writable readiness on a write-capable handle is advisory, so high-throughput
-pipe users should still use overlapped I/O. Issue `EPOLL_CTL_DEL` before
-`CloseHandle()` for every registered non-socket object. `EPOLLONESHOT` is
-supported. Manual-reset events use ordinary observed-level ET filtering;
+timer polls and combines `NtQueryInformationFile(FilePipeLocalInformation)`
+state/quota snapshots with the existing `PeekNamedPipe` fallback and HANDLE
+access classification. Buffered read-side EOF reports the requested
+`EPOLLIN`/`EPOLLRDNORM` aliases plus
+unrequested `EPOLLHUP`; empty or drained EOF reports `EPOLLHUP` alone. A write
+endpoint whose reader has closed reports the requested `EPOLLOUT`/`EPOLLWRNORM`
+aliases plus unrequested `EPOLLERR`, without `EPOLLHUP`. Pipes never synthesize
+`EPOLLRDBAND` or `EPOLLWRBAND`. Pipe ET reports ordinary rising readiness
+aliases without repeating unrelated active directions. A newly raised terminal
+condition includes the current normal aliases, preserving the
+`IN` -> `IN|HUP` -> `HUP` and `OUT` -> `OUT|ERR` sequences. Unavailable native
+metadata samples do not clear the edge latch. A peer-closed ONESHOT registration
+remains installed for MOD or `epoll_rearm()` rearm. A natively identified
+terminal client pipe end stops polling after its final ET snapshot. A
+named-pipe server HANDLE remains
+sampled because `DisconnectNamedPipe()` and `ConnectNamedPipe()` can reuse the
+same HANDLE; readiness on the next client produces a fresh edge without MOD.
+Writable backpressure and restoration normally follow the reported quota.
+When native local information is unavailable or access is denied, the
+`PeekNamedPipe` compatibility path can retain advisory writable readiness and
+may not distinguish peer closure. Pure write-only outbound named-pipe servers
+are the known access-denied case. Overlapped pipe HANDLEs use the same metadata
+sampling; the adapter does not manage application `OVERLAPPED` requests. Issue
+`EPOLL_CTL_DEL` before `CloseHandle()` for every registered non-socket object.
+`EPOLLONESHOT` is supported. Manual-reset events use ordinary observed-level ET
+filtering;
 auto-reset events and semaphores deliver one ET notification per consumed
 signal/count. Terminated process/thread handles deliver their terminal ET edge
 once and then stay idle instead of entering the reset-detection retry loop.
@@ -172,7 +193,9 @@ optional and Windows scheduling can wake later than the requested deadline,
 edge delivery is observed-level rather than Linux kernel queue semantics, AFD
 collapses the writable aliases into one readiness class, `EPOLLMSG` is never
 produced, `SO_OOBINLINE` collapses priority into ordinary readability, unknown
-provider protocol metadata retains a conservative abort mapping,
+provider protocol metadata retains a conservative abort mapping, pipe writable
+readiness can remain advisory when native local information is unavailable or
+access is denied,
 exclusive-claim updates serialize through one process-wide mutex, and virtual
 epoll descriptors cannot be nested.
 

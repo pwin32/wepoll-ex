@@ -28,6 +28,14 @@
 #  define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002UL
 #endif
 
+#define EP_FILE_PIPE_LOCAL_INFORMATION_CLASS 24U
+#define EP_PIPE_STATE_DISCONNECTED 1U
+#define EP_PIPE_STATE_LISTENING     2U
+#define EP_PIPE_STATE_CONNECTED     3U
+#define EP_PIPE_STATE_CLOSING       4U
+#define EP_PIPE_SERVER_END          1U
+#define EP_STATUS_INVALID_HANDLE    UINT32_C(0xC0000008)
+
 static _Atomic uint64_t g_quarantined_ports;
 
 #ifdef _WIN32
@@ -847,46 +855,236 @@ static int ep_pipe_query_access(HANDLE handle, uint8_t *access_out)
     return 0;
 }
 
-static uint32_t ep_pipe_level_events(const ep_sock_t *sock)
+typedef struct ep_pipe_local_information {
+    ULONG named_pipe_type;
+    ULONG named_pipe_configuration;
+    ULONG maximum_instances;
+    ULONG current_instances;
+    ULONG inbound_quota;
+    ULONG read_data_available;
+    ULONG outbound_quota;
+    ULONG write_quota_available;
+    ULONG named_pipe_state;
+    ULONG named_pipe_end;
+} ep_pipe_local_information_t;
+
+typedef struct ep_pipe_snapshot {
+    uint32_t events;
+    uint8_t local_closed;
+    uint8_t valid;
+    uint8_t native_information;
+    uint8_t server_end;
+} ep_pipe_snapshot_t;
+
+static uint32_t ep_pipe_read_events(const ep_sock_t *sock)
 {
+    return sock->user_events & (EPOLLIN | EPOLLRDNORM);
+}
+
+static uint32_t ep_pipe_write_events(const ep_sock_t *sock)
+{
+    return sock->user_events & (EPOLLOUT | EPOLLWRNORM);
+}
+
+static uint32_t ep_pipe_peer_closed_events(const ep_sock_t *sock,
+                                            ULONG available)
+{
+    uint32_t events = 0;
+
+    if ((sock->pipe_access & EP_PIPE_ACCESS_READ) != 0) {
+        if (available > 0) {
+            events |= ep_pipe_read_events(sock);
+        }
+        events |= EPOLLHUP;
+    }
+    if ((sock->pipe_access & EP_PIPE_ACCESS_WRITE) != 0) {
+        events |= ep_pipe_write_events(sock) | EPOLLERR;
+    }
+    return events;
+}
+
+static ep_pipe_snapshot_t ep_pipe_fallback_snapshot(const ep_sock_t *sock)
+{
+    ep_pipe_snapshot_t snapshot = {0};
     DWORD available = 0;
-    DWORD left = 0;
-    uint32_t out = 0;
-    uint32_t interest = sock->user_events | EPOLLERR | EPOLLHUP;
 
-    if (!PeekNamedPipe((HANDLE)sock->fd, NULL, 0, NULL, &available, &left)) {
-        DWORD error = GetLastError();
-        if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED ||
-            error == ERROR_INVALID_HANDLE || error == ERROR_BAD_PIPE) {
-            out = EPOLLHUP | EPOLLERR;
-            if ((sock->pipe_access & EP_PIPE_ACCESS_READ) != 0) {
-                out |= EPOLLIN | EPOLLRDNORM;
-            }
-            if ((sock->pipe_access & EP_PIPE_ACCESS_WRITE) != 0) {
-                out |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
-            }
-            return out & interest;
+    if (PeekNamedPipe((HANDLE)sock->fd, NULL, 0, NULL, &available, NULL)) {
+        snapshot.valid = 1;
+        if ((sock->pipe_access & EP_PIPE_ACCESS_READ) != 0 &&
+            available > 0) {
+            snapshot.events |= ep_pipe_read_events(sock);
         }
-        /* Write ends often reject PeekNamedPipe; treat as writable unless
-         * the handle is known dead. */
+        if ((sock->pipe_access & EP_PIPE_ACCESS_WRITE) != 0) {
+            snapshot.events |= ep_pipe_write_events(sock);
+        }
+        return snapshot;
+    }
+
+    switch (GetLastError()) {
+    case ERROR_INVALID_HANDLE:
+        snapshot.local_closed = 1;
+        break;
+    case ERROR_BROKEN_PIPE:
+    case ERROR_PIPE_NOT_CONNECTED:
+    case ERROR_BAD_PIPE:
+        snapshot.valid = 1;
+        snapshot.events = ep_pipe_peer_closed_events(sock, 0);
+        break;
+    case ERROR_ACCESS_DENIED:
+        /* Pure write-only pipe handles reject PeekNamedPipe.  Without the
+         * optional native query, retain advisory writable readiness; peer
+         * closure cannot be distinguished on this fallback path. */
+        snapshot.valid = 1;
+        if ((sock->pipe_access & EP_PIPE_ACCESS_WRITE) != 0) {
+            snapshot.events |= ep_pipe_write_events(sock);
+        }
+        break;
+    default:
+        break;
+    }
+    return snapshot;
+}
+
+static ep_pipe_snapshot_t ep_pipe_snapshot(const ep_sock_t *sock)
+{
+    ep_pipe_local_information_t info;
+    ep_pipe_snapshot_t snapshot = {0};
+    IO_STATUS_BLOCK io_status_block;
+    NTSTATUS status;
+
+    if (g_ntdll.NtQueryInformationFile == NULL) {
+        return ep_pipe_fallback_snapshot(sock);
+    }
+
+    memset(&info, 0, sizeof(info));
+    memset(&io_status_block, 0, sizeof(io_status_block));
+    /* NtQueryInformationFile is a synchronous metadata query: its documented
+     * contract returns STATUS_SUCCESS or an error, unlike the read/write NT
+     * routines that can leave caller storage live behind STATUS_PENDING. */
+    status = g_ntdll.NtQueryInformationFile(
+        (HANDLE)sock->fd, &io_status_block, &info, (ULONG)sizeof(info),
+        EP_FILE_PIPE_LOCAL_INFORMATION_CLASS);
+    if (status != STATUS_SUCCESS ||
+        io_status_block.Status != STATUS_SUCCESS ||
+        io_status_block.Information != sizeof(info)) {
+        DWORD error;
+
+        if ((uint32_t)status == EP_STATUS_INVALID_HANDLE) {
+            snapshot.local_closed = 1;
+            return snapshot;
+        }
+        error = ep_ntstatus_to_winerr(
+            status != STATUS_SUCCESS ? status : io_status_block.Status);
+        if (error == ERROR_INVALID_HANDLE) {
+            snapshot.local_closed = 1;
+            return snapshot;
+        }
+        if (error == ERROR_BROKEN_PIPE ||
+            error == ERROR_PIPE_NOT_CONNECTED || error == ERROR_BAD_PIPE) {
+            snapshot.valid = 1;
+            snapshot.events = ep_pipe_peer_closed_events(sock, 0);
+            return snapshot;
+        }
+        if (error == ERROR_ACCESS_DENIED) {
+            return ep_pipe_fallback_snapshot(sock);
+        }
+        /* A transient or provider-specific query error is not evidence of
+         * readiness.  The timer path retries without fabricating writable
+         * state; only the explicit access-denied compatibility path remains
+         * advisory. */
+        return snapshot;
+    }
+
+    snapshot.valid = 1;
+    snapshot.native_information = 1;
+    snapshot.server_end = info.named_pipe_end == EP_PIPE_SERVER_END;
+
+    switch (info.named_pipe_state) {
+    case EP_PIPE_STATE_CONNECTED:
+        if ((sock->pipe_access & EP_PIPE_ACCESS_READ) != 0 &&
+            info.read_data_available > 0) {
+            snapshot.events |= ep_pipe_read_events(sock);
+        }
         if ((sock->pipe_access & EP_PIPE_ACCESS_WRITE) != 0 &&
-            (sock->user_events &
-             (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) != 0) {
-            out |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
+            info.write_quota_available > 0) {
+            snapshot.events |= ep_pipe_write_events(sock);
         }
-        return out & interest;
+        break;
+    case EP_PIPE_STATE_DISCONNECTED:
+    case EP_PIPE_STATE_CLOSING:
+        snapshot.events = ep_pipe_peer_closed_events(
+            sock, info.read_data_available);
+        break;
+    case EP_PIPE_STATE_LISTENING:
+    default:
+        break;
+    }
+    return snapshot;
+}
+
+static int ep_pipe_et_events_have_final_shape(const ep_sock_t *sock,
+                                              uint32_t events)
+{
+    if ((events & EPOLLHUP) != 0 &&
+        (events & (EPOLLIN | EPOLLRDNORM)) == 0) {
+        return 1;
+    }
+    return (events & EPOLLERR) != 0 &&
+        (sock->pipe_access & EP_PIPE_ACCESS_READ) == 0;
+}
+
+static int ep_pipe_et_snapshot_is_final(const ep_sock_t *sock,
+                                        uint32_t events,
+                                        const ep_pipe_snapshot_t *snapshot)
+{
+    if (!snapshot->valid || !snapshot->native_information ||
+        snapshot->server_end) {
+        /* A named-pipe server HANDLE can be disconnected and connected to a
+         * later client without changing its numeric value.  Keep it eligible
+         * for resampling after terminal ET delivery.  Unknown fallback ends
+         * are treated conservatively for the same reason. */
+        return 0;
+    }
+    return ep_pipe_et_events_have_final_shape(sock, events);
+}
+
+static uint32_t ep_pipe_et_events(ep_sock_t *sock,
+                                  const ep_pipe_snapshot_t *snapshot)
+{
+    uint32_t level;
+    uint32_t previous;
+    uint32_t rising;
+    uint32_t falling;
+    uint32_t delivered;
+
+    if (!snapshot->valid) {
+        /* An unavailable metadata sample is not evidence that readiness fell.
+         * Retain the edge latch so a later successful retry cannot duplicate
+         * an unchanged level. */
+        return 0;
     }
 
-    if ((sock->pipe_access & EP_PIPE_ACCESS_READ) != 0 && available > 0 &&
-        (sock->user_events & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP)) != 0) {
-        out |= EPOLLIN | EPOLLRDNORM;
+    level = snapshot->events;
+    previous = sock->observed_events;
+    rising = level & ~previous;
+    falling = previous & ~level;
+
+    if ((rising & (EPOLLHUP | EPOLLERR)) != 0) {
+        /* Linux includes the current normal aliases when a terminal condition
+         * first appears (for example IN -> IN|HUP and OUT -> OUT|ERR). */
+        delivered = level;
+    } else if ((level & EPOLLHUP) != 0 &&
+               (falling & (EPOLLIN | EPOLLRDNORM)) != 0) {
+        /* Draining buffered pipe data after EOF produces one final HUP-only
+         * snapshot.  This is the one falling transition that forms another
+         * pipe event; ordinary IN/OUT disappearance must stay silent. */
+        delivered = level;
+    } else {
+        delivered = rising;
     }
-    if ((sock->pipe_access & EP_PIPE_ACCESS_WRITE) != 0 &&
-        (sock->user_events &
-         (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) != 0) {
-        out |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
-    }
-    return out & interest;
+
+    sock->observed_events = level;
+    return delivered;
 }
 
 static VOID CALLBACK ep_pipe_timer_callback(PVOID parameter, BOOLEAN fired)
@@ -932,15 +1130,13 @@ static int ep_pipe_delete_timer_locked(ep_sock_t *sock)
     return 0;
 }
 
-static int ep_pipe_schedule_locked(ep_sock_t *sock)
+static int ep_pipe_schedule_locked(ep_sock_t *sock, uint32_t level)
 {
     HANDLE timer = NULL;
-    uint32_t level;
 
     if (sock->wait_registration != NULL) {
         return 0;
     }
-    level = ep_pipe_level_events(sock);
     if (level != 0) {
         if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
             ep_set_errno(ep_winerr_to_errno(GetLastError()));
@@ -1778,6 +1974,7 @@ static void ep_sock_free_locked(ep_port_t *port, ep_sock_t *sock)
         ep_exclusive_release_owner(sock);
     }
     sock->observed_events = 0;
+    sock->pipe_terminal_delivered = 0;
     sock->et_holdoff = 0;
     if (sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) {
         assert(sock->wait_registration == NULL);
@@ -1978,25 +2175,29 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
     }
 
     if (sock->kind == EP_REG_PIPE) {
+        ep_pipe_snapshot_t snapshot = ep_pipe_snapshot(sock);
+
+        if (snapshot.local_closed) {
+            ep_sock_drop_closed_locked(port, sock);
+            ep_set_errno(EBADF);
+            return 1;
+        }
         if (sock->oneshot_fired) {
-            uint32_t level = ep_pipe_level_events(sock);
-            if (level != 0 &&
-                (level & ~(EPOLLHUP | EPOLLERR)) == 0) {
-                ep_sock_drop_closed_locked(port, sock);
-                ep_set_errno(EPIPE);
-                return 1;
-            }
+            /* Peer shutdown is persistent pipe state, not local handle
+             * invalidation.  Keep a fired one-shot registration available
+             * for MOD/epoll_rearm to sample that terminal state again. */
             return 0;
         }
         if (!sock->needs_rearm) {
             return 0;
         }
         sock->et_holdoff = 0;
-        if (ep_pipe_level_events(sock) == 0 &&
+        if (snapshot.valid && snapshot.events == 0 &&
             (sock->user_flags & EPOLLET) != 0) {
             sock->observed_events = 0;
+            sock->pipe_terminal_delivered = 0;
         }
-        if (ep_pipe_schedule_locked(sock) != 0) {
+        if (ep_pipe_schedule_locked(sock, snapshot.events) != 0) {
             return -1;
         }
         ep_sock_set_needs_rearm_locked(sock, 0);
@@ -2249,7 +2450,9 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
 {
     ep_port_t *port = sock->port;
     ep_ready_node_t *node = NULL;
+    ep_pipe_snapshot_t pipe_snapshot = {0};
     uint32_t delivered = 0;
+    uint32_t old_observed_events = 0;
     uint32_t old_poll_status;
 
     (void)bytes;
@@ -2399,7 +2602,14 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
             delivered = EPOLLERR | EPOLLHUP;
         }
     } else if (sock->kind == EP_REG_PIPE) {
-        delivered = ep_pipe_level_events(sock);
+        pipe_snapshot = ep_pipe_snapshot(sock);
+
+        if (pipe_snapshot.local_closed) {
+            ep_sock_drop_closed_locked(port, sock);
+            pthread_mutex_unlock(&port->fd_table_lock);
+            return;
+        }
+        delivered = pipe_snapshot.events;
     } else if (status < 0) {
         delivered = EPOLLERR;
     }
@@ -2434,16 +2644,22 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
 
     if ((sock->user_flags & EPOLLET) != 0) {
         uint32_t level = delivered;
-        uint32_t interest = sock->user_events | EPOLLERR | EPOLLHUP;
-        uint32_t edge;
 
-        /* Bits no longer present in the latest level snapshot become eligible
-         * for a future edge when they reappear. */
-        sock->observed_events &= level & interest;
-        edge = level & ~sock->observed_events;
-        delivered = edge;
-        if (edge != 0) {
-            sock->observed_events |= edge;
+        old_observed_events = sock->observed_events;
+        if (sock->kind == EP_REG_PIPE) {
+            delivered = ep_pipe_et_events(sock, &pipe_snapshot);
+        } else {
+            uint32_t interest = sock->user_events | EPOLLERR | EPOLLHUP;
+            uint32_t edge;
+
+            /* Bits no longer present in the latest level snapshot become
+             * eligible for a future edge when they reappear. */
+            sock->observed_events &= level & interest;
+            edge = level & ~sock->observed_events;
+            delivered = edge;
+            if (edge != 0) {
+                sock->observed_events |= edge;
+            }
         }
     } else {
         sock->observed_events = 0;
@@ -2451,6 +2667,22 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     }
 
     if (delivered == 0) {
+        if (sock->kind == EP_REG_PIPE &&
+            (sock->user_flags & EPOLLET) != 0 && pipe_snapshot.valid &&
+            sock->pipe_terminal_delivered &&
+            ep_pipe_et_snapshot_is_final(
+                sock, pipe_snapshot.events, &pipe_snapshot)) {
+            /* The final-shape event was already delivered, but its drain-time
+             * metadata confirmation was unavailable.  A later valid unchanged
+             * native client snapshot can now finish the final idle transition
+             * without manufacturing a duplicate terminal event. */
+            sock->et_holdoff = 0;
+            ep_sock_set_needs_rearm_locked(sock, 0);
+            atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                  memory_order_relaxed);
+            pthread_mutex_unlock(&port->fd_table_lock);
+            return;
+        }
         /* Level-triggered empty reports re-arm immediately.  Edge-triggered
          * empty reports mean the level is still true but already observed;
          * defer and throttle re-arming so permanently ready sockets do not
@@ -2473,6 +2705,12 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     if (node == NULL) {
         int error = ep_last_err();
 
+        if ((sock->user_flags & EPOLLET) != 0) {
+            /* No ready node owns this edge yet.  Restore the prior latch so a
+             * successful retry can report the same level instead of losing it
+             * after the transient allocation failure. */
+            sock->observed_events = old_observed_events;
+        }
         ep_sock_set_needs_rearm_locked(sock, 1);
         ep_port_record_async_error_locked(port, error == 0 ? ENOMEM : error);
         pthread_mutex_unlock(&port->fd_table_lock);
@@ -3123,6 +3361,7 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
     sock->user_data = data;
     sock->user_ctx = ctx;
     sock->observed_events = 0;
+    sock->pipe_terminal_delivered = 0;
     sock->et_holdoff = 0;
     if ((sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) &&
         (flags & EPOLLEXCLUSIVE) != 0) {
@@ -3191,6 +3430,7 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     uint32_t old_pending_events;
     uint32_t old_ready_queued;
     uint32_t old_state;
+    uint32_t old_observed_events;
     uint32_t old_user_events;
     uint32_t old_user_flags;
     uint32_t new_afd_events;
@@ -3205,6 +3445,8 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     uint64_t old_generation;
     uint8_t old_needs_rearm;
     uint8_t old_oneshot_fired;
+    uint8_t old_pipe_terminal_delivered;
+    uint8_t old_et_holdoff;
     int pending_poll_covers_request = 0;
 
     pthread_mutex_lock(&port->fd_table_lock);
@@ -3260,8 +3502,11 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     old_user_data = sock->user_data;
     old_user_ctx = sock->user_ctx;
     old_pending_events = sock->pending_events;
+    old_observed_events = sock->observed_events;
     old_oneshot_fired = sock->oneshot_fired;
     old_needs_rearm = sock->needs_rearm;
+    old_pipe_terminal_delivered = sock->pipe_terminal_delivered;
+    old_et_holdoff = sock->et_holdoff;
     old_base_socket = sock->base_socket;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     old_endpoint_id = sock->endpoint_id;
@@ -3300,6 +3545,7 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     /* MOD resets edge observation so a newly requested interest can form a
      * fresh edge against the current level. */
     sock->observed_events = 0;
+    sock->pipe_terminal_delivered = 0;
     sock->et_holdoff = 0;
     ep_sock_set_oneshot_fired_locked(sock, 0);
     if (preserve_waitable_ready) {
@@ -3360,8 +3606,11 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
             sock->user_data = old_user_data;
             sock->user_ctx = old_user_ctx;
             sock->pending_events = old_pending_events;
+            sock->observed_events = old_observed_events;
             ep_sock_set_oneshot_fired_locked(sock, old_oneshot_fired);
             ep_sock_set_needs_rearm_locked(sock, old_needs_rearm);
+            sock->pipe_terminal_delivered = old_pipe_terminal_delivered;
+            sock->et_holdoff = old_et_holdoff;
             sock->base_socket = old_base_socket;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
             sock->endpoint_id = old_endpoint_id;
@@ -3432,6 +3681,7 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     uint32_t old_pending_events;
     uint32_t old_ready_queued;
     uint32_t old_state;
+    uint32_t old_observed_events;
     SOCKET old_base_socket;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     uint64_t old_endpoint_id;
@@ -3440,6 +3690,8 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     uint64_t old_generation;
     uint8_t old_needs_rearm;
     uint8_t old_oneshot_fired;
+    uint8_t old_pipe_terminal_delivered;
+    uint8_t old_et_holdoff;
 
     pthread_mutex_lock(&port->fd_table_lock);
     ep_sock_t *sock = ep_fd_table_lookup(port, fd);
@@ -3458,8 +3710,11 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     }
 
     old_pending_events = sock->pending_events;
+    old_observed_events = sock->observed_events;
     old_oneshot_fired = sock->oneshot_fired;
     old_needs_rearm = sock->needs_rearm;
+    old_pipe_terminal_delivered = sock->pipe_terminal_delivered;
+    old_et_holdoff = sock->et_holdoff;
     old_base_socket = sock->base_socket;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     old_endpoint_id = sock->endpoint_id;
@@ -3472,6 +3727,9 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
 
     ep_sock_set_oneshot_fired_locked(sock, 0);
     sock->pending_events = 0;
+    sock->observed_events = 0;
+    sock->pipe_terminal_delivered = 0;
+    sock->et_holdoff = 0;
     ep_sock_set_needs_rearm_locked(sock, 1);
     atomic_store_explicit(&sock->ready_queued, 0, memory_order_relaxed);
     sock->generation = ++port->next_sock_generation;
@@ -3490,8 +3748,11 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     } else if (result < 0) {
         int saved_errno = ep_last_err();
         sock->pending_events = old_pending_events;
+        sock->observed_events = old_observed_events;
         ep_sock_set_oneshot_fired_locked(sock, old_oneshot_fired);
         ep_sock_set_needs_rearm_locked(sock, old_needs_rearm);
+        sock->pipe_terminal_delivered = old_pipe_terminal_delivered;
+        sock->et_holdoff = old_et_holdoff;
         sock->base_socket = old_base_socket;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
         sock->endpoint_id = old_endpoint_id;
@@ -3566,11 +3827,30 @@ static int ep_drain_to_buffer(ep_port_t *port,
                 valid = 1;
             }
             if (valid) {
+                int pipe_et = sock->kind == EP_REG_PIPE &&
+                    (sock->user_flags & EPOLLET) != 0;
+                ep_pipe_snapshot_t pipe_snapshot = {0};
+                int final_pipe_et;
+
+                if (pipe_et) {
+                    pipe_snapshot = ep_pipe_snapshot(sock);
+                }
+                final_pipe_et = pipe_et && pipe_snapshot.valid &&
+                    !pipe_snapshot.local_closed &&
+                    pipe_snapshot.events == node->events &&
+                    ep_pipe_et_snapshot_is_final(
+                        sock, node->events, &pipe_snapshot);
+
                 sock->pending_events = 0;
                 atomic_store_explicit(&sock->ready_queued, 0,
                                       memory_order_relaxed);
                 atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
                                       memory_order_relaxed);
+                if (pipe_et) {
+                    sock->pipe_terminal_delivered =
+                        ep_pipe_et_events_have_final_shape(
+                            sock, node->events) != 0;
+                }
                 if (sock->kind == EP_REG_WAITABLE &&
                     (sock->user_flags & EPOLLET) != 0 &&
                     sock->waitable_semantics == EP_WAITABLE_CONSUMPTIVE) {
@@ -3578,21 +3858,21 @@ static int ep_drain_to_buffer(ep_port_t *port,
                      * signal/count.  Reopen the latch without another wait,
                      * which could silently consume the next notification. */
                     sock->observed_events = 0;
-                } else if (sock->kind == EP_REG_PIPE &&
-                           (sock->user_flags & EPOLLET) != 0) {
-                    if (ep_pipe_level_events(sock) == 0) {
+                } else if (pipe_et) {
+                    if (pipe_snapshot.valid && !pipe_snapshot.local_closed &&
+                        pipe_snapshot.events == 0) {
                         sock->observed_events = 0;
                     }
                 }
                 if (!sock->oneshot_fired &&
                     !(sock->kind == EP_REG_WAITABLE &&
                       (sock->user_flags & EPOLLET) != 0 &&
-                      sock->waitable_semantics == EP_WAITABLE_TERMINAL)) {
+                      sock->waitable_semantics == EP_WAITABLE_TERMINAL) &&
+                    !final_pipe_et) {
                     /* Level and edge registrations both re-arm after a
-                     * delivered snapshot.  Edge filtering above suppresses
-                     * duplicates while the observed level remains true.
-                     * Process and thread objects cannot become unsignaled,
-                     * so their delivered ET registration stays idle until a
+                     * delivered snapshot.  Process/thread objects and final
+                     * pipe terminal snapshots cannot transition again, so
+                     * their delivered ET registrations stay idle until a
                      * later MOD explicitly starts a fresh observation. */
                     sock->et_holdoff = 0;
                     ep_sock_set_needs_rearm_locked(sock, 1);

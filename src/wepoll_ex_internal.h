@@ -217,6 +217,17 @@ typedef NTSTATUS (NTAPI *PNtQueryEventFn)(
     ULONG EventInformationLength,
     ULONG *ReturnLength);
 
+/* FILE_INFORMATION_CLASS and FILE_PIPE_LOCAL_INFORMATION are not exposed by
+ * every supported Windows SDK.  Keep this dynamically resolved signature
+ * expressed in ABI-sized primitive types and use a project-local pipe-info
+ * structure at the call site. */
+typedef NTSTATUS (NTAPI *PNtQueryInformationFileFn)(
+    HANDLE FileHandle,
+    PIO_STATUS_BLOCK IoStatusBlock,
+    PVOID FileInformation,
+    ULONG FileInformationLength,
+    ULONG FileInformationClass);
+
 #ifdef _WIN32
 /* Indirect the completion dequeue primitive so fault-injection tests can
  * model a timer-granularity WAIT_TIMEOUT without intercepting kernel32.  The
@@ -378,6 +389,11 @@ struct ep_sock {
     uint8_t aux_consumed_pending;
     uint8_t oneshot_fired;
     uint8_t needs_rearm;
+    /* A final-shape pipe ET snapshot reached the user-ready drain.  If its
+     * client/server confirmation sample was unavailable, a later unchanged
+     * valid client snapshot may use this bit to finish idling without
+     * redelivering the event. */
+    uint8_t pipe_terminal_delivered;
     /* Empty ET observations and losing exclusive claims defer re-submission.
      * The wait loop clears this latch on the next API wait or after a short
      * internal retry interval, avoiding a tight immediate-completion loop. */
@@ -586,6 +602,7 @@ typedef struct ep_ntdll {
     PNtCancelIoFileEx       NtCancelIoFileEx;
     PNtQueryObjectFn        NtQueryObject;
     PNtQueryEventFn         NtQueryEvent;
+    PNtQueryInformationFileFn NtQueryInformationFile;
     int                     initialized;
     int                     wsa_initialized;
 } ep_ntdll_t;

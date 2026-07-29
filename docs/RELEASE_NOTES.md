@@ -138,13 +138,27 @@ queue, pool, rearm, stale-event, identity, asynchronous-error, drain-budget,
 quarantine, reaper, and close-timeout diagnostics. Linux reports its extension
 registration count and a not-applicable lifetime policy.
 
-Windows registrations now also accept anonymous/named pipes via
-short timer-queue polls and `PeekNamedPipe`, plus waitable timers through the
-existing waitable-HANDLE path. Ordinary disk files return Linux-compatible
-`EPERM`. Pipe readiness honors the HANDLE's granted read/write data access, so
-opposite-direction interest is not synthesized on ordinary or terminal polls.
-Pipe regressions cover read/write direction and readiness, HUP, edge, oneshot,
-pending MOD, exclusive rejection, named pipes, and cancellation cleanup.
+Windows registrations now also accept anonymous/named pipes via short
+timer-queue polls, `NtQueryInformationFile(FilePipeLocalInformation)` state and
+quota snapshots, and the existing `PeekNamedPipe` fallback, plus waitable
+timers through the existing waitable-HANDLE path. Ordinary disk files return
+Linux-compatible `EPERM`. Pipe readiness honors the HANDLE's granted
+read/write data access and matches Linux masks for directional pipe states:
+buffered EOF reports only the requested `EPOLLIN`/`EPOLLRDNORM` aliases plus
+`EPOLLHUP`, drained or initially empty EOF reports `EPOLLHUP` alone, and a
+write endpoint whose reader closed reports only requested
+`EPOLLOUT`/`EPOLLWRNORM` aliases plus `EPOLLERR`, without `EPOLLHUP`. Pipes never
+synthesize `EPOLLRDBAND` or `EPOLLWRBAND`. ET emits ordinary rising aliases
+without repeating an unrelated active direction, while terminal transitions
+preserve `IN` -> `IN|HUP` -> `HUP` and `OUT` -> `OUT|ERR`. Invalid native
+metadata samples retain the existing edge latch. Terminal ONESHOT registrations
+remain MOD/`epoll_rearm()`-rearmable, writable quota drives LT/ET backpressure
+and restoration, and a reused named-server HANDLE re-edges for its next client
+without MOD. Regressions cover exact normal and terminal aliases,
+mixed-direction ET, LT terminal redelivery, both terminal ONESHOT rearm paths,
+both native named-pipe endpoint orientations with overlapped handles, rejected
+native snapshots, the outbound-server advisory fallback, server reconnect,
+pending MOD, exclusive rejection, and cancellation cleanup.
 
 Windows registrations now accept waitable HANDLEs in addition to
 Winsock sockets. Events, semaphores, waitable timers, processes, and threads
@@ -356,7 +370,9 @@ may combine with `EPOLLET`, but not with
 descriptors cannot be nested, AFD writable aliases share one readiness class,
 `EPOLLMSG` is not emitted, `SO_OOBINLINE` collapses priority into ordinary
 readability, unknown provider protocol metadata retains a conservative abort
-mapping, and pipe writable readiness remains advisory.
+mapping, and pipe writable readiness can remain advisory when native local
+information is unavailable or access is denied. Pure write-only outbound
+named-pipe server handles are the known access-denied case.
 Performance measurements are local loopback observations, not portable
 throughput guarantees.
 

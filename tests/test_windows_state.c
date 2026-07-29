@@ -466,6 +466,66 @@ static volatile LONG counted_cancel_calls;
 static PNtDeviceIoControlFile counted_submit_delegate;
 static volatile LONG counted_submit_calls;
 
+#define TEST_FILE_PIPE_LOCAL_INFORMATION_CLASS 24U
+#define TEST_STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
+
+typedef enum pipe_query_injection {
+    PIPE_QUERY_INJECT_UNKNOWN_FAILURE = 1,
+    PIPE_QUERY_INJECT_INVALID_LENGTH = 2
+} pipe_query_injection_t;
+
+static PNtQueryInformationFileFn pipe_query_delegate;
+static HANDLE pipe_query_target;
+static volatile LONG pipe_query_calls;
+static volatile LONG pipe_query_injected;
+static volatile LONG pipe_name_serial;
+static int pipe_query_injection_mode;
+
+static NTSTATUS NTAPI pipe_query_transient_stub(
+    HANDLE file_handle,
+    PIO_STATUS_BLOCK io_status_block,
+    PVOID file_information,
+    ULONG file_information_length,
+    ULONG file_information_class)
+{
+    LONG call;
+
+    if (file_handle != pipe_query_target ||
+        file_information_class != TEST_FILE_PIPE_LOCAL_INFORMATION_CLASS) {
+        return pipe_query_delegate(file_handle, io_status_block,
+                                   file_information, file_information_length,
+                                   file_information_class);
+    }
+
+    call = InterlockedIncrement(&pipe_query_calls);
+    if (call != 3) {
+        return pipe_query_delegate(file_handle, io_status_block,
+                                   file_information, file_information_length,
+                                   file_information_class);
+    }
+
+    InterlockedIncrement(&pipe_query_injected);
+    if (pipe_query_injection_mode == PIPE_QUERY_INJECT_UNKNOWN_FAILURE) {
+        if (io_status_block != NULL) {
+            io_status_block->Status = TEST_STATUS_UNSUCCESSFUL;
+            io_status_block->Information = 0;
+        }
+        return TEST_STATUS_UNSUCCESSFUL;
+    }
+
+    {
+        NTSTATUS status = pipe_query_delegate(
+            file_handle, io_status_block, file_information,
+            file_information_length, file_information_class);
+
+        if (status == STATUS_SUCCESS && io_status_block != NULL) {
+            io_status_block->Information = file_information_length > 0
+                ? file_information_length - 1 : 0;
+        }
+        return status;
+    }
+}
+
 static NTSTATUS NTAPI counted_cancel_stub(
     HANDLE file_handle,
     PIO_STATUS_BLOCK io_request_to_cancel,
@@ -896,6 +956,7 @@ static int test_failed_mod_rollback(void)
 {
     static const uint64_t old_value = UINT64_C(0x7172737475767778);
     static const uint64_t new_value = UINT64_C(0x8182838485868788);
+    static const uint32_t old_observed_events = EPOLLIN | EPOLLHUP;
     state_fixture_t fixture;
     PNtDeviceIoControlFile original_submit;
     ep_sock_t *sock;
@@ -918,6 +979,9 @@ static int test_failed_mod_rollback(void)
 
     pthread_mutex_lock(&fixture.port->fd_table_lock);
     old_generation = sock->generation;
+    sock->observed_events = old_observed_events;
+    sock->et_holdoff = 1;
+    sock->pipe_terminal_delivered = 1;
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
 
     original_submit = g_ntdll.NtDeviceIoControlFile;
@@ -935,6 +999,8 @@ static int test_failed_mod_rollback(void)
     state_ok = modify_result == -1 && modify_error == EACCES &&
         sock->generation == old_generation &&
         sock->user_data.u64 == old_value && sock->user_ctx == &old_context &&
+        sock->observed_events == old_observed_events &&
+        sock->et_holdoff != 0 && sock->pipe_terminal_delivered != 0 &&
         sock->oneshot_fired != 0 &&
         fixture.port->oneshot_fired_count == 1 &&
         fixture.port->oneshot_head == sock &&
@@ -964,6 +1030,7 @@ cleanup:
 static int test_failed_rearm_rollback(void)
 {
     static const uint64_t value = UINT64_C(0x9192939495969798);
+    static const uint32_t old_observed_events = EPOLLIN | EPOLLERR;
     state_fixture_t fixture;
     PNtDeviceIoControlFile original_submit;
     ep_sock_t *sock;
@@ -985,6 +1052,9 @@ static int test_failed_rearm_rollback(void)
 
     pthread_mutex_lock(&fixture.port->fd_table_lock);
     old_generation = sock->generation;
+    sock->observed_events = old_observed_events;
+    sock->et_holdoff = 1;
+    sock->pipe_terminal_delivered = 1;
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
 
     original_submit = g_ntdll.NtDeviceIoControlFile;
@@ -1000,7 +1070,10 @@ static int test_failed_rearm_rollback(void)
 
     pthread_mutex_lock(&fixture.port->fd_table_lock);
     state_ok = rearm_result == -1 && rearm_error == EACCES &&
-        sock->generation == old_generation && sock->oneshot_fired != 0 &&
+        sock->generation == old_generation &&
+        sock->observed_events == old_observed_events &&
+        sock->et_holdoff != 0 && sock->pipe_terminal_delivered != 0 &&
+        sock->oneshot_fired != 0 &&
         fixture.port->oneshot_fired_count == 1 &&
         fixture.port->oneshot_head == sock &&
         fixture.port->oneshot_tail == sock &&
@@ -1298,6 +1371,212 @@ cleanup:
     return result;
 }
 
+static int run_pipe_invalid_et_case(pipe_query_injection_t injection)
+{
+    static const char byte = 'p';
+    ep_port_t *port = NULL;
+    HANDLE read_handle = NULL;
+    HANDLE write_handle = NULL;
+    PNtQueryInformationFileFn original_query = NULL;
+    epoll_data_t data;
+    epoll_event_ex event;
+    DWORD transferred = 0;
+    int query_stub_installed = 0;
+    int result = -1;
+
+    if (!CreatePipe(&read_handle, &write_handle, NULL, 0) ||
+        !WriteFile(write_handle, &byte, 1, &transferred, NULL) ||
+        transferred != 1 || ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x7071727374757677);
+    if (ep_port_register(port, (SOCKET)(uintptr_t)read_handle,
+                         EPOLLIN | EPOLLET, EPOLLET, data, NULL) != 0) {
+        goto cleanup;
+    }
+
+    original_query = g_ntdll.NtQueryInformationFile;
+    if (original_query == NULL) {
+        ep_set_errno(EOPNOTSUPP);
+        goto cleanup;
+    }
+    pipe_query_delegate = original_query;
+    pipe_query_target = read_handle;
+    pipe_query_injection_mode = injection;
+    InterlockedExchange(&pipe_query_calls, 0);
+    InterlockedExchange(&pipe_query_injected, 0);
+    g_ntdll.NtQueryInformationFile = pipe_query_transient_stub;
+    query_stub_installed = 1;
+
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 2000, NULL) != 1 ||
+        event.data.u64 != data.u64 || (event.events & EPOLLIN) == 0 ||
+        InterlockedCompareExchange(&pipe_query_injected, 0, 0) != 1) {
+        goto cleanup;
+    }
+
+    /* The pipe remains continuously readable.  The third metadata query is
+     * transiently invalid, and at least one later query observes the same
+     * stable readable level.  That invalid middle sample must not reopen the
+     * ET latch and manufacture a duplicate EPOLLIN edge. */
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 50, NULL) != 0 ||
+        InterlockedCompareExchange(&pipe_query_calls, 0, 0) < 4) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (query_stub_installed) {
+        g_ntdll.NtQueryInformationFile = original_query;
+    }
+    pipe_query_delegate = NULL;
+    pipe_query_target = NULL;
+    pipe_query_injection_mode = 0;
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    if (write_handle != NULL) CloseHandle(write_handle);
+    if (read_handle != NULL) CloseHandle(read_handle);
+    return result;
+}
+
+static int run_pipe_terminal_invalid_et_case(void)
+{
+    wchar_t name[160];
+    ep_port_t *port = NULL;
+    ep_sock_t *sock;
+    HANDLE server = INVALID_HANDLE_VALUE;
+    HANDLE client = INVALID_HANDLE_VALUE;
+    PNtQueryInformationFileFn original_query = NULL;
+    epoll_data_t data;
+    epoll_event_ex event;
+    uint64_t rearm_visits;
+    LONG query_count;
+    LONG serial;
+    int query_stub_installed = 0;
+    int state_ok;
+    int result = -1;
+
+    serial = InterlockedIncrement(&pipe_name_serial);
+    _snwprintf(name, sizeof(name) / sizeof(name[0]),
+               L"\\\\.\\pipe\\wepoll-ex-state-terminal-%lu-%llu-%ld",
+               (unsigned long)GetCurrentProcessId(),
+               (unsigned long long)GetTickCount64(), (long)serial);
+    name[(sizeof(name) / sizeof(name[0])) - 1] = L'\0';
+
+    server = CreateNamedPipeW(
+        name, PIPE_ACCESS_OUTBOUND,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 4096, 4096, 0, NULL);
+    if (server == INVALID_HANDLE_VALUE) {
+        goto cleanup;
+    }
+    client = CreateFileW(name, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (client == INVALID_HANDLE_VALUE ||
+        ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x8081828384858687);
+    if (ep_port_register(port, (SOCKET)(uintptr_t)client,
+                         EPOLLIN | EPOLLET, EPOLLET, data, NULL) != 0) {
+        goto cleanup;
+    }
+
+    original_query = g_ntdll.NtQueryInformationFile;
+    if (original_query == NULL) {
+        ep_set_errno(EOPNOTSUPP);
+        goto cleanup;
+    }
+    pipe_query_delegate = original_query;
+    pipe_query_target = client;
+    pipe_query_injection_mode = PIPE_QUERY_INJECT_INVALID_LENGTH;
+    InterlockedExchange(&pipe_query_calls, 0);
+    InterlockedExchange(&pipe_query_injected, 0);
+    g_ntdll.NtQueryInformationFile = pipe_query_transient_stub;
+    query_stub_installed = 1;
+
+    CloseHandle(server);
+    server = INVALID_HANDLE_VALUE;
+
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 2000, NULL) != 1 ||
+        event.data.u64 != data.u64 || event.events != EPOLLHUP ||
+        InterlockedCompareExchange(&pipe_query_injected, 0, 0) != 1) {
+        goto cleanup;
+    }
+
+    /* The ready-drain confirmation was invalid, so the client endpoint must
+     * remain eligible for one native retry.  A later valid terminal snapshot
+     * confirms that this HANDLE cannot transition again; it must then become
+     * truly idle without delivering a duplicate terminal edge. */
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 100, NULL) != 0 ||
+        InterlockedCompareExchange(&pipe_query_calls, 0, 0) < 4) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    query_count = InterlockedCompareExchange(&pipe_query_calls, 0, 0);
+    rearm_visits = port->rearm_work_visits;
+    state_ok = sock != NULL && sock->next == NULL &&
+        sock->kind == EP_REG_PIPE &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_REGISTERED &&
+        sock->wait_registration == NULL && !sock->needs_rearm &&
+        !sock->et_holdoff && port->pending_poll_count == 0 &&
+        port->needs_rearm_count == 0 && port->rearm_head == NULL &&
+        port->rearm_tail == NULL && ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok) {
+        goto cleanup;
+    }
+
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 50, NULL) != 0) {
+        goto cleanup;
+    }
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = port->rearm_work_visits == rearm_visits &&
+        port->pending_poll_count == 0 && port->needs_rearm_count == 0 &&
+        ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok ||
+        InterlockedCompareExchange(&pipe_query_calls, 0, 0) != query_count) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (query_stub_installed) {
+        g_ntdll.NtQueryInformationFile = original_query;
+    }
+    pipe_query_delegate = NULL;
+    pipe_query_target = NULL;
+    pipe_query_injection_mode = 0;
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    if (client != INVALID_HANDLE_VALUE) CloseHandle(client);
+    if (server != INVALID_HANDLE_VALUE) CloseHandle(server);
+    return result;
+}
+
+static int test_pipe_invalid_et_snapshot(void)
+{
+    if (run_pipe_invalid_et_case(PIPE_QUERY_INJECT_UNKNOWN_FAILURE) != 0) {
+        return -1;
+    }
+    if (run_pipe_invalid_et_case(PIPE_QUERY_INJECT_INVALID_LENGTH) != 0) {
+        return -1;
+    }
+
+    return run_pipe_terminal_invalid_et_case();
+}
+
 int main(int argc, char **argv)
 {
     WSADATA wsa_data;
@@ -1328,6 +1607,8 @@ int main(int argc, char **argv)
         result = test_aux_posted_cancel();
     } else if (strcmp(argv[1], "aux-post-close-lease") == 0) {
         result = test_aux_post_close_lease();
+    } else if (strcmp(argv[1], "pipe-invalid-et") == 0) {
+        result = test_pipe_invalid_et_snapshot();
     }
     (void)WSACleanup();
 

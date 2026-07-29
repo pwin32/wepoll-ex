@@ -60,6 +60,9 @@ static void ep_global_init_once(void)
     ep_store_proc(&g_ntdll.NtQueryEvent,
                   sizeof(g_ntdll.NtQueryEvent),
                   GetProcAddress(ntdll, "NtQueryEvent"));
+    ep_store_proc(&g_ntdll.NtQueryInformationFile,
+                  sizeof(g_ntdll.NtQueryInformationFile),
+                  GetProcAddress(ntdll, "NtQueryInformationFile"));
     ep_store_proc(&p_RtlNtStatusToDosError,
                   sizeof(p_RtlNtStatusToDosError),
                   GetProcAddress(ntdll, "RtlNtStatusToDosError"));
