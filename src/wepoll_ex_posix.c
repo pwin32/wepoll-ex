@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -651,28 +652,149 @@ static int validate_timespec_timeout(const struct timespec *timeout)
     return 0;
 }
 
-static int timeout_to_milliseconds(const struct timespec *timeout, int *out)
+static int timeout_to_millisecond_chunk(const struct timespec *timeout,
+                                        int *out, int *has_more)
 {
     if (validate_timespec_timeout(timeout) != 0) return -1;
     if (timeout == NULL) {
         *out = -1;
+        *has_more = 0;
         return 0;
     }
-    if (timeout->tv_sec > INT_MAX / 1000) {
-        errno = EOVERFLOW;
-        return -1;
+
+    const time_t max_seconds = INT_MAX / 1000;
+    const long max_nanoseconds =
+        (long)(INT_MAX % 1000) * 1000000L;
+    if (timeout->tv_sec > max_seconds ||
+        (timeout->tv_sec == max_seconds &&
+         timeout->tv_nsec > max_nanoseconds)) {
+        *out = INT_MAX;
+        *has_more = 1;
+        return 0;
     }
 
     int64_t milliseconds = (int64_t)timeout->tv_sec * 1000;
     if (timeout->tv_nsec != 0) {
         milliseconds += (timeout->tv_nsec + 999999L) / 1000000L;
     }
-    if (milliseconds > INT_MAX) {
-        errno = EOVERFLOW;
+    *out = (int)milliseconds;
+    *has_more = 0;
+    return 0;
+}
+
+static void timeout_subtract_millisecond_chunk(struct timespec *timeout,
+                                               int milliseconds)
+{
+    time_t seconds = milliseconds / 1000;
+    long nanoseconds = (long)(milliseconds % 1000) * 1000000L;
+
+    timeout->tv_sec -= seconds;
+    if (timeout->tv_nsec < nanoseconds) {
+        timeout->tv_sec--;
+        timeout->tv_nsec += 1000000000L;
+    }
+    timeout->tv_nsec -= nanoseconds;
+}
+
+static int posix_millisecond_wait(int epfd, struct epoll_event *events,
+                                  int maxevents, int timeout_ms,
+                                  const sigset_t *sigmask)
+{
+    if (sigmask) {
+        return epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask);
+    }
+    return epoll_wait(epfd, events, maxevents, timeout_ms);
+}
+
+static int posix_timespec_wait_chunks(int epfd, struct epoll_event *events,
+                                      int maxevents,
+                                      struct timespec remaining,
+                                      const sigset_t *sigmask)
+{
+    /* The millisecond APIs accept only an int timeout.  Split longer valid
+     * timespecs into bounded waits, advancing only after a chunk times out so
+     * readiness, EINTR, and descriptor errors are returned unchanged. */
+    for (;;) {
+        int timeout_ms;
+        int has_more;
+        if (timeout_to_millisecond_chunk(&remaining, &timeout_ms,
+                                         &has_more) != 0) {
+            return -1;
+        }
+
+        int result = posix_millisecond_wait(epfd, events, maxevents,
+                                            timeout_ms, sigmask);
+        if (result != 0 || !has_more) return result;
+
+        timeout_subtract_millisecond_chunk(&remaining, timeout_ms);
+    }
+}
+
+typedef struct posix_signal_mask_cleanup {
+    sigset_t previous;
+    int error;
+} posix_signal_mask_cleanup_t;
+
+static void posix_signal_mask_restore(void *arg)
+{
+    posix_signal_mask_cleanup_t *cleanup = arg;
+
+    cleanup->error = pthread_sigmask(SIG_SETMASK, &cleanup->previous, NULL);
+}
+
+static int posix_timespec_wait_fallback(int epfd, struct epoll_event *events,
+                                        int maxevents,
+                                        const struct timespec *timeout,
+                                        const sigset_t *sigmask)
+{
+    if (validate_timespec_timeout(timeout) != 0) return -1;
+    if (timeout == NULL) {
+        return posix_millisecond_wait(epfd, events, maxevents, -1, sigmask);
+    }
+
+    int timeout_ms;
+    int has_more;
+    if (timeout_to_millisecond_chunk(timeout, &timeout_ms, &has_more) != 0) {
         return -1;
     }
-    *out = (int)milliseconds;
-    return 0;
+    if (!has_more) {
+        return posix_millisecond_wait(epfd, events, maxevents, timeout_ms,
+                                      sigmask);
+    }
+    if (!sigmask) {
+        return posix_timespec_wait_chunks(epfd, events, maxevents, *timeout,
+                                          NULL);
+    }
+
+    /* epoll_pwait restores the caller's mask after every syscall.  Block all
+     * catchable signals between chunks, then let each epoll_pwait atomically
+     * install the requested mask.  This prevents an inter-chunk delivery from
+     * being consumed without interrupting the logical epoll_pwait2 wait. */
+    sigset_t blocked_mask;
+    if (sigfillset(&blocked_mask) != 0) return -1;
+
+    posix_signal_mask_cleanup_t mask_cleanup = { .error = 0 };
+    int mask_error = pthread_sigmask(SIG_SETMASK, &blocked_mask,
+                                     &mask_cleanup.previous);
+    if (mask_error != 0) {
+        errno = mask_error;
+        return -1;
+    }
+
+    int result;
+    int saved_errno;
+    pthread_cleanup_push(posix_signal_mask_restore, &mask_cleanup);
+    result = posix_timespec_wait_chunks(epfd, events, maxevents, *timeout,
+                                        sigmask);
+    saved_errno = errno;
+    pthread_cleanup_pop(1);
+
+    if (mask_cleanup.error != 0) {
+        errno = mask_cleanup.error;
+        return -1;
+    }
+    errno = saved_errno;
+    return result;
 }
 
 typedef struct posix_wait_cleanup {
@@ -705,20 +827,13 @@ static int posix_native_wait(int epfd, struct epoll_event *events,
         /* A new libc can run on a kernel predating epoll_pwait2.  Preserve
          * atomic signal-mask handling while falling back to millisecond
          * timeout precision in that configuration. */
-#else
-        (void)timeout;
 #endif
-        if (timeout_to_milliseconds(timeout, &timeout_ms) != 0) return -1;
-        if (sigmask) {
-            return epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask);
-        }
-        return epoll_wait(epfd, events, maxevents, timeout_ms);
+        return posix_timespec_wait_fallback(epfd, events, maxevents,
+                                            timeout, sigmask);
     }
 
-    if (sigmask) {
-        return epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask);
-    }
-    return epoll_wait(epfd, events, maxevents, timeout_ms);
+    return posix_millisecond_wait(epfd, events, maxevents, timeout_ms,
+                                  sigmask);
 }
 
 static int posix_wait_ex(int epfd, struct epoll_event_ex *events,

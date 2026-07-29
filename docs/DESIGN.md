@@ -71,6 +71,19 @@ the nginx-embedded source build independent of a generated CMake header.
    After it acquires the lock, while internal packets keep arriving it
    processes at least 16 successful, nonempty IOCP dequeue batches before
    enforcing a 10 ms drain budget.
+   Positive finite timespec waits lazily create a high-resolution waitable
+   timer and thread-pool wait when the required Windows APIs are available.
+   The requested duration is rounded up to 100-nanosecond timer units; the
+   callback posts a generation-tagged IOCP sentinel, and stale generations
+   are consumed without touching socket storage. An independently rounded-up
+   millisecond IOCP deadline remains active as a safety backstop. Capability,
+   initialization, arm, or callback-post failure therefore degrades to the
+   coarse path without changing the public result. Timer resolution does not
+   guarantee scheduler wake latency. Long finite waits are accepted and use
+   bounded IOCP chunks rather than overflowing a `DWORD` timeout. Integer
+   `epoll_wait` and `epoll_pwait` retain their millisecond contract. Durations
+   too large for the internal 100-nanosecond representation bypass the precise
+   timer and retain the longer millisecond/chunked deadline.
    Level-triggered registrations are armed again on a later wait; oneshot
    registrations require MOD or `epoll_rearm()`. Failures discovered during
    completion processing or deferred rearming are latched and wake the wait
@@ -148,9 +161,16 @@ uses native `epoll_pwait2` when the libc symbol is present and the kernel
 supports it. A build-time absence, runtime `ENOSYS`, or
 `WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK=ON` falls back to `epoll_pwait` for a
 supplied mask, or `epoll_wait` otherwise, rounding a nonzero submillisecond
-timeout up. The forced mode has a dedicated strict preset and qualification
-build. Pthread cancellation cleanup releases the optional heap event buffer
-and metadata reference before unwinding.
+timeout up. Valid durations beyond the `int` millisecond range are divided
+into `INT_MAX`-millisecond chunks. For a supplied mask, catchable signals stay
+blocked between chunks and each `epoll_pwait` atomically installs the requested
+mask; cleanup restores the caller's original mask on return and cancellation.
+This preserves thread-directed delivery, but a process-directed signal may be
+routed to another eligible thread during the userspace inter-chunk bridge; a
+multi-syscall fallback cannot make that whole logical wait kernel-atomic.
+The forced mode has a dedicated strict preset and qualification build.
+Pthread cancellation cleanup releases the optional heap event buffer and
+metadata reference before unwinding.
 
 ## Supported semantics and boundaries
 
@@ -280,11 +300,13 @@ and metadata reference before unwinding.
 - Windows signal masks are opaque API placeholders. Non-null masks are
   accepted and ignored so portable `epoll_pwait*` call sites run; Windows has
   no POSIX process signal mask to apply. Linux extended waits pass masks
-  atomically to native `epoll_pwait2` or the `epoll_pwait` fallback.
-- Windows `epoll_pwait2*` rounds a positive submillisecond timeout up to one
-  millisecond because the IOCP dequeue API accepts millisecond timeouts.
-  Windows virtual epoll descriptors also cannot be nested as monitored objects
-  inside another epoll instance.
+  atomically to native `epoll_pwait2` or the chunked `epoll_pwait` fallback.
+- Windows `epoll_pwait2*` represents positive finite durations in upward-
+  rounded 100-nanosecond timer units when high-resolution timers are available,
+  with an upward-rounded millisecond IOCP backstop and transparent coarse
+  fallback. This improves requested deadline resolution but does not guarantee
+  an equivalent scheduler wake latency. Windows virtual epoll descriptors also
+  cannot be nested as monitored objects inside another epoll instance.
 - `SO_OOBINLINE` exposes urgent bytes as ordinary readable data without a
   separate `EPOLLPRI` bit on Windows.
 - `EPOLLWAKEUP` is accepted and ignored on Windows.
@@ -326,16 +348,17 @@ and metadata reference before unwinding.
 
 ## Verification baseline
 
-On July 28, 2026, strict MinGW GCC 15.2 with
-`-O2 -Wall -Wextra -Wpedantic -Werror` completed 116 combined best-effort, 114
-static-only, 65 shared-only, 116 strict-identity, 65 strict shared-only, 116
+On July 29, 2026, strict MinGW GCC 15.2 with
+`-O2 -Wall -Wextra -Wpedantic -Werror` completed 124 combined best-effort, 122
+static-only, 65 shared-only, 124 strict-identity, 65 strict shared-only, 124
 synchronized-lifetime, and 65 synchronized shared-only CTest entries. Their
-passed/skipped counts were 115/1, 113/1, 64/1, 115/1, 64/1, 111/5, and 60/5.
+passed/skipped counts were 123/1, 121/1, 64/1, 123/1, 64/1, 119/5, and 60/5.
 All seven variants skipped the environment-dependent UDP/ICMP case;
 synchronized modes additionally skipped the four native-reuse identity cases
-owned by their DEL-before-close contract. Three repeats of every applicable API,
-backpressure, stress, concurrent-control, AFD mapping/status, socket-alias,
-urgent-data LT/ET/ONESHOT/MOD, and inline-urgent LT/ET lane passed. The shared
+owned by their DEL-before-close contract. Three repeats of every applicable
+API, backpressure, stress, concurrent-control, AFD mapping/status,
+socket-alias, urgent-data LT/ET/ONESHOT/MOD, inline-urgent LT/ET, and precise-
+timeout conversion/generation/readiness/close/fallback lane passed. The shared
 builds also passed exact public-export checks.
 
 The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 4/4, five
@@ -348,8 +371,11 @@ transitions; direction-aware pipe adapters; waitable terminal ET and
 pending/queued MOD races; consumptive notification counts; auxiliary-disarm
 fault recovery and preserved consumptive retries; immediate auxiliary
 cancellation reclamation; IOCP post/close lease races and fatal-post wakeups;
-provider identity modes; cancellation/close/quarantine; packaging; and
-static-winpthread dependency checks. `scripts/qualify-posix.sh`,
+high-resolution timeout conversion, stale generations, readiness races,
+fallback, close, and init/arm/post failures; long native/fallback timespecs and
+masked cancellation/restoration; provider identity modes;
+cancellation/close/quarantine; packaging; and static-winpthread dependency
+checks. `scripts/qualify-posix.sh`,
 `scripts/qualify-mingw.sh`, CMake presets, and `scripts/repeat-ctest.sh` make
 those lanes reproducible.
 

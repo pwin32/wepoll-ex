@@ -89,6 +89,20 @@ GCC 14.2 native and forced
 fallback Release passed 4/4 each, the API/pool lanes passed five repeats,
 ASan/UBSan passed 3/3, and Clang 19.1.7 strict Release passed 4/4.
 
+The July 29, 2026 timeout-compatibility qualification used MinGW GCC 15.2 on
+Windows 10.0.19044 with `-O2 -Wall -Wextra -Wpedantic -Werror`. Combined
+best-effort, static-only, shared-only, strict-identity, strict shared-only,
+synchronized-lifetime, and synchronized shared-only contained 124, 122, 65,
+124, 65, 124, and 65 CTest entries. Their passed/skipped counts were 123/1,
+121/1, 64/1, 123/1, 64/1, 119/5, and 60/5. The general skip remained the
+environment-dependent UDP/ICMP probe; synchronized variants also skipped the
+four native-reuse identity cases owned by their DEL-before-close contract.
+Three repeats of every applicable API, backpressure, stress,
+concurrent-control, socket-event, and precise-timeout lane passed. Linux/WSL
+GCC 14.2 native and forced-fallback strict Release passed 4/4 each, repeated
+API/pool tests passed five times, ASan/UBSan passed 3/3, and Clang 19.1.7
+strict Release passed 4/4.
+
 On Windows 10.0.19044, the deterministic long stress profile completed all
 250,000 operations on 128 sockets with 59,906 sends, 4,960 epoll rotations,
 and zero backpressure in combined best-effort and best-effort, strict, and
@@ -252,19 +266,35 @@ extension-owned registrations; native `epoll_ctl()` additions are outside
 that view until an extension MOD adopts them. `epoll_pwait2_ex()` uses native
 `epoll_pwait2` when available and falls back after build-time absence or
 runtime `ENOSYS`, preserving atomic signal-mask application but rounding the
-fallback timeout up to milliseconds. The new
+fallback timeout up to milliseconds. Valid timespecs beyond the `int`
+millisecond range are now split into bounded waits rather than rejected with
+`EOVERFLOW`; masked multi-chunk waits block catchable signals between calls and
+restore the caller's mask on return or cancellation. The new
 `WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK` option, matching preset, and
 `qualify-posix.sh` lane make that fallback reproducible even on current libc
 and kernels. Pthread cancellation cleanup releases the wait buffer and
 metadata reference before unwinding.
 
 Windows finite waits now retry an early `WAIT_TIMEOUT` against their absolute
-deadline. When internal packets keep arriving, a zero-timeout wait processes
+deadline. Positive finite `epoll_pwait2*` waits now request an optional
+high-resolution waitable timer with an upward-rounded 100-nanosecond duration,
+generation-tagged IOCP timeout packets, and an independently rounded-up
+millisecond safety deadline. Missing capability and timer initialization, arm,
+or post failures transparently retain the coarse wait path; requested timer
+units are not a scheduler wake-latency guarantee. Long finite timespecs are
+accepted and IOCP waits are chunked as needed, while integer-millisecond API
+behavior remains unchanged. When internal packets keep arriving, a
+zero-timeout wait processes
 at least 16 successful, nonempty IOCP dequeue batches before enforcing a 10 ms
 budget; any readiness found during the drain is still returned. Winsock
 provider resolution uses `SIO_BASE_HANDLE` first and then guarded SELECT, POLL,
 and generic BSP fallbacks, rejecting malformed responses and cycles while
 continuing past one cyclic candidate if a later fallback advances the chain.
+Deterministic timeout regressions cover conversion, stale/current generations,
+early timeout packets, readiness racing a timeout, concurrent close, and the
+forced coarse fallback. Fault injection covers timer initialization, arm, and
+callback-post failures; precise-only cases report a capability skip on hosts
+without the optional timer path.
 New regressions exercise UDP IPv4/IPv6 readiness, optional ICMP error delivery,
 DEL/ADD reuse, provider fallback, concurrent controls, a 513-packet internal
 burst, and an injected early timeout.
@@ -319,8 +349,9 @@ edge queue, and exclusive wake uniqueness relies on AFD exclusive-poll
 cancellation plus a readiness-class-granular process-wide claim index among
 wepoll-ex instances. Non-null
 Windows signal-mask pointers are accepted and ignored, `EPOLLWAKEUP` is a
-no-op, and `epoll_pwait2*` rounds positive submillisecond timeouts up to one
-millisecond. `EPOLLEXCLUSIVE` may combine with `EPOLLET`, but not with
+no-op, and high-resolution `epoll_pwait2*` deadlines remain subject to Windows
+scheduler latency and a transparent millisecond fallback. `EPOLLEXCLUSIVE`
+may combine with `EPOLLET`, but not with
 `EPOLLONESHOT`, `EPOLLRDHUP`, or unsupported event bits; virtual Windows epoll
 descriptors cannot be nested, AFD writable aliases share one readiness class,
 `EPOLLMSG` is not emitted, `SO_OOBINLINE` collapses priority into ordinary

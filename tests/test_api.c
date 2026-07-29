@@ -493,7 +493,7 @@ static void test_create_ex_and_timeout_validation(void)
     }
     PASS();
 
-    TEST("epoll_pwait2_ex rejects invalid and overflowing timespecs");
+    TEST("epoll_pwait2_ex rejects invalid timespecs");
     struct timespec invalid = { -1, 0 };
     errno = 0;
     n = epoll_pwait2_ex(epfd, out, 1, &invalid, NULL);
@@ -516,12 +516,61 @@ static void test_create_ex_and_timeout_validation(void)
         FAIL("large tv_nsec should return EINVAL");
         goto timeout_cleanup;
     }
-    invalid.tv_nsec = 0;
-    invalid.tv_sec = INT_MAX;
-    errno = 0;
-    n = epoll_pwait2_ex(epfd, out, 1, &invalid, NULL);
-    if (n != -1 || errno != EOVERFLOW) {
-        FAIL("overflowing timeout should return EOVERFLOW");
+    PASS();
+
+    TEST("very long epoll_pwait2_ex timeout returns ready fd");
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        FAIL("socketpair for long timeout");
+        goto timeout_cleanup;
+    }
+    struct epoll_event event = {
+        .events = EPOLLIN,
+        .data.u64 = UINT64_C(0x1020304050607080)
+    };
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair[0], &event) != 0 ||
+        write(pair[1], "x", 1) != 1) {
+        FAIL("prepare ready fd for long timeout");
+        close(pair[0]);
+        close(pair[1]);
+        goto timeout_cleanup;
+    }
+    struct timespec very_long = { INT_MAX, 0 };
+    n = epoll_pwait2_ex(epfd, out, 1, &very_long, NULL);
+    int long_wait_error = errno;
+    if (n != 1 || (out[0].events & EPOLLIN) == 0 ||
+        out[0].data.u64 != event.data.u64) {
+        close(pair[0]);
+        close(pair[1]);
+        errno = long_wait_error;
+        FAIL("ready fd was not returned for long timeout");
+        goto timeout_cleanup;
+    }
+
+    sigset_t caller_mask;
+    sigset_t caller_previous;
+    sigset_t caller_after;
+    sigemptyset(&caller_mask);
+    sigaddset(&caller_mask, SIGUSR2);
+    if (pthread_sigmask(SIG_SETMASK, &caller_mask, &caller_previous) != 0) {
+        close(pair[0]);
+        close(pair[1]);
+        FAIL("block caller mask for long timeout");
+        goto timeout_cleanup;
+    }
+    n = epoll_pwait2_ex(epfd, out, 1, &very_long, &empty_mask);
+    long_wait_error = errno;
+    int mask_query_error = pthread_sigmask(SIG_SETMASK, NULL, &caller_after);
+    int mask_restore_error = pthread_sigmask(SIG_SETMASK, &caller_previous,
+                                             NULL);
+    close(pair[0]);
+    close(pair[1]);
+    if (n != 1 || (out[0].events & EPOLLIN) == 0 ||
+        out[0].data.u64 != event.data.u64 || mask_query_error != 0 ||
+        mask_restore_error != 0 || sigismember(&caller_after, SIGUSR2) != 1 ||
+        sigismember(&caller_after, SIGUSR1) != 0) {
+        errno = long_wait_error;
+        FAIL("masked long timeout did not restore the caller mask");
         goto timeout_cleanup;
     }
     PASS();
@@ -1378,22 +1427,55 @@ static int sleep_milliseconds(long milliseconds)
 }
 
 typedef struct cancel_wait_context {
-    int         epfd;
-    atomic_int  started;
+    int        epfd;
+    atomic_int started;
+    atomic_int cleanup_seen;
+    atomic_int mask_restored;
+    int        setup_error;
 } cancel_wait_context_t;
+
+static void cancel_wait_mask_cleanup(void *opaque)
+{
+    cancel_wait_context_t *context = opaque;
+    sigset_t current;
+    int mask_error = pthread_sigmask(SIG_SETMASK, NULL, &current);
+    int restored = mask_error == 0 &&
+                   sigismember(&current, SIGUSR2) == 1 &&
+                   sigismember(&current, SIGUSR1) == 0;
+
+    atomic_store_explicit(&context->mask_restored, restored,
+                          memory_order_release);
+    atomic_store_explicit(&context->cleanup_seen, 1, memory_order_release);
+}
 
 static void *cancel_wait_thread(void *opaque)
 {
     cancel_wait_context_t *context = opaque;
     epoll_event_ex events[64];
     struct timespec zero = { 0, 0 };
+    struct timespec very_long = { INT_MAX, 0 };
+    sigset_t caller_mask;
+    sigset_t wait_mask;
+
+    sigemptyset(&caller_mask);
+    sigaddset(&caller_mask, SIGUSR2);
+    sigemptyset(&wait_mask);
+    context->setup_error = pthread_sigmask(SIG_SETMASK, &caller_mask, NULL);
+    if (context->setup_error != 0) {
+        atomic_store_explicit(&context->started, 1, memory_order_release);
+        return context;
+    }
 
     /* Create the metadata port before publishing readiness, then use a batch
      * larger than the internal stack buffer so cancellation must release both
-     * the port reference and a heap allocation. */
+     * the port reference and a heap allocation.  The long masked wait also
+     * drives the forced multi-chunk fallback and its signal-mask cleanup. */
     (void)epoll_pwait2_ex(context->epfd, events, 64, &zero, NULL);
+    pthread_cleanup_push(cancel_wait_mask_cleanup, context);
     atomic_store_explicit(&context->started, 1, memory_order_release);
-    (void)epoll_pwait2_ex(context->epfd, events, 64, NULL, NULL);
+    (void)epoll_pwait2_ex(context->epfd, events, 64,
+                         &very_long, &wait_mask);
+    pthread_cleanup_pop(0);
     return context;
 }
 
@@ -1409,7 +1491,10 @@ static void test_cancel_blocking_extended_wait(void)
 
     cancel_wait_context_t context = {
         .epfd = epfd,
-        .started = ATOMIC_VAR_INIT(0)
+        .started = ATOMIC_VAR_INIT(0),
+        .cleanup_seen = ATOMIC_VAR_INIT(0),
+        .mask_restored = ATOMIC_VAR_INIT(0),
+        .setup_error = 0
     };
     pthread_t thread;
     int thread_error = pthread_create(&thread, NULL, cancel_wait_thread,
@@ -1422,7 +1507,9 @@ static void test_cancel_blocking_extended_wait(void)
     }
 
     if (wait_atomic_at_least(&context.started, 1, 2000) != 0 ||
+        context.setup_error != 0 ||
         sleep_milliseconds(50) != 0) {
+        if (context.setup_error != 0) errno = context.setup_error;
         FAIL("cancel waiter did not block");
         (void)wepoll_close(epfd);
         pthread_join(thread, NULL);
@@ -1443,6 +1530,14 @@ static void test_cancel_blocking_extended_wait(void)
     if (thread_error != 0 || thread_result != PTHREAD_CANCELED) {
         if (thread_error != 0) errno = thread_error;
         FAIL("cancelled wait thread result");
+        (void)wepoll_close(epfd);
+        return;
+    }
+    if (atomic_load_explicit(&context.cleanup_seen,
+                             memory_order_acquire) != 1 ||
+        atomic_load_explicit(&context.mask_restored,
+                             memory_order_acquire) != 1) {
+        FAIL("cancelled masked wait did not restore the caller mask");
         (void)wepoll_close(epfd);
         return;
     }

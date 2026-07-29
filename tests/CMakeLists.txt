@@ -154,6 +154,17 @@ else()
         target_link_libraries(test_wepoll_ex_windows_iocp_batch PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
 
+        add_executable(test_wepoll_ex_windows_pwait2
+            test_windows_pwait2.c)
+        target_include_directories(test_wepoll_ex_windows_pwait2 PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(test_wepoll_ex_windows_pwait2 PRIVATE
+            _WIN32_WINNT=0x0602
+            WIN32_LEAN_AND_MEAN
+            ${WEPOLL_EX_PLATFORM_DEFINITIONS})
+        target_link_libraries(test_wepoll_ex_windows_pwait2 PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+
         add_executable(test_wepoll_ex_windows_lifecycle
             test_windows_lifecycle.c)
         target_include_directories(test_wepoll_ex_windows_lifecycle PRIVATE
@@ -397,6 +408,19 @@ else()
             COMMAND test_wepoll_ex_windows_iocp_batch)
         set_tests_properties(wepoll_ex_windows_iocp_batch PROPERTIES TIMEOUT 20)
 
+        foreach(_pwait2_mode IN ITEMS
+                conversion
+                generation-deadline
+                readiness-wins
+                close
+                fallback)
+            string(REPLACE "-" "_" _pwait2_name "${_pwait2_mode}")
+            add_test(NAME wepoll_ex_windows_pwait2_${_pwait2_name}
+                COMMAND test_wepoll_ex_windows_pwait2 ${_pwait2_mode})
+            set_tests_properties(wepoll_ex_windows_pwait2_${_pwait2_name}
+                PROPERTIES TIMEOUT 15 SKIP_RETURN_CODE 77)
+        endforeach()
+
         foreach(_compat_mode IN ITEMS
                 provider
                 del-add
@@ -432,12 +456,19 @@ else()
                 aux-waitable-disarm
                 aux-waitable-disarm-repeat
                 aux-consumptive-disarm
-                aux-pipe-disarm)
+                aux-pipe-disarm
+                timeout-init
+                timeout-arm
+                timeout-post)
             string(REPLACE "-" "_" _fault_name "${_fault_mode}")
             add_test(NAME wepoll_ex_windows_fault_${_fault_name}
                 COMMAND test_wepoll_ex_windows_faults ${_fault_mode})
             set_tests_properties(wepoll_ex_windows_fault_${_fault_name}
                 PROPERTIES TIMEOUT 20)
+            if(_fault_mode MATCHES "^timeout-")
+                set_tests_properties(wepoll_ex_windows_fault_${_fault_name}
+                    PROPERTIES SKIP_RETURN_CODE 77)
+            endif()
         endforeach()
     endif()
 

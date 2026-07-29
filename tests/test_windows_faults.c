@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define TEST_SKIP 77
+
 #ifndef SIO_BASE_HANDLE
 #define SIO_BASE_HANDLE 0x48000022
 #endif
@@ -1250,6 +1252,130 @@ cleanup:
     return result;
 }
 
+static PGetQueuedCompletionStatusEx timeout_native_dequeue;
+static ep_port_t *timeout_fault_port;
+
+/* The precise timer callback and the rounded-millisecond IOCP timeout share
+ * nearly the same deadline.  For the callback-post fault, keep dequeuing in
+ * short native slices until the callback reaches the injected post or the
+ * optional timer path proves unavailable.  This prevents scheduler order
+ * from deciding whether the fault point is covered. */
+static BOOL WINAPI timeout_post_dequeue(
+    HANDLE completion_port, OVERLAPPED_ENTRY *entries, ULONG count,
+    PULONG removed, DWORD milliseconds, BOOL alertable)
+{
+    ULONGLONG deadline = GetTickCount64() + 2000;
+
+    (void)milliseconds;
+    for (;;) {
+        BOOL ok = timeout_native_dequeue(
+            completion_port, entries, count, removed, 10, alertable);
+
+        if (ok) return TRUE;
+        if (GetLastError() != WAIT_TIMEOUT) return FALSE;
+        if (ep_fault_hits(EP_FAULT_TIMEOUT_POST) != 0 ||
+            (timeout_fault_port != NULL &&
+             timeout_fault_port->precise_timeout_capability ==
+                 EP_TIMEOUT_CAPABILITY_UNAVAILABLE) ||
+            GetTickCount64() >= deadline) {
+            *removed = 0;
+            SetLastError(WAIT_TIMEOUT);
+            return FALSE;
+        }
+    }
+}
+
+static int run_timeout_fault(ep_fault_point_t point)
+{
+    const struct timespec duration = { 0, 20000000L };
+    ep_wait_timeout_t timeout;
+    epoll_event_ex event;
+    ep_port_t *port = NULL;
+    uint64_t post_failures_before = 0;
+    PGetQueuedCompletionStatusEx original_dequeue = NULL;
+    int result = -1;
+
+    ep_fault_reset();
+    if (ep_port_create(0, 0, &port) != 0 ||
+        ep_wait_timeout_from_timespec(&duration, &timeout) != 0) {
+        goto cleanup;
+    }
+    if (port->create_waitable_timer_ex_w == NULL ||
+        port->query_unbiased_interrupt_time_precise == NULL) {
+        /* Older supported Windows releases intentionally take the coarse
+         * fallback and cannot reach high-resolution timer fault points. */
+        result = TEST_SKIP;
+        goto cleanup;
+    }
+    post_failures_before = atomic_load_explicit(
+        &port->precise_timeout_post_failures, memory_order_relaxed);
+    if (ep_fault_configure(point, 1, EIO) != 0) {
+        goto cleanup;
+    }
+    if (point == EP_FAULT_TIMEOUT_POST) {
+        original_dequeue = port->get_queued_completion_status_ex;
+        timeout_native_dequeue = original_dequeue;
+        timeout_fault_port = port;
+        port->get_queued_completion_status_ex = timeout_post_dequeue;
+    }
+    if (ep_port_wait_timeout(port, &event, 1, &timeout, NULL) != 0 ||
+        atomic_load_explicit(&port->iocp_closed,
+                             memory_order_acquire) != 0 ||
+        atomic_load_explicit(&port->iocp_post_error,
+                             memory_order_acquire) != 0) {
+        goto cleanup;
+    }
+    if (ep_fault_hits(point) != 1) {
+        if (point != EP_FAULT_TIMEOUT_INIT &&
+            ep_fault_hits(point) == 0 &&
+            port->precise_timeout_capability ==
+                EP_TIMEOUT_CAPABILITY_UNAVAILABLE) {
+            result = TEST_SKIP;
+        }
+        goto cleanup;
+    }
+    if (point == EP_FAULT_TIMEOUT_INIT &&
+        port->precise_timeout_capability !=
+            EP_TIMEOUT_CAPABILITY_UNAVAILABLE) {
+        goto cleanup;
+    }
+    if (point == EP_FAULT_TIMEOUT_POST &&
+        atomic_load_explicit(&port->precise_timeout_post_failures,
+                             memory_order_relaxed) !=
+            post_failures_before + 1) {
+        goto cleanup;
+    }
+
+    ep_fault_reset();
+    if (ep_port_wait(port, &event, 1, 0, NULL) != 0) goto cleanup;
+    result = 0;
+
+cleanup:
+    if (port != NULL && original_dequeue != NULL) {
+        port->get_queued_completion_status_ex = original_dequeue;
+    }
+    timeout_fault_port = NULL;
+    timeout_native_dequeue = NULL;
+    ep_fault_reset();
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    return result;
+}
+
+static int test_timeout_init(void)
+{
+    return run_timeout_fault(EP_FAULT_TIMEOUT_INIT);
+}
+
+static int test_timeout_arm(void)
+{
+    return run_timeout_fault(EP_FAULT_TIMEOUT_ARM);
+}
+
+static int test_timeout_post(void)
+{
+    return run_timeout_fault(EP_FAULT_TIMEOUT_POST);
+}
+
 typedef int (*fault_test_fn)(void);
 
 typedef struct fault_test_case {
@@ -1277,7 +1403,10 @@ static const fault_test_case_t g_tests[] = {
     { "aux-waitable-disarm", test_aux_waitable_disarm },
     { "aux-waitable-disarm-repeat", test_aux_waitable_disarm_repeat },
     { "aux-consumptive-disarm", test_aux_consumptive_disarm },
-    { "aux-pipe-disarm", test_aux_pipe_disarm }
+    { "aux-pipe-disarm", test_aux_pipe_disarm },
+    { "timeout-init", test_timeout_init },
+    { "timeout-arm", test_timeout_arm },
+    { "timeout-post", test_timeout_post }
 };
 
 static int run_test(const fault_test_case_t *test)
@@ -1288,6 +1417,11 @@ static int run_test(const fault_test_case_t *test)
         printf("%s: OK\n", test->name);
         return 0;
     }
+    if (result == TEST_SKIP) {
+        printf("%s: SKIPPED (high-resolution timer unavailable)\n",
+               test->name);
+        return TEST_SKIP;
+    }
     fprintf(stderr, "%s: FAILED (errno=%d WSA=%d)\n",
             test->name, errno, WSAGetLastError());
     return -1;
@@ -1297,7 +1431,9 @@ int main(int argc, char **argv)
 {
     if (argc == 1 || (argc == 2 && strcmp(argv[1], "all") == 0)) {
         for (size_t i = 0; i < sizeof(g_tests) / sizeof(g_tests[0]); i++) {
-            if (run_test(&g_tests[i]) != 0)
+            int result = run_test(&g_tests[i]);
+
+            if (result != 0 && result != TEST_SKIP)
                 return 1;
         }
         return 0;
@@ -1305,8 +1441,12 @@ int main(int argc, char **argv)
 
     if (argc == 2) {
         for (size_t i = 0; i < sizeof(g_tests) / sizeof(g_tests[0]); i++) {
-            if (strcmp(argv[1], g_tests[i].name) == 0)
-                return run_test(&g_tests[i]) == 0 ? 0 : 1;
+            if (strcmp(argv[1], g_tests[i].name) == 0) {
+                int result = run_test(&g_tests[i]);
+
+                if (result == TEST_SKIP) return TEST_SKIP;
+                return result == 0 ? 0 : 1;
+            }
         }
     }
 
@@ -1317,7 +1457,7 @@ int main(int argc, char **argv)
             "aux-closed-iocp|aux-post|aux-post-immediate|ready-node-alloc|"
             "aux-waitable-disarm|"
             "aux-waitable-disarm-repeat|aux-consumptive-disarm|"
-            "aux-pipe-disarm]\n",
+            "aux-pipe-disarm|timeout-init|timeout-arm|timeout-post]\n",
             argv[0]);
     return 2;
 }

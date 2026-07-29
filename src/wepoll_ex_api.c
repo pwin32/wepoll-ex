@@ -233,40 +233,6 @@ uint64_t ep_test_api_deferred_destroy_count(void)
                                 memory_order_relaxed);
 }
 
-static int timeout_from_timespec(const struct timespec *timeout,
-                                 int *timeout_ms)
-{
-    uint64_t seconds;
-    uint64_t millis;
-
-    if (timeout == NULL) {
-        *timeout_ms = -1;
-        return 0;
-    }
-    if (timeout->tv_sec < 0 ||
-        timeout->tv_nsec < 0 ||
-        timeout->tv_nsec >= 1000000000L) {
-        ep_set_errno(EINVAL);
-        return -1;
-    }
-
-    seconds = (uint64_t)timeout->tv_sec;
-    if (seconds > (uint64_t)INT_MAX / UINT64_C(1000)) {
-        ep_set_errno(EOVERFLOW);
-        return -1;
-    }
-
-    millis = seconds * UINT64_C(1000);
-    millis += ((uint64_t)timeout->tv_nsec + UINT64_C(999999)) /
-              UINT64_C(1000000);
-    if (millis > (uint64_t)INT_MAX) {
-        ep_set_errno(EOVERFLOW);
-        return -1;
-    }
-    *timeout_ms = (int)millis;
-    return 0;
-}
-
 static int epoll_ctl_port(ep_port_t *port,
                           int op,
                           epoll_fd_t fd,
@@ -335,6 +301,16 @@ static int epoll_wait_port(epfd_entry_t *entry,
 {
     return ep_port_wait(entry->port, events, maxevents,
                         timeout_ms, sigmask);
+}
+
+static int epoll_wait_port_timeout(epfd_entry_t *entry,
+                                   epoll_event_ex *events,
+                                   int maxevents,
+                                   const ep_wait_timeout_t *timeout,
+                                   const wepoll_sigset_t *sigmask)
+{
+    return ep_port_wait_timeout(entry->port, events, maxevents,
+                                timeout, sigmask);
 }
 
 WEPOLL_EX_API int epoll_create(int size)
@@ -410,11 +386,11 @@ WEPOLL_EX_API int epoll_wait(int epfd,
     return epoll_pwait(epfd, events, maxevents, timeout, NULL);
 }
 
-WEPOLL_EX_API int epoll_pwait(int epfd,
-                              struct epoll_event *events,
-                              int maxevents,
-                              int timeout,
-                              const wepoll_sigset_t *sigmask)
+static int epoll_wait_basic_timeout(int epfd,
+                                    struct epoll_event *events,
+                                    int maxevents,
+                                    const ep_wait_timeout_t *timeout,
+                                    const wepoll_sigset_t *sigmask)
 {
     epfd_entry_t *entry;
     epoll_event_ex stack_events[EP_WAIT_STACK_EVENTS];
@@ -452,7 +428,8 @@ WEPOLL_EX_API int epoll_pwait(int epfd,
         extended = heap_events;
     }
 
-    result = epoll_wait_port(entry, extended, maxevents, timeout, sigmask);
+    result = epoll_wait_port_timeout(entry, extended, maxevents,
+                                     timeout, sigmask);
     if (result >= 0) {
         for (int i = 0; i < result; i++) {
             events[i].events = extended[i].events;
@@ -465,18 +442,32 @@ WEPOLL_EX_API int epoll_pwait(int epfd,
     return result;
 }
 
+WEPOLL_EX_API int epoll_pwait(int epfd,
+                              struct epoll_event *events,
+                              int maxevents,
+                              int timeout,
+                              const wepoll_sigset_t *sigmask)
+{
+    ep_wait_timeout_t wait_timeout;
+
+    ep_wait_timeout_from_milliseconds(timeout, &wait_timeout);
+    return epoll_wait_basic_timeout(epfd, events, maxevents,
+                                    &wait_timeout, sigmask);
+}
+
 WEPOLL_EX_API int epoll_pwait2(int epfd,
                                struct epoll_event *events,
                                int maxevents,
                                const struct timespec *timeout,
                                const wepoll_sigset_t *sigmask)
 {
-    int timeout_ms;
+    ep_wait_timeout_t wait_timeout;
 
-    if (timeout_from_timespec(timeout, &timeout_ms) != 0) {
+    if (ep_wait_timeout_from_timespec(timeout, &wait_timeout) != 0) {
         return -1;
     }
-    return epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask);
+    return epoll_wait_basic_timeout(epfd, events, maxevents,
+                                    &wait_timeout, sigmask);
 }
 
 WEPOLL_EX_API int epoll_wait_ex(int epfd,
@@ -512,7 +503,7 @@ WEPOLL_EX_API int epoll_pwait2_ex(int epfd,
                                   const wepoll_sigset_t *sigmask)
 {
     epfd_entry_t *entry;
-    int timeout_ms;
+    ep_wait_timeout_t wait_timeout;
     int result;
 
     if (events == NULL) {
@@ -523,7 +514,7 @@ WEPOLL_EX_API int epoll_pwait2_ex(int epfd,
         ep_set_errno(EINVAL);
         return -1;
     }
-    if (timeout_from_timespec(timeout, &timeout_ms) != 0) {
+    if (ep_wait_timeout_from_timespec(timeout, &wait_timeout) != 0) {
         return -1;
     }
 
@@ -531,8 +522,8 @@ WEPOLL_EX_API int epoll_pwait2_ex(int epfd,
     if (entry == NULL) {
         return -1;
     }
-    result = epoll_wait_port(entry, events, maxevents,
-                             timeout_ms, sigmask);
+    result = epoll_wait_port_timeout(entry, events, maxevents,
+                                     &wait_timeout, sigmask);
     epfd_put(entry);
     return result;
 }

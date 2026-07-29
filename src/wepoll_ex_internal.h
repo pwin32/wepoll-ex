@@ -233,7 +233,31 @@ typedef BOOL (WINAPI *PPostQueuedCompletionStatusFn)(
     DWORD NumberOfBytesTransferred,
     ULONG_PTR CompletionKey,
     LPOVERLAPPED Overlapped);
+typedef HANDLE (WINAPI *PCreateWaitableTimerExWFn)(
+    LPSECURITY_ATTRIBUTES TimerAttributes,
+    LPCWSTR TimerName,
+    DWORD Flags,
+    DWORD DesiredAccess);
+typedef VOID (WINAPI *PQueryUnbiasedInterruptTimePreciseFn)(
+    PULONGLONG UnbiasedTime);
 #endif
+
+/* Internal wait representation.  Millisecond waits retain the public
+ * epoll_wait/epoll_pwait contract, while timespec waits additionally carry
+ * an upward-rounded 100-nanosecond duration for the optional Windows
+ * high-resolution timer path. */
+typedef struct ep_wait_timeout {
+    uint64_t milliseconds;
+    uint64_t intervals_100ns;
+    uint8_t infinite;
+    uint8_t precise;
+} ep_wait_timeout_t;
+
+typedef enum ep_timeout_capability {
+    EP_TIMEOUT_CAPABILITY_UNKNOWN = 0,
+    EP_TIMEOUT_CAPABILITY_AVAILABLE = 1,
+    EP_TIMEOUT_CAPABILITY_UNAVAILABLE = 2
+} ep_timeout_capability_t;
 
 /* ----------------------------------------------------------------------- */
 /* ep_sock_t — per-fd state.                                               */
@@ -495,6 +519,23 @@ struct ep_port {
 #ifdef _WIN32
     PGetQueuedCompletionStatusEx get_queued_completion_status_ex;
     PPostQueuedCompletionStatusFn post_queued_completion_status;
+
+    /* Positive finite epoll_pwait2 waits may use a high-resolution waitable
+     * timer.  The timer and threadpool wait are initialized lazily so the
+     * ordinary integer-millisecond API path remains unchanged.  Timeout
+     * callbacks post the sentinel below to IOCP with the immutable arm
+     * generation in the completion key; stale packets are harmless. */
+    PCreateWaitableTimerExWFn create_waitable_timer_ex_w;
+    PQueryUnbiasedInterruptTimePreciseFn
+        query_unbiased_interrupt_time_precise;
+    HANDLE precise_timeout_timer;
+    PTP_WAIT precise_timeout_wait;
+    OVERLAPPED precise_timeout_overlapped;
+    ULONG_PTR precise_timeout_generation;
+    _Atomic ULONG_PTR precise_timeout_active_generation;
+    _Atomic int precise_timeout_armed;
+    _Atomic uint64_t precise_timeout_post_failures;
+    uint8_t precise_timeout_capability; /* ep_timeout_capability_t */
 #endif
 
     /* Configuration snapshot. */
@@ -575,6 +616,9 @@ typedef enum ep_fault_point {
     EP_FAULT_AUX_POST,
     EP_FAULT_IOCP_DEQUEUE,
     EP_FAULT_AUX_DISARM,
+    EP_FAULT_TIMEOUT_INIT,
+    EP_FAULT_TIMEOUT_ARM,
+    EP_FAULT_TIMEOUT_POST,
     EP_FAULT_POINT_COUNT
 } ep_fault_point_t;
 
@@ -613,6 +657,15 @@ int  ep_port_rearm(ep_port_t *port, SOCKET fd);
 
 int  ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
                   int timeout_ms, const wepoll_sigset_t *sigmask);
+#ifdef _WIN32
+void ep_wait_timeout_from_milliseconds(int timeout_ms,
+                                       ep_wait_timeout_t *timeout);
+int  ep_wait_timeout_from_timespec(const struct timespec *timespec,
+                                   ep_wait_timeout_t *timeout);
+int  ep_port_wait_timeout(ep_port_t *port, epoll_event_ex *out,
+                          int maxevents, const ep_wait_timeout_t *timeout,
+                          const wepoll_sigset_t *sigmask);
+#endif
 
 void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes,
                                NTSTATUS status);

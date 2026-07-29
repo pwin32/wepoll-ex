@@ -194,6 +194,9 @@ WEPOLL_EX_API int  epoll_wait(int epfd, struct epoll_event *events,
 WEPOLL_EX_API int  epoll_pwait(int epfd, struct epoll_event *events,
                                int maxevents, int timeout,
                                const wepoll_sigset_t *sigmask);
+/* Positive finite timespec waits use an optional high-resolution Windows
+ * timer with a millisecond IOCP safety fallback. Long valid durations are
+ * accepted; timer resolution does not guarantee scheduler wake latency. */
 WEPOLL_EX_API int  epoll_pwait2(int epfd, struct epoll_event *events,
                                 int maxevents,
                                 const struct timespec *timeout,
@@ -231,9 +234,12 @@ WEPOLL_EX_API int  epoll_ctl_ctx(int epfd, int op, epoll_fd_t fd,
 WEPOLL_EX_API int  epoll_wait_ex(int epfd, struct epoll_event_ex *events,
                                  int maxevents, int timeout);
 
-/* epoll_pwait2 that returns extended events.  POSIX applies a non-NULL
- * signal mask atomically through epoll_pwait; Windows accepts and ignores
- * a non-null mask pointer. */
+/* epoll_pwait2 that returns extended events.  POSIX applies a non-NULL signal
+ * mask through native epoll_pwait2, or per chunk through epoll_pwait with an
+ * inter-chunk signal bridge. Windows accepts and ignores a non-null mask
+ * pointer. Positive finite Windows waits use an optional high-resolution
+ * timer with a millisecond safety fallback; timer resolution does not
+ * guarantee wake latency. */
 WEPOLL_EX_API int  epoll_pwait2_ex(int epfd, struct epoll_event_ex *events,
                                    int maxevents,
                                    const struct timespec *timeout,

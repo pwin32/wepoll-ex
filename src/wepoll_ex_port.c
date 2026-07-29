@@ -21,8 +21,24 @@
 #define EP_ZERO_TIMEOUT_MIN_DEQUEUES     16U
 #define EP_DEFERRED_REARM_RETRY_MS       1U
 #define EP_MAX_ACTIVE_QUARANTINES        4U
+#define EP_100NS_PER_MILLISECOND         UINT64_C(10000)
+#define EP_MAX_FINITE_IOCP_WAIT_MS       (INFINITE - 1U)
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#  define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002UL
+#endif
 
 static _Atomic uint64_t g_quarantined_ports;
+
+#ifdef _WIN32
+static void ep_port_store_proc(void *target, size_t target_size, FARPROC proc)
+{
+    size_t copy_size = target_size < sizeof(proc) ? target_size : sizeof(proc);
+
+    memset(target, 0, target_size);
+    memcpy(target, &proc, copy_size);
+}
+#endif
 
 /* EPOLLEXCLUSIVE wake uniqueness among wepoll-ex instances.  AFD Exclusive
  * cancels peer polls when it can, but already-queued completions can still
@@ -327,9 +343,9 @@ static void ep_exclusive_release_inactive(ep_sock_t *sock,
 }
 
 #ifdef _WIN32
-static int ep_port_post_iocp(ep_port_t *port, LPOVERLAPPED overlapped,
-                             ep_fault_point_t fault_point,
-                             DWORD *error_out)
+static int ep_port_post_iocp(ep_port_t *port, ULONG_PTR completion_key,
+                             LPOVERLAPPED overlapped,
+                             ep_fault_point_t fault_point, DWORD *error_out)
 {
     HANDLE handle;
     DWORD error = ERROR_SUCCESS;
@@ -342,7 +358,7 @@ static int ep_port_post_iocp(ep_port_t *port, LPOVERLAPPED overlapped,
     } else if (ep_fault_hit(fault_point) != 0) {
         error = ERROR_GEN_FAILURE;
     } else if (port->post_queued_completion_status(
-                   handle, 0, 0, overlapped)) {
+                   handle, 0, completion_key, overlapped)) {
         posted = 1;
     } else {
         error = GetLastError();
@@ -408,7 +424,7 @@ static int ep_aux_post_completion(ep_sock_t *sock, NTSTATUS status)
     sock->io_status_block.Information = 0;
     atomic_store_explicit(&sock->completion_posted, 1,
                           memory_order_release);
-    if (!ep_port_post_iocp(sock->port,
+    if (!ep_port_post_iocp(sock->port, 0,
                            (LPOVERLAPPED)&sock->io_status_block,
                            EP_FAULT_AUX_POST, &error)) {
         atomic_store_explicit(&sock->completion_posted, 0,
@@ -418,6 +434,162 @@ static int ep_aux_post_completion(ep_sock_t *sock, NTSTATUS status)
         return 0;
     }
     return 1;
+}
+
+static VOID CALLBACK ep_precise_timeout_callback(
+    PTP_CALLBACK_INSTANCE instance, PVOID context, PTP_WAIT wait,
+    TP_WAIT_RESULT wait_result)
+{
+    ep_port_t *port = (ep_port_t *)context;
+    ULONG_PTR generation;
+    DWORD error = ERROR_SUCCESS;
+
+    (void)instance;
+    (void)wait;
+    (void)wait_result;
+    if (port == NULL) {
+        return;
+    }
+    generation = atomic_load_explicit(
+        &port->precise_timeout_active_generation, memory_order_acquire);
+    if (generation == 0) {
+        return;
+    }
+    if (!ep_port_post_iocp(
+            port, generation, &port->precise_timeout_overlapped,
+            EP_FAULT_TIMEOUT_POST, &error)) {
+        /* The millisecond IOCP deadline remains armed as a backstop.  A
+         * timeout callback post is therefore an optimization failure, not a
+         * fatal completion-port failure. */
+        atomic_fetch_add_explicit(&port->precise_timeout_post_failures, 1,
+                                  memory_order_relaxed);
+        SetLastError(error);
+    }
+}
+
+/* The caller owns wait_lock.  Capability failure is cached and is invisible
+ * to the public wait: positive timespec waits then use the upward-rounded
+ * millisecond IOCP deadline. */
+static int ep_port_precise_timeout_initialize(ep_port_t *port)
+{
+    HANDLE timer = NULL;
+    PTP_WAIT wait = NULL;
+    int saved_errno = ep_last_err();
+    DWORD saved_error = GetLastError();
+
+    if (port->precise_timeout_capability ==
+        EP_TIMEOUT_CAPABILITY_AVAILABLE) {
+        return 1;
+    }
+    if (port->precise_timeout_capability ==
+        EP_TIMEOUT_CAPABILITY_UNAVAILABLE) {
+        return 0;
+    }
+    if (port->create_waitable_timer_ex_w != NULL &&
+        port->query_unbiased_interrupt_time_precise != NULL &&
+        ep_fault_hit(EP_FAULT_TIMEOUT_INIT) == 0) {
+        timer = port->create_waitable_timer_ex_w(
+            NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_MODIFY_STATE | SYNCHRONIZE);
+        if (timer != NULL) {
+            wait = CreateThreadpoolWait(ep_precise_timeout_callback,
+                                        port, NULL);
+        }
+    }
+    if (timer == NULL || wait == NULL) {
+        if (wait != NULL) {
+            CloseThreadpoolWait(wait);
+        }
+        if (timer != NULL) {
+            (void)CloseHandle(timer);
+        }
+        port->precise_timeout_capability =
+            EP_TIMEOUT_CAPABILITY_UNAVAILABLE;
+        ep_set_errno(saved_errno);
+        SetLastError(saved_error);
+        return 0;
+    }
+
+    port->precise_timeout_timer = timer;
+    port->precise_timeout_wait = wait;
+    port->precise_timeout_capability = EP_TIMEOUT_CAPABILITY_AVAILABLE;
+    ep_set_errno(saved_errno);
+    SetLastError(saved_error);
+    return 1;
+}
+
+/* Arm one relative high-resolution deadline.  Generation zero is reserved
+ * for non-timeout/control IOCP packets.  The caller owns wait_lock. */
+static ULONG_PTR ep_port_precise_timeout_arm(ep_port_t *port,
+                                             uint64_t delay_100ns)
+{
+    LARGE_INTEGER due_time;
+    ULONG_PTR generation;
+    uint64_t timer_delay = delay_100ns;
+    int saved_errno = ep_last_err();
+    DWORD saved_error = GetLastError();
+
+    if (delay_100ns == 0 ||
+        !ep_port_precise_timeout_initialize(port)) {
+        return 0;
+    }
+    generation = ++port->precise_timeout_generation;
+    if (generation == 0) {
+        generation = ++port->precise_timeout_generation;
+    }
+    if (timer_delay > (uint64_t)INT64_MAX) {
+        timer_delay = (uint64_t)INT64_MAX;
+    }
+    due_time.QuadPart = -(LONGLONG)timer_delay;
+    atomic_store_explicit(&port->precise_timeout_active_generation,
+                          generation, memory_order_release);
+
+    if (ep_fault_hit(EP_FAULT_TIMEOUT_ARM) != 0 ||
+        !SetWaitableTimer(port->precise_timeout_timer, &due_time, 0,
+                          NULL, NULL, FALSE)) {
+        atomic_store_explicit(&port->precise_timeout_active_generation, 0,
+                              memory_order_release);
+        ep_set_errno(saved_errno);
+        SetLastError(saved_error);
+        return 0;
+    }
+    SetThreadpoolWait(port->precise_timeout_wait,
+                      port->precise_timeout_timer, NULL);
+    atomic_store_explicit(&port->precise_timeout_armed, 1,
+                          memory_order_release);
+    ep_set_errno(saved_errno);
+    SetLastError(saved_error);
+    return generation;
+}
+
+/* Synchronous disassociation is mandatory: epfd_put() may make this wait the
+ * last public reference and destroy the port immediately after return. */
+static void ep_port_precise_timeout_disarm(ep_port_t *port)
+{
+    if (!atomic_load_explicit(&port->precise_timeout_armed,
+                              memory_order_acquire)) {
+        return;
+    }
+    (void)CancelWaitableTimer(port->precise_timeout_timer);
+    SetThreadpoolWait(port->precise_timeout_wait, NULL, NULL);
+    WaitForThreadpoolWaitCallbacks(port->precise_timeout_wait, TRUE);
+    atomic_store_explicit(&port->precise_timeout_active_generation, 0,
+                          memory_order_release);
+    atomic_store_explicit(&port->precise_timeout_armed, 0,
+                          memory_order_release);
+}
+
+static void ep_port_precise_timeout_destroy(ep_port_t *port)
+{
+    ep_port_precise_timeout_disarm(port);
+    if (port->precise_timeout_wait != NULL) {
+        CloseThreadpoolWait(port->precise_timeout_wait);
+        port->precise_timeout_wait = NULL;
+    }
+    if (port->precise_timeout_timer != NULL) {
+        (void)CloseHandle(port->precise_timeout_timer);
+        port->precise_timeout_timer = NULL;
+    }
 }
 
 static void ep_aux_wait_callback_idle(ep_sock_t *sock)
@@ -804,7 +976,7 @@ static void ep_port_record_async_error_locked(ep_port_t *port, int error)
         !atomic_load_explicit(&port->iocp_closed, memory_order_acquire)) {
         DWORD win_error = ERROR_SUCCESS;
 
-        if (!ep_port_post_iocp(port, NULL, EP_FAULT_IOCP_POST,
+        if (!ep_port_post_iocp(port, 0, NULL, EP_FAULT_IOCP_POST,
                                &win_error)) {
             ep_port_fail_iocp_post(port, win_error);
         }
@@ -891,6 +1063,70 @@ int ep_port_get_stats(ep_port_t *port, wepoll_ex_stats *stats)
 /* ------------------------------------------------------------------------- */
 /* Time and fd-table helpers.                                                */
 /* ------------------------------------------------------------------------- */
+
+static uint64_t ep_saturating_mul_add_u64(uint64_t value, uint64_t multiplier,
+                                          uint64_t addend)
+{
+    if (value > (UINT64_MAX - addend) / multiplier) {
+        return UINT64_MAX;
+    }
+    return value * multiplier + addend;
+}
+
+void ep_wait_timeout_from_milliseconds(int timeout_ms,
+                                       ep_wait_timeout_t *timeout)
+{
+    memset(timeout, 0, sizeof(*timeout));
+    if (timeout_ms < 0) {
+        timeout->infinite = 1;
+        return;
+    }
+    timeout->milliseconds = (uint64_t)timeout_ms;
+    timeout->intervals_100ns =
+        (uint64_t)timeout_ms * EP_100NS_PER_MILLISECOND;
+}
+
+int ep_wait_timeout_from_timespec(const struct timespec *timespec,
+                                  ep_wait_timeout_t *timeout)
+{
+    uint64_t seconds;
+    uint64_t millis_remainder;
+    uint64_t intervals_remainder;
+    int intervals_fit;
+
+    if (timeout == NULL) {
+        ep_set_errno(EFAULT);
+        return -1;
+    }
+    memset(timeout, 0, sizeof(*timeout));
+    if (timespec == NULL) {
+        timeout->infinite = 1;
+        return 0;
+    }
+    if (timespec->tv_sec < 0 || timespec->tv_nsec < 0 ||
+        timespec->tv_nsec >= 1000000000L) {
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+
+    seconds = (uint64_t)timespec->tv_sec;
+    millis_remainder =
+        ((uint64_t)timespec->tv_nsec + UINT64_C(999999)) /
+        UINT64_C(1000000);
+    intervals_remainder =
+        ((uint64_t)timespec->tv_nsec + UINT64_C(99)) / UINT64_C(100);
+    timeout->milliseconds = ep_saturating_mul_add_u64(
+        seconds, UINT64_C(1000), millis_remainder);
+    intervals_fit =
+        seconds <= (UINT64_MAX - intervals_remainder) / UINT64_C(10000000);
+    timeout->intervals_100ns = ep_saturating_mul_add_u64(
+        seconds, UINT64_C(10000000), intervals_remainder);
+    /* Keep the exact millisecond/chunked path for durations whose 100-ns
+     * representation would saturate.  Treating UINT64_MAX as the precise
+     * deadline would otherwise expire a still-representable long wait early. */
+    timeout->precise = intervals_fit;
+    return 0;
+}
 
 static uint64_t ep_now_ns(void)
 {
@@ -2374,6 +2610,32 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     }
     port->get_queued_completion_status_ex = GetQueuedCompletionStatusEx;
     port->post_queued_completion_status = PostQueuedCompletionStatus;
+    {
+        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+
+        if (kernel32 != NULL) {
+            ep_port_store_proc(
+                &port->create_waitable_timer_ex_w,
+                sizeof(port->create_waitable_timer_ex_w),
+                GetProcAddress(kernel32, "CreateWaitableTimerExW"));
+            ep_port_store_proc(
+                &port->query_unbiased_interrupt_time_precise,
+                sizeof(port->query_unbiased_interrupt_time_precise),
+                GetProcAddress(kernel32,
+                               "QueryUnbiasedInterruptTimePrecise"));
+        }
+        if (port->query_unbiased_interrupt_time_precise == NULL) {
+            HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+
+            if (kernelbase != NULL) {
+                ep_port_store_proc(
+                    &port->query_unbiased_interrupt_time_precise,
+                    sizeof(port->query_unbiased_interrupt_time_precise),
+                    GetProcAddress(
+                        kernelbase, "QueryUnbiasedInterruptTimePrecise"));
+            }
+        }
+    }
 
     if (ep_fault_hit(EP_FAULT_IOCP_CREATE) != 0) {
         goto fail;
@@ -2394,6 +2656,9 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     atomic_init(&port->iocp_closed, 0);
     atomic_init(&port->iocp_post_error, 0);
     atomic_init(&port->iocp_post_failures, 0);
+    atomic_init(&port->precise_timeout_active_generation, 0);
+    atomic_init(&port->precise_timeout_armed, 0);
+    atomic_init(&port->precise_timeout_post_failures, 0);
     atomic_init(&port->generation, 0);
     port->close_drain_timeout_ms = EP_CLOSE_DRAIN_TIMEOUT_MS;
     port->quarantine_drain_timeout_ms = EP_QUARANTINE_DRAIN_TIMEOUT_MS;
@@ -2479,6 +2744,33 @@ static int ep_port_pending_count(ep_port_t *port, size_t *pending_out)
     return 0;
 }
 
+/* Return one only for the current wait's timeout packet.  Stale timeout
+ * generations and NULL control/wakeup packets are consumed internally. */
+static int ep_port_dispatch_iocp_entry(ep_port_t *port,
+                                       const OVERLAPPED_ENTRY *entry,
+                                       ULONG_PTR timeout_generation)
+{
+    OVERLAPPED *overlapped = entry->lpOverlapped;
+
+    if (overlapped == NULL) {
+        return 0;
+    }
+    if (overlapped == &port->precise_timeout_overlapped) {
+        ULONG_PTR packet_generation = (ULONG_PTR)entry->lpCompletionKey;
+
+        return timeout_generation != 0 &&
+               packet_generation == timeout_generation;
+    }
+
+    IO_STATUS_BLOCK *iosb = (IO_STATUS_BLOCK *)overlapped;
+    ep_sock_t *completed = (ep_sock_t *)(
+        (unsigned char *)iosb - offsetof(ep_sock_t, io_status_block));
+    ep_sock_handle_completion(completed,
+                              entry->dwNumberOfBytesTransferred,
+                              iosb->Status);
+    return 0;
+}
+
 /* Continue consuming cancellation completions until every kernel request has
  * released its embedded socket storage, the deadline expires, or IOCP becomes
  * unusable.  The caller owns wait_lock. */
@@ -2518,16 +2810,8 @@ static int ep_port_drain_pending_until(ep_port_t *port, uint64_t deadline)
             return -1;
         }
         for (ULONG i = 0; i < removed; i++) {
-            OVERLAPPED *overlapped = port->iocp_entries[i].lpOverlapped;
-            if (overlapped == NULL) continue;
-
-            IO_STATUS_BLOCK *iosb = (IO_STATUS_BLOCK *)overlapped;
-            ep_sock_t *completed = (ep_sock_t *)(
-                (unsigned char *)iosb - offsetof(ep_sock_t, io_status_block));
-            ep_sock_handle_completion(
-                completed,
-                port->iocp_entries[i].dwNumberOfBytesTransferred,
-                iosb->Status);
+            (void)ep_port_dispatch_iocp_entry(
+                port, &port->iocp_entries[i], 0);
         }
     }
 }
@@ -2561,6 +2845,7 @@ static void ep_port_finish_destroy_locked(ep_port_t *port)
         (void)CloseHandle(port->afd);
         port->afd = NULL;
     }
+    ep_port_precise_timeout_destroy(port);
     {
         HANDLE iocp_to_close = ep_port_revoke_iocp_posts(port);
 
@@ -2587,6 +2872,7 @@ static void ep_port_abandon_locked(ep_port_t *port)
         (void)CloseHandle(port->afd);
         port->afd = NULL;
     }
+    ep_port_precise_timeout_destroy(port);
     {
         HANDLE iocp_to_close = ep_port_revoke_iocp_posts(port);
 
@@ -3330,14 +3616,107 @@ static int ep_drain_to_buffer(ep_port_t *port,
     return delivered;
 }
 
+typedef struct ep_wait_state {
+    const ep_wait_timeout_t *timeout;
+    uint64_t start_ms;
+    uint64_t start_100ns;
+    ULONG_PTR timeout_generation;
+    int precise_clock;
+    int precise_enabled;
+    int precise_attempted;
+} ep_wait_state_t;
+
+static void ep_wait_state_initialize(ep_port_t *port,
+                                     const ep_wait_timeout_t *timeout,
+                                     ep_wait_state_t *state)
+{
+    memset(state, 0, sizeof(*state));
+    state->timeout = timeout;
+    state->start_ms = GetTickCount64();
+    if (timeout->precise && !timeout->infinite &&
+        timeout->intervals_100ns != 0 &&
+        port->query_unbiased_interrupt_time_precise != NULL) {
+        ULONGLONG now = 0;
+
+        port->query_unbiased_interrupt_time_precise(&now);
+        state->start_100ns = (uint64_t)now;
+        state->precise_clock = 1;
+    }
+}
+
+static uint64_t ep_wait_remaining_milliseconds(
+    ep_port_t *port, const ep_wait_state_t *state)
+{
+    if (state->precise_enabled) {
+        ULONGLONG now = 0;
+        uint64_t elapsed;
+        uint64_t remaining;
+
+        port->query_unbiased_interrupt_time_precise(&now);
+        elapsed = (uint64_t)now - state->start_100ns;
+        if (elapsed >= state->timeout->intervals_100ns) {
+            return 0;
+        }
+        remaining = state->timeout->intervals_100ns - elapsed;
+        return remaining / EP_100NS_PER_MILLISECOND +
+               (remaining % EP_100NS_PER_MILLISECOND != 0);
+    }
+
+    {
+        uint64_t elapsed = GetTickCount64() - state->start_ms;
+
+        if (elapsed >= state->timeout->milliseconds) {
+            return 0;
+        }
+        return state->timeout->milliseconds - elapsed;
+    }
+}
+
+static uint64_t ep_wait_remaining_100ns(ep_port_t *port,
+                                        const ep_wait_state_t *state)
+{
+    ULONGLONG now = 0;
+    uint64_t elapsed;
+
+    port->query_unbiased_interrupt_time_precise(&now);
+    elapsed = (uint64_t)now - state->start_100ns;
+    if (elapsed >= state->timeout->intervals_100ns) {
+        return 0;
+    }
+    return state->timeout->intervals_100ns - elapsed;
+}
+
+static int ep_wait_expired(ep_port_t *port, const ep_wait_state_t *state)
+{
+    return !state->timeout->infinite &&
+           ep_wait_remaining_milliseconds(port, state) == 0;
+}
+
+static DWORD ep_wait_backstop_milliseconds(ep_port_t *port,
+                                           const ep_wait_state_t *state)
+{
+    uint64_t remaining;
+
+    if (state->timeout->infinite) {
+        return INFINITE;
+    }
+    remaining = ep_wait_remaining_milliseconds(port, state);
+    if (remaining > (uint64_t)EP_MAX_FINITE_IOCP_WAIT_MS) {
+        return EP_MAX_FINITE_IOCP_WAIT_MS;
+    }
+    return (DWORD)remaining;
+}
+
 /* The ready queue has one consumer, so waiters still serialize their drain
  * operation.  Do not let that serialization turn a bounded wait into an
  * unbounded mutex wait: a zero-timeout drain returns immediately when another
  * consumer owns the lock, and a positive timeout includes lock acquisition. */
-static int ep_wait_lock_acquire(ep_port_t *port, int timeout_ms,
-                                uint64_t deadline)
+static int ep_wait_lock_acquire(ep_port_t *port,
+                                const ep_wait_state_t *wait_state)
 {
-    if (timeout_ms < 0) {
+    const ep_wait_timeout_t *timeout = wait_state->timeout;
+
+    if (timeout->infinite) {
         int lock_result = pthread_mutex_lock(&port->wait_lock);
         if (lock_result != 0) {
             ep_set_errno(lock_result);
@@ -3348,8 +3727,9 @@ static int ep_wait_lock_acquire(ep_port_t *port, int timeout_ms,
 
     int first_attempt = 1;
     for (;;) {
-        if (!first_attempt && timeout_ms > 0 &&
-            GetTickCount64() >= deadline) {
+        if (!first_attempt && timeout->milliseconds != 0 &&
+            GetTickCount64() - wait_state->start_ms >=
+                timeout->milliseconds) {
             return 0;
         }
         first_attempt = 0;
@@ -3369,24 +3749,26 @@ static int ep_wait_lock_acquire(ep_port_t *port, int timeout_ms,
             ep_set_errno(post_error != 0 ? post_error : EBADF);
             return -1;
         }
-        if (timeout_ms == 0 ||
-            (timeout_ms > 0 && GetTickCount64() >= deadline)) {
+        if (timeout->milliseconds == 0 ||
+            GetTickCount64() - wait_state->start_ms >=
+                timeout->milliseconds) {
             return 0;
         }
         Sleep(1);
     }
 }
 
-int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
-                 int timeout_ms, const wepoll_sigset_t *sigmask)
+int ep_port_wait_timeout(ep_port_t *port, epoll_event_ex *out, int maxevents,
+                         const ep_wait_timeout_t *timeout,
+                         const wepoll_sigset_t *sigmask)
 {
-    uint64_t deadline = 0;
+    ep_wait_state_t wait_state;
     uint64_t zero_timeout_deadline = 0;
     unsigned int zero_timeout_dequeues = 0;
     int result = -1;
     int lock_result;
 
-    if (out == NULL) {
+    if (out == NULL || timeout == NULL) {
         ep_set_errno(EFAULT);
         return -1;
     }
@@ -3399,9 +3781,8 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
      * applied.  This matches the public wepoll_sigset_t opacity on Win32. */
     (void)sigmask;
 
-    if (timeout_ms > 0) {
-        deadline = GetTickCount64() + (uint64_t)timeout_ms;
-    } else if (timeout_ms == 0) {
+    ep_wait_state_initialize(port, timeout, &wait_state);
+    if (!timeout->infinite && timeout->milliseconds == 0) {
         /* AFD cancellation and wake packets are internal to the API.  Drain
          * all immediately queued batches for a short bounded time slice
          * before reporting an empty nonblocking wait, otherwise a large
@@ -3413,7 +3794,7 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
         zero_timeout_deadline = GetTickCount64() +
                                 EP_ZERO_TIMEOUT_DRAIN_BUDGET_MS;
     }
-    lock_result = ep_wait_lock_acquire(port, timeout_ms, deadline);
+    lock_result = ep_wait_lock_acquire(port, &wait_state);
     if (lock_result <= 0) {
         return lock_result == 0 ? 0 : -1;
     }
@@ -3487,9 +3868,9 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
 
             result = ep_drain_to_buffer(port, out, maxevents);
             if (result <= 0) {
-                int post_error = ep_port_take_iocp_post_error(port);
+                int wait_post_error = ep_port_take_iocp_post_error(port);
 
-                if (post_error != 0) arm_error = post_error;
+                if (wait_post_error != 0) arm_error = wait_post_error;
                 pthread_mutex_lock(&port->fd_table_lock);
                 {
                     int reported_error =
@@ -3515,19 +3896,45 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
         pthread_mutex_lock(&port->fd_table_lock);
         deferred_rearm = ep_port_has_deferred_rearm_locked(port);
         pthread_mutex_unlock(&port->fd_table_lock);
-        if (timeout_ms < 0) {
-            wait_ms = INFINITE;
-        } else if (timeout_ms == 0) {
-            wait_ms = 0;
-        } else {
-            uint64_t now = GetTickCount64();
-            if (now >= deadline) {
+
+        if (timeout->precise && !timeout->infinite &&
+            timeout->intervals_100ns != 0 &&
+            !wait_state.precise_attempted) {
+            wait_state.precise_attempted = 1;
+            if (wait_state.precise_clock &&
+                ep_port_precise_timeout_initialize(port)) {
+                wait_state.precise_enabled = 1;
+            }
+        }
+        if (!timeout->infinite && timeout->milliseconds != 0 &&
+            ep_wait_expired(port, &wait_state)) {
+            result = 0;
+            break;
+        }
+        if (wait_state.precise_enabled &&
+            wait_state.timeout_generation == 0) {
+            uint64_t remaining_100ns =
+                ep_wait_remaining_100ns(port, &wait_state);
+
+            if (remaining_100ns == 0) {
                 result = 0;
                 break;
             }
-            wait_ms = (DWORD)(deadline - now);
+            wait_state.timeout_generation =
+                ep_port_precise_timeout_arm(port, remaining_100ns);
+            if (wait_state.timeout_generation == 0) {
+                wait_state.precise_enabled = 0;
+                if (!timeout->infinite && timeout->milliseconds != 0 &&
+                    ep_wait_expired(port, &wait_state)) {
+                    result = 0;
+                    break;
+                }
+            }
         }
-        if (deferred_rearm && timeout_ms != 0 &&
+
+        wait_ms = ep_wait_backstop_milliseconds(port, &wait_state);
+        if (deferred_rearm &&
+            (timeout->infinite || timeout->milliseconds != 0) &&
             (wait_ms == INFINITE || wait_ms > EP_DEFERRED_REARM_RETRY_MS)) {
             wait_ms = EP_DEFERRED_REARM_RETRY_MS;
             deferred_rearm_wait = 1;
@@ -3543,10 +3950,10 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
             &removed, wait_ms, FALSE);
         if (!ok) {
             DWORD error = GetLastError();
-            int post_error = ep_port_take_iocp_post_error(port);
+            int wait_post_error = ep_port_take_iocp_post_error(port);
 
-            if (post_error != 0) {
-                ep_set_errno(post_error);
+            if (wait_post_error != 0) {
+                ep_set_errno(wait_post_error);
                 result = -1;
                 break;
             }
@@ -3557,17 +3964,12 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
                     pthread_mutex_unlock(&port->fd_table_lock);
                     continue;
                 }
-                if (timeout_ms > 0) {
-                    uint64_t now = GetTickCount64();
-                    if (now < deadline) {
-                        /* GetQueuedCompletionStatusEx can observe a timer
-                         * boundary before the requested deadline.  Retry
-                         * against the absolute deadline rather than
-                         * under-waiting; a one-millisecond yield prevents a
-                         * spurious-timeout loop from consuming a core. */
-                        Sleep(1);
-                        continue;
-                    }
+                if (!ep_wait_expired(port, &wait_state)) {
+                    /* A coarse IOCP boundary or a test dequeue hook may fire
+                     * before the requested deadline.  Retry against the
+                     * monotonic duration rather than under-waiting. */
+                    Sleep(wait_state.precise_enabled ? 0 : 1);
+                    continue;
                 }
                 result = 0;
             } else {
@@ -3577,24 +3979,20 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
             break;
         }
         if (removed == 0) {
+            if (!ep_wait_expired(port, &wait_state)) {
+                continue;
+            }
             result = 0;
             break;
         }
 
+        int timeout_packet = 0;
         for (ULONG i = 0; i < removed; i++) {
-            OVERLAPPED *overlapped = port->iocp_entries[i].lpOverlapped;
-            if (overlapped == NULL) {
-                continue;
-            }
-            IO_STATUS_BLOCK *iosb = (IO_STATUS_BLOCK *)overlapped;
-            ep_sock_t *sock = (ep_sock_t *)(
-                (unsigned char *)iosb - offsetof(ep_sock_t, io_status_block));
-            ep_sock_handle_completion(
-                sock,
-                port->iocp_entries[i].dwNumberOfBytesTransferred,
-                iosb->Status);
+            timeout_packet |= ep_port_dispatch_iocp_entry(
+                port, &port->iocp_entries[i],
+                wait_state.timeout_generation);
         }
-        if (timeout_ms == 0) {
+        if (!timeout->infinite && timeout->milliseconds == 0) {
             zero_timeout_dequeues++;
         }
 
@@ -3616,7 +4014,17 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
             result = -1;
             break;
         }
-        if (timeout_ms == 0 &&
+        if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
+            post_error = ep_port_take_iocp_post_error(port);
+            ep_set_errno(post_error != 0 ? post_error : EBADF);
+            result = -1;
+            break;
+        }
+        if (timeout_packet && ep_wait_expired(port, &wait_state)) {
+            result = 0;
+            break;
+        }
+        if (!timeout->infinite && timeout->milliseconds == 0 &&
             zero_timeout_dequeues >= EP_ZERO_TIMEOUT_MIN_DEQUEUES &&
             GetTickCount64() >= zero_timeout_deadline) {
             pthread_mutex_lock(&port->fd_table_lock);
@@ -3625,14 +4033,27 @@ int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
             result = 0;
             break;
         }
-        if (timeout_ms > 0 && GetTickCount64() >= deadline) {
+        if (!timeout->infinite && timeout->milliseconds != 0 &&
+            ep_wait_expired(port, &wait_state)) {
             result = 0;
             break;
         }
     }
 
 done:
+    if (wait_state.timeout_generation != 0) {
+        ep_port_precise_timeout_disarm(port);
+    }
     atomic_store_explicit(&port->waiter_active, 0, memory_order_release);
     pthread_mutex_unlock(&port->wait_lock);
     return result;
+}
+
+int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
+                 int timeout_ms, const wepoll_sigset_t *sigmask)
+{
+    ep_wait_timeout_t timeout;
+
+    ep_wait_timeout_from_milliseconds(timeout_ms, &timeout);
+    return ep_port_wait_timeout(port, out, maxevents, &timeout, sigmask);
 }

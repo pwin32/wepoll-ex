@@ -11,6 +11,7 @@
 #include "wepoll_ex.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -628,6 +629,67 @@ static void test_zero_timeout(void)
     PASS();
 }
 
+static void test_pwait2_timeouts(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    struct epoll_event output;
+    struct epoll_event_ex extended;
+    struct timespec submillisecond = { 0, 500000L };
+    struct timespec long_timeout = { INT_MAX, 0 };
+    ULONGLONG started;
+    int epfd = -1;
+
+    TEST("epoll_pwait2 preserves submillisecond and long timespecs");
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        return;
+    }
+    started = GetTickCount64();
+    if (epoll_pwait2(epfd, &output, 1, &submillisecond, NULL) != 0 ||
+        epoll_pwait2_ex(epfd, &extended, 1,
+                        &submillisecond, NULL) != 0 ||
+        GetTickCount64() - started > 2000) {
+        FAIL("positive submillisecond timeout");
+        wepoll_close(epfd);
+        return;
+    }
+    if (wepoll_close(epfd) != 0 || make_tcp_pair(&pair) != 0) {
+        FAIL("long-timeout setup");
+        return;
+    }
+
+    epfd = epoll_create1(0);
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = UINT64_C(0x707761697432);
+    if (epfd < 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
+        send_byte(pair.client) != 0 ||
+        epoll_pwait2(epfd, &output, 1, &long_timeout, NULL) != 1 ||
+        output.data.u64 != event.data.u64 ||
+        (output.events & EPOLLIN) == 0 || recv_byte(pair.server) != 0 ||
+        send_byte(pair.client) != 0 ||
+        epoll_pwait2_ex(epfd, &extended, 1,
+                        &long_timeout, NULL) != 1 ||
+        extended.data.u64 != event.data.u64 ||
+        (extended.events & EPOLLIN) == 0 || recv_byte(pair.server) != 0) {
+        FAIL("ready event with long timeout");
+        if (epfd >= 0) wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL) != 0 ||
+        wepoll_close(epfd) != 0) {
+        FAIL("long-timeout cleanup");
+        tcp_pair_close(&pair);
+        return;
+    }
+    tcp_pair_close(&pair);
+    PASS();
+}
+
 static void test_context_clear(void)
 {
     tcp_pair_t pair;
@@ -1217,6 +1279,7 @@ int main(void)
     test_remote_reset();
     test_connect_failure();
     test_zero_timeout();
+    test_pwait2_timeouts();
     test_context_clear();
     test_oneshot_rearm();
     test_unsupported_event_modes();

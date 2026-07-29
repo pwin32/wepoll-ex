@@ -71,10 +71,17 @@ changes that overlap a wait, deliberately produce `user_ctx == NULL` instead
 of a stale association. `epoll_pwait2_ex()` uses native `epoll_pwait2` when
 the libc and kernel provide it, retaining nanosecond timeout precision. An
 `ENOSYS` or build-time absence falls back to `epoll_pwait`/`epoll_wait` with a
-timeout rounded up to milliseconds. Cancellation cleanup releases wait
-buffers and metadata references, so cancelling a blocked thread cannot strand
-a later `wepoll_close()`. The shared pool/queue code is also compiled here for
-unit tests; it does not make the Linux wrapper a Windows-engine implementation.
+timeout rounded up to milliseconds. Valid finite timeouts longer than
+`INT_MAX` milliseconds are split into bounded waits instead of failing with
+`EOVERFLOW`; a masked multi-chunk fallback blocks catchable signals between
+syscalls and restores the caller's original mask on return or cancellation.
+As with any userspace multi-syscall fallback, a process-directed signal may be
+routed to another eligible thread during the inter-chunk bridge; thread-
+directed delivery to the waiting thread remains protected.
+Cancellation cleanup also releases wait buffers and metadata references, so
+cancelling a blocked thread cannot strand a later `wepoll_close()`. The shared
+pool/queue code is compiled here for unit tests; it does not make the Linux
+wrapper a Windows-engine implementation.
 
 ### Public extensions
 
@@ -149,18 +156,25 @@ track read, write, and terminal readiness independently, so a continuously
 writable exclusive owner does not suppress a disjoint read wake. Windows
 `epoll_pwait*` accepts a non-null signal-mask pointer and ignores it (there is
 no POSIX process signal mask). Linux `epoll_pwait2_ex` applies a supplied mask
-atomically through the native wait. `EPOLLWAKEUP` is accepted and ignored on
-Windows. Call `wepoll_close()` for the virtual Windows epoll descriptor and for
-prompt Linux extended-wait wakeup.
+atomically through the native wait or its chunked fallback. Positive finite
+Windows `epoll_pwait2*` waits request an optional high-resolution waitable
+timer using an upward-rounded 100-nanosecond duration while retaining an
+upward-rounded millisecond IOCP deadline as a safety backstop. Missing timer
+support or any initialization/arm failure transparently uses the millisecond
+path; integer `epoll_wait`/`epoll_pwait` behavior is unchanged. Timer units are
+not a scheduler wake-latency guarantee. `EPOLLWAKEUP` is accepted and ignored
+on Windows. Call `wepoll_close()` for the virtual Windows epoll descriptor and
+for prompt Linux extended-wait wakeup.
 
 Remaining platform limits are explicit: Windows signal masks and
-`EPOLLWAKEUP` have no native effect, `epoll_pwait2*` has millisecond timeout
-resolution, edge delivery is observed-level rather than Linux kernel queue
-semantics, AFD collapses the writable aliases into one readiness class,
-`EPOLLMSG` is never produced, `SO_OOBINLINE` collapses priority into ordinary
-readability, unknown provider protocol metadata retains a conservative abort
-mapping, exclusive-claim updates serialize through one process-wide mutex, and
-virtual epoll descriptors cannot be nested.
+`EPOLLWAKEUP` have no native effect, high-resolution timeout support is
+optional and Windows scheduling can wake later than the requested deadline,
+edge delivery is observed-level rather than Linux kernel queue semantics, AFD
+collapses the writable aliases into one readiness class, `EPOLLMSG` is never
+produced, `SO_OOBINLINE` collapses priority into ordinary readability, unknown
+provider protocol metadata retains a conservative abort mapping,
+exclusive-claim updates serialize through one process-wide mutex, and virtual
+epoll descriptors cannot be nested.
 
 On Linux, `epoll_fd_count()` reports registrations owned by the extension
 metadata, including successful `epoll_ctl_batch` operations. Native
