@@ -306,7 +306,11 @@ else()
             oob-inline-et
             udp-v4
             udp-v6
-            udp-error)
+            udp-error
+            udp-error-v6
+            udp-error-v6-et
+            udp-error-v6-oneshot
+            udp-iocp)
         string(REPLACE "-" "_" _socket_event_name
             "${_socket_event_mode}")
         add_test(NAME wepoll_ex_windows_socket_events_${_socket_event_name}
@@ -316,7 +320,10 @@ else()
             wepoll_ex_windows_socket_events_${_socket_event_name}
             PROPERTIES TIMEOUT 30)
         if(_socket_event_mode STREQUAL "udp-v6" OR
-           _socket_event_mode STREQUAL "udp-error")
+           _socket_event_mode STREQUAL "udp-error" OR
+           _socket_event_mode STREQUAL "udp-error-v6" OR
+           _socket_event_mode STREQUAL "udp-error-v6-et" OR
+           _socket_event_mode STREQUAL "udp-error-v6-oneshot")
             set_tests_properties(
                 wepoll_ex_windows_socket_events_${_socket_event_name}
                 PROPERTIES SKIP_RETURN_CODE 77)

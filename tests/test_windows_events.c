@@ -215,18 +215,66 @@ static int test_protocol_metadata(void)
     protocol_info.iAddressFamily = AF_INET;
     protocol_info.iSocketType = SOCK_DGRAM;
     protocol_info.iProtocol = IPPROTO_UDP;
+    protocol_info.ProtocolChain.ChainLen = BASE_PROTOCOL;
     if (check_protocol("UDP IPv4 metadata",
                        ep_socket_protocol_from_info(
                            &protocol_info, (int)sizeof(protocol_info)),
-                       EP_SOCKET_PROTOCOL_UDP) != 0) {
+                       EP_SOCKET_PROTOCOL_UDP) != 0 ||
+        check_protocol("UDP base-provider AFD qualifier",
+                       (uint8_t)ep_socket_udp_afd_qualifier_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       1) != 0) {
         return -1;
     }
+
+    protocol_info.ProtocolChain.ChainLen = LAYERED_PROTOCOL;
+    if (check_protocol("UDP layered metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       EP_SOCKET_PROTOCOL_UDP) != 0 ||
+        check_protocol("UDP layered AFD qualifier",
+                       (uint8_t)ep_socket_udp_afd_qualifier_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       0) != 0) {
+        return -1;
+    }
+
+    protocol_info.ProtocolChain.ChainLen = BASE_PROTOCOL + 1;
+    if (check_protocol("UDP provider-chain metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       EP_SOCKET_PROTOCOL_UDP) != 0 ||
+        check_protocol("UDP provider-chain AFD qualifier",
+                       (uint8_t)ep_socket_udp_afd_qualifier_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       0) != 0) {
+        return -1;
+    }
+    protocol_info.ProtocolChain.ChainLen = -1;
+    if (check_protocol("UDP negative-chain AFD qualifier",
+                       (uint8_t)ep_socket_udp_afd_qualifier_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       0) != 0) {
+        return -1;
+    }
+    protocol_info.ProtocolChain.ChainLen = MAX_PROTOCOL_CHAIN + 1;
+    if (check_protocol("UDP oversized-chain AFD qualifier",
+                       (uint8_t)ep_socket_udp_afd_qualifier_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       0) != 0) {
+        return -1;
+    }
+    protocol_info.ProtocolChain.ChainLen = BASE_PROTOCOL;
 
     protocol_info.iAddressFamily = AF_INET6;
     if (check_protocol("UDP IPv6 metadata",
                        ep_socket_protocol_from_info(
                            &protocol_info, (int)sizeof(protocol_info)),
                        EP_SOCKET_PROTOCOL_UDP) != 0 ||
+        check_protocol("UDP IPv6 base-provider AFD qualifier",
+                       (uint8_t)ep_socket_udp_afd_qualifier_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       1) != 0 ||
         check_mask("UDP IPv6 metadata abort",
                    ep_afd_to_epoll_events(
                        AFD_POLL_ABORT, STATUS_SUCCESS,
@@ -269,13 +317,24 @@ static int test_protocol_metadata(void)
                        ep_socket_protocol_from_info(
                            &protocol_info, (int)sizeof(protocol_info)),
                        EP_SOCKET_PROTOCOL_UNKNOWN) != 0 ||
+        check_protocol("UDP wrong-protocol AFD qualifier",
+                       (uint8_t)ep_socket_udp_afd_qualifier_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       0) != 0 ||
         check_protocol("missing protocol metadata",
                        ep_socket_protocol_from_info(NULL, 0),
                        EP_SOCKET_PROTOCOL_UNKNOWN) != 0 ||
         check_protocol("short protocol metadata",
                        ep_socket_protocol_from_info(
                            &protocol_info, (int)sizeof(protocol_info) - 1),
-                       EP_SOCKET_PROTOCOL_UNKNOWN) != 0) {
+                       EP_SOCKET_PROTOCOL_UNKNOWN) != 0 ||
+        check_protocol("missing AFD qualifier metadata",
+                       (uint8_t)ep_socket_udp_afd_qualifier_from_info(NULL, 0),
+                       0) != 0 ||
+        check_protocol("short AFD qualifier metadata",
+                       (uint8_t)ep_socket_udp_afd_qualifier_from_info(
+                           &protocol_info, (int)sizeof(protocol_info) - 1),
+                       0) != 0) {
         return -1;
     }
 

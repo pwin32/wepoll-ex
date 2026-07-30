@@ -338,10 +338,27 @@ metadata reference before unwinding.
   LT, and re-edges under the observed ET rule. AFD does not expose a separate
   expedited class in that mode, so Windows does not also report Linux's
   `EPOLLPRI` indication. `EPOLLMSG` is accepted but AFD has no event class that
-  produces it. UDP IPv4/IPv6 readiness is covered publicly; connected-UDP ICMP
-  error delivery is also checked when
-  `SIO_UDP_CONNRESET`, the provider, and host firewall expose it, and any
-  observed event must contain `EPOLLERR` without `EPOLLHUP`.
+  produces it. UDP IPv4/IPv6 readiness is covered publicly. For a confirmed
+  UDP socket whose cached provider-file mode permits overlapped I/O, each
+  requested normal-read AFD completion is qualified with a one-byte direct
+  `IOCTL_AFD_RECV` normal-plus-peek request issued through `DeviceIoControl`.
+  Eligibility requires an unlayered base-provider protocol chain because this
+  native request bypasses Winsock provider transformations. Each request
+  duplicates the provider base handle, revalidates endpoint identity in
+  hardened lifetime modes, and pins that duplicate through settlement. Its
+  private low-bit event prevents a qualifier packet from entering an
+  application-owned IOCP. Success or AFD buffer overflow preserves the
+  requested readable aliases without consuming the datagram; an asynchronous
+  network receive error removes those aliases and contributes
+  exact unrequested `EPOLLERR` without HUP. A pending probe is cancelled and
+  joined before its stack state is released. IPv4/IPv6 connected-UDP ICMP
+  probes require repeated LT `EPOLLERR`, then `recv() == WSAECONNRESET`, when
+  `SIO_UDP_CONNRESET`, the provider, and host firewall expose the condition.
+  A synchronous/non-overlapped socket, a layered provider, or a provider that
+  returns a recognized unsupported-operation error for the reverse-engineered
+  receive request retains the legacy AFD readable mapping. Receive-class errors
+  are not yet armed without `EPOLLIN`/`EPOLLRDNORM`, and an error behind an
+  unread datagram is visible only after that datagram leaves the receive head.
 - Socket `EPOLLET` is implemented as an observed-edge filter over AFD level
   snapshots: each interest bit is delivered once while continuously true, then
   suppressed until it drops out of the latest level and reappears. Empty edge

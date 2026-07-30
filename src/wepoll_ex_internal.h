@@ -169,8 +169,23 @@ typedef struct _AFD_POLL_INFO {
                                     AFD_POLL_ABORT | AFD_POLL_LOCAL_CLOSE | \
                                     AFD_POLL_ACCEPT | AFD_POLL_CONNECT_FAIL)
 
-/* IoControlCode for AFD_POLL.  Reverse-engineered; matches Win8+. */
+/* Reverse-engineered AFD control contracts; match the Windows 8+ provider. */
+#define IOCTL_AFD_RECV  0x00012017
 #define IOCTL_AFD_POLL  0x00012024
+
+#ifdef _WIN32
+typedef struct _AFD_RECV_INFO {
+    WSABUF *BufferArray;
+    ULONG BufferCount;
+    ULONG AfdFlags;
+    ULONG TdiFlags;
+} AFD_RECV_INFO, *PAFD_RECV_INFO;
+
+#define AFD_RECV_OVERLAPPED 0x00000002UL
+#define AFD_RECV_IMMEDIATE  0x00000004UL
+#define AFD_MSG_NOT_OOB     0x00000020UL
+#define AFD_MSG_PEEK        0x00000080UL
+#endif
 
 /* Function pointer types for the NTDLL entry points we resolve at startup. */
 typedef NTSTATUS (NTAPI *PNtDeviceIoControlFile)(
@@ -319,6 +334,16 @@ typedef enum ep_socket_protocol {
     EP_SOCKET_PROTOCOL_UDP = 1
 } ep_socket_protocol_t;
 
+/* A one-byte direct AFD receive is only a safe readiness observation when the
+ * provider handle was opened for asynchronous I/O.  Cache that conclusion
+ * per registration: UNKNOWN/UNSAFE keep the conservative poll mapping, while
+ * SAFE permits the UDP read qualifier. */
+typedef enum ep_socket_async_read_capability {
+    EP_SOCKET_ASYNC_READ_UNKNOWN = 0,
+    EP_SOCKET_ASYNC_READ_SAFE = 1,
+    EP_SOCKET_ASYNC_READ_UNSAFE = 2
+} ep_socket_async_read_capability_t;
+
 typedef enum ep_waitable_semantics {
     EP_WAITABLE_NONE = 0,
     EP_WAITABLE_PERSISTENT = 1,
@@ -348,6 +373,8 @@ struct ep_sock {
     uint8_t waitable_semantics; /* ep_waitable_semantics_t */
     uint8_t pipe_access; /* ep_pipe_access_t */
     uint8_t socket_protocol; /* ep_socket_protocol_t */
+    uint8_t udp_afd_qualifier_eligible;
+    uint8_t async_read_capability; /* ep_socket_async_read_capability_t */
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     uint64_t endpoint_id;
     uint8_t endpoint_id_state;
@@ -511,6 +538,10 @@ struct ep_port {
 
     /* Handle to AFD, opened once per port. */
     HANDLE afd;
+
+    /* Private completion event for synchronous settlement of internal direct
+     * AFD UDP qualifiers.  Its packets never enter an application IOCP. */
+    HANDLE udp_probe_event;
 
     /* Per-port fd table — indexed by SOCKET value masked by fd_mask.
      * Grows when more than 75 % full.  NULL entries are unused slots. */
@@ -726,6 +757,9 @@ uint32_t ep_epoll_to_afd_events(uint32_t epoll_events);
 #ifdef _WIN32
 uint8_t  ep_socket_protocol_from_info(const WSAPROTOCOL_INFOW *protocol_info,
                                       int protocol_info_length);
+int      ep_socket_udp_afd_qualifier_from_info(
+             const WSAPROTOCOL_INFOW *protocol_info,
+             int protocol_info_length);
 /* Internal callback form used to test provider-chain resolution without
  * installing a process- or system-wide Winsock layered service provider. */
 typedef SOCKET (*ep_socket_ioctl_fn)(SOCKET socket, DWORD ioctl,

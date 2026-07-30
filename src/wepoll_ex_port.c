@@ -30,6 +30,9 @@
 #endif
 
 #define EP_FILE_PIPE_LOCAL_INFORMATION_CLASS 24U
+#define EP_FILE_MODE_INFORMATION_CLASS       16U
+#define EP_FILE_SYNCHRONOUS_IO_ALERT          0x00000010UL
+#define EP_FILE_SYNCHRONOUS_IO_NONALERT       0x00000020UL
 #define EP_PIPE_STATE_DISCONNECTED 1U
 #define EP_PIPE_STATE_LISTENING     2U
 #define EP_PIPE_STATE_CONNECTED     3U
@@ -793,6 +796,286 @@ static int ep_socket_select_ready(SOCKET fd, int writable)
         return -1;
     }
     return result > 0 && FD_ISSET(fd, &descriptors);
+}
+
+typedef struct ep_file_mode_information {
+    ULONG mode;
+} ep_file_mode_information_t;
+
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+typedef enum ep_identity_check {
+    EP_IDENTITY_ERROR = -1,
+    EP_IDENTITY_MATCH = 0,
+    EP_IDENTITY_STALE,
+    EP_IDENTITY_CLOSED
+} ep_identity_check_t;
+
+static ep_identity_check_t ep_sock_validate_identity_locked(
+    ep_sock_t *sock, int allow_transition);
+#endif
+
+int ep_socket_udp_afd_qualifier_from_info(
+    const WSAPROTOCOL_INFOW *protocol_info, int protocol_info_length)
+{
+    return ep_socket_protocol_from_info(protocol_info,
+                                        protocol_info_length) ==
+               EP_SOCKET_PROTOCOL_UDP &&
+        protocol_info != NULL &&
+        protocol_info_length >= (int)sizeof(*protocol_info) &&
+        protocol_info->ProtocolChain.ChainLen == BASE_PROTOCOL;
+}
+
+/* Direct AFD receive bypasses Winsock provider-layer semantics.  Restrict it
+ * to exact UDP/IP sockets whose protocol chain contains only the base
+ * provider; layered/custom chains retain the conservative poll mapping. */
+static uint8_t ep_socket_udp_afd_qualifier_eligible(SOCKET fd)
+{
+    WSAPROTOCOL_INFOW protocol_info;
+    int protocol_info_length = (int)sizeof(protocol_info);
+    int saved_errno = ep_last_err();
+    int saved_wsa_error = WSAGetLastError();
+    DWORD saved_last_error = GetLastError();
+    uint8_t eligible = 0;
+
+    memset(&protocol_info, 0, sizeof(protocol_info));
+    if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL_INFOW,
+                   (char *)&protocol_info, &protocol_info_length) == 0 &&
+        ep_socket_udp_afd_qualifier_from_info(
+            &protocol_info, protocol_info_length)) {
+        eligible = 1;
+    }
+    WSASetLastError(saved_wsa_error);
+    SetLastError(saved_last_error);
+    ep_set_errno(saved_errno);
+    return eligible;
+}
+
+/* Determine whether a provider handle supports overlapped I/O.  Registration
+ * caches the initial answer, and each pinned per-probe duplicate is checked
+ * again so native close/reuse cannot transfer that capability to another file
+ * object.  Metadata failure is deliberately classified as unsafe. */
+static uint8_t ep_socket_async_read_capability(SOCKET base_socket)
+{
+    ep_file_mode_information_t info;
+    IO_STATUS_BLOCK io_status_block;
+    NTSTATUS status;
+    int saved_errno = ep_last_err();
+    int saved_wsa_error = WSAGetLastError();
+    DWORD saved_last_error = GetLastError();
+    uint8_t capability = EP_SOCKET_ASYNC_READ_UNKNOWN;
+
+    if (g_ntdll.NtQueryInformationFile == NULL) {
+        goto done;
+    }
+    memset(&info, 0, sizeof(info));
+    memset(&io_status_block, 0, sizeof(io_status_block));
+    status = g_ntdll.NtQueryInformationFile(
+        (HANDLE)(uintptr_t)base_socket, &io_status_block, &info,
+        (ULONG)sizeof(info),
+        EP_FILE_MODE_INFORMATION_CLASS);
+    if (status != STATUS_SUCCESS ||
+        io_status_block.Status != STATUS_SUCCESS ||
+        io_status_block.Information != sizeof(info)) {
+        goto done;
+    }
+    if ((info.mode & (EP_FILE_SYNCHRONOUS_IO_ALERT |
+                      EP_FILE_SYNCHRONOUS_IO_NONALERT)) != 0) {
+        capability = EP_SOCKET_ASYNC_READ_UNSAFE;
+        goto done;
+    }
+    capability = EP_SOCKET_ASYNC_READ_SAFE;
+
+done:
+    WSASetLastError(saved_wsa_error);
+    SetLastError(saved_last_error);
+    ep_set_errno(saved_errno);
+    return capability;
+}
+
+typedef enum ep_udp_read_probe_result {
+    EP_UDP_READ_PROBE_UNAVAILABLE = -1,
+    EP_UDP_READ_PROBE_NOT_READY = 0,
+    EP_UDP_READ_PROBE_READY = 1,
+    EP_UDP_READ_PROBE_ERROR = 2,
+    EP_UDP_READ_PROBE_CLOSED = 3,
+    EP_UDP_READ_PROBE_IDENTITY_ERROR = 4
+} ep_udp_read_probe_result_t;
+
+static int ep_udp_probe_error_is_unavailable(DWORD error)
+{
+    switch (error) {
+    case ERROR_INVALID_FUNCTION:
+    case ERROR_BAD_COMMAND:
+    case ERROR_NOT_SUPPORTED:
+    case ERROR_INVALID_PARAMETER:
+    case ERROR_CALL_NOT_IMPLEMENTED:
+    case WSAEINVAL:
+    case WSAEOPNOTSUPP:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static ep_udp_read_probe_result_t ep_udp_probe_classify_error(DWORD error)
+{
+    if (error == ERROR_OPERATION_ABORTED ||
+        error == ERROR_IO_INCOMPLETE) {
+        return EP_UDP_READ_PROBE_NOT_READY;
+    }
+    /* A datagram may not fit the one-byte buffer.  PEEK keeps it queued, so
+     * truncation is a positive readability observation. */
+    if (error == ERROR_MORE_DATA) {
+        return EP_UDP_READ_PROBE_READY;
+    }
+    if (error == WSAENOTSOCK || error == WSAEBADF ||
+        error == ERROR_INVALID_HANDLE) {
+        return EP_UDP_READ_PROBE_CLOSED;
+    }
+    if (ep_udp_probe_error_is_unavailable(error)) {
+        return EP_UDP_READ_PROBE_UNAVAILABLE;
+    }
+    return EP_UDP_READ_PROBE_ERROR;
+}
+
+/* Qualify AFD's UDP receive indication without consuming a datagram or a
+ * queued transport error.  A one-byte direct IOCTL_AFD_RECV with PEEK is
+ * non-consuming for datagrams; completion with a genuine network error still
+ * represents observable EPOLLERR state.  A pending request is cancelled and
+ * synchronously joined on a private event before this stack-owned OVERLAPPED
+ * is released. */
+static ep_udp_read_probe_result_t ep_udp_probe_read_locked(
+    ep_sock_t *sock, int *identity_error_out)
+{
+    ep_port_t *port = sock->port;
+    HANDLE probe_handle = NULL;
+    char byte;
+    WSABUF buffer;
+    AFD_RECV_INFO receive_info;
+    OVERLAPPED overlapped;
+    DWORD transferred = 0;
+    DWORD wait_result;
+    DWORD error;
+    int saved_errno = ep_last_err();
+    int saved_wsa_error = WSAGetLastError();
+    DWORD saved_last_error = GetLastError();
+    ep_udp_read_probe_result_t probe = EP_UDP_READ_PROBE_UNAVAILABLE;
+
+    if (identity_error_out != NULL) {
+        *identity_error_out = 0;
+    }
+
+    if (sock->socket_protocol != EP_SOCKET_PROTOCOL_UDP ||
+        !sock->udp_afd_qualifier_eligible ||
+        sock->async_read_capability != EP_SOCKET_ASYNC_READ_SAFE ||
+        sock->base_socket == INVALID_SOCKET ||
+        port->udp_probe_event == NULL) {
+        goto done;
+    }
+
+    /* Pin the provider file object from submission through settlement.  The
+     * public SOCKET may be closed and its numeric handle reused concurrently;
+     * every operation in this request therefore uses only this duplicate. */
+    if (!DuplicateHandle(GetCurrentProcess(),
+                         (HANDLE)(uintptr_t)sock->base_socket,
+                         GetCurrentProcess(), &probe_handle,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        error = GetLastError();
+        probe = error == ERROR_INVALID_HANDLE
+            ? EP_UDP_READ_PROBE_CLOSED
+            : EP_UDP_READ_PROBE_UNAVAILABLE;
+        goto done;
+    }
+    if (ep_socket_async_read_capability(
+            (SOCKET)(uintptr_t)probe_handle) != EP_SOCKET_ASYNC_READ_SAFE) {
+        goto done;
+    }
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+    {
+        ep_identity_check_t identity_check =
+            ep_sock_validate_identity_locked(sock, 0);
+
+        if (identity_check == EP_IDENTITY_STALE ||
+            identity_check == EP_IDENTITY_CLOSED) {
+            probe = EP_UDP_READ_PROBE_CLOSED;
+            goto done;
+        }
+        if (identity_check == EP_IDENTITY_ERROR) {
+#ifdef WEPOLL_EX_STRICT_SOCKET_IDENTITY
+            if (identity_error_out != NULL) {
+                int identity_error = ep_last_err();
+
+                *identity_error_out = identity_error != 0
+                    ? identity_error : EIO;
+            }
+            probe = EP_UDP_READ_PROBE_IDENTITY_ERROR;
+#endif
+            goto done;
+        }
+    }
+#endif
+
+    buffer.buf = &byte;
+    buffer.len = 1;
+    receive_info.BufferArray = &buffer;
+    receive_info.BufferCount = 1;
+    receive_info.AfdFlags = AFD_RECV_OVERLAPPED | AFD_RECV_IMMEDIATE;
+    receive_info.TdiFlags = AFD_MSG_NOT_OOB | AFD_MSG_PEEK;
+    memset(&overlapped, 0, sizeof(overlapped));
+    /* The low bit suppresses any completion packet on a completion port the
+     * application may have associated with this provider handle.  Waiting
+     * still uses the untagged private event handle. */
+    overlapped.hEvent = (HANDLE)((uintptr_t)port->udp_probe_event |
+                                 (uintptr_t)1);
+    if (!ResetEvent(port->udp_probe_event)) {
+        goto done;
+    }
+
+    if (DeviceIoControl(probe_handle,
+                        IOCTL_AFD_RECV,
+                        &receive_info, (DWORD)sizeof(receive_info),
+                        NULL, 0, NULL, &overlapped)) {
+        probe = EP_UDP_READ_PROBE_READY;
+        goto done;
+    }
+
+    error = GetLastError();
+    if (error != ERROR_IO_PENDING) {
+        probe = ep_udp_probe_classify_error(error);
+        goto done;
+    }
+
+    wait_result = WaitForSingleObject(port->udp_probe_event, 0);
+    if (wait_result != WAIT_OBJECT_0) {
+        /* ERROR_NOT_FOUND means completion won the cancellation race.  In
+         * every case the raw event, not the provider handle, is the proof
+         * that the kernel no longer owns this stack-backed request. */
+        (void)CancelIoEx(probe_handle, &overlapped);
+        wait_result = WaitForSingleObject(port->udp_probe_event, INFINITE);
+    }
+    if (wait_result != WAIT_OBJECT_0) {
+        /* Port teardown is serialized with this handler, so the event remains
+         * valid and an infinite wait cannot time out.  Never release the
+         * stack-backed request on an invariant violation: querying through a
+         * concurrently closed provider handle would not prove settlement. */
+        assert(!"UDP qualifier event settlement invariant violated");
+        abort();
+    }
+    if (GetOverlappedResult(probe_handle, &overlapped,
+                            &transferred, FALSE)) {
+        probe = EP_UDP_READ_PROBE_READY;
+        goto done;
+    }
+    probe = ep_udp_probe_classify_error(GetLastError());
+
+done:
+    if (probe_handle != NULL) {
+        (void)CloseHandle(probe_handle);
+    }
+    WSASetLastError(saved_wsa_error);
+    SetLastError(saved_last_error);
+    ep_set_errno(saved_errno);
+    return probe;
 }
 
 static int ep_waitable_register_locked(ep_sock_t *sock)
@@ -1955,13 +2238,6 @@ int ep_port_worklists_valid_locked(const ep_port_t *port)
 }
 
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
-typedef enum ep_identity_check {
-    EP_IDENTITY_ERROR = -1,
-    EP_IDENTITY_MATCH = 0,
-    EP_IDENTITY_STALE,
-    EP_IDENTITY_CLOSED
-} ep_identity_check_t;
-
 static int ep_socket_identity_is_stable(SOCKET fd)
 {
     int socket_type = 0;
@@ -2153,6 +2429,14 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd,
 #endif
     } else {
         sock->socket_protocol = ep_socket_get_protocol(fd);
+        if (sock->socket_protocol == EP_SOCKET_PROTOCOL_UDP) {
+            sock->udp_afd_qualifier_eligible =
+                ep_socket_udp_afd_qualifier_eligible(fd);
+            if (sock->udp_afd_qualifier_eligible) {
+                sock->async_read_capability =
+                    ep_socket_async_read_capability(sock->base_socket);
+            }
+        }
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
         identity_result = ep_socket_get_endpoint_id(fd, &sock->endpoint_id);
         if (identity_result < 0) {
@@ -2839,6 +3123,10 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
 
     if (status >= 0 && sock->afd_info != NULL &&
         sock->afd_info->NumberOfHandles > 0) {
+        ULONG afd_events = sock->afd_info->Handles[0].Events;
+        int udp_identity_error = 0;
+        int udp_probe_error = 0;
+
         if ((sock->afd_info->Handles[0].Events & AFD_POLL_LOCAL_CLOSE) != 0) {
             /* The application closed this socket without EPOLL_CTL_DEL.
              * There is no usable registration left to report; retire it now
@@ -2871,10 +3159,42 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
 #endif
         }
 #endif
+        if ((afd_events & AFD_POLL_RECEIVE) != 0 &&
+            sock->afd_info->Handles[0].Status >= 0 &&
+            sock->socket_protocol == EP_SOCKET_PROTOCOL_UDP &&
+            (sock->user_events & (EPOLLIN | EPOLLRDNORM)) != 0) {
+            ep_udp_read_probe_result_t probe =
+                ep_udp_probe_read_locked(sock, &udp_identity_error);
+
+            if (probe == EP_UDP_READ_PROBE_CLOSED) {
+                ep_sock_drop_closed_locked(port, sock);
+                pthread_mutex_unlock(&port->fd_table_lock);
+                return;
+            }
+            if (probe == EP_UDP_READ_PROBE_IDENTITY_ERROR) {
+                atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                      memory_order_relaxed);
+                ep_sock_set_needs_rearm_locked(sock, 1);
+                ep_port_record_async_error_locked(
+                    port, udp_identity_error != 0
+                        ? udp_identity_error : EIO);
+                pthread_mutex_unlock(&port->fd_table_lock);
+                return;
+            }
+            if (probe == EP_UDP_READ_PROBE_NOT_READY ||
+                probe == EP_UDP_READ_PROBE_ERROR) {
+                afd_events &= ~AFD_POLL_RECEIVE;
+            }
+            udp_probe_error = probe == EP_UDP_READ_PROBE_ERROR;
+        }
         delivered = ep_afd_to_epoll_events(
-            sock->afd_info->Handles[0].Events,
+            afd_events,
             sock->afd_info->Handles[0].Status,
             sock->socket_protocol);
+        if (udp_probe_error) {
+            delivered |= EPOLLERR;
+            delivered &= ~EPOLLHUP;
+        }
     } else if (sock->kind == EP_REG_WAITABLE) {
         /* Consumptive waits use the callback/immediate wait itself as the
          * readiness observation.  Persistent objects can be sampled safely;
@@ -3189,6 +3509,18 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     if (ep_afd_open(port->iocp, &port->afd) != 0) {
         goto fail;
     }
+    /* Qualification is optional.  If this private event cannot be allocated,
+     * UDP delivery keeps the conservative AFD-only behavior. */
+    {
+        int saved_errno = ep_last_err();
+        int saved_wsa_error = WSAGetLastError();
+        DWORD saved_last_error = GetLastError();
+
+        port->udp_probe_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+        WSASetLastError(saved_wsa_error);
+        SetLastError(saved_last_error);
+        ep_set_errno(saved_errno);
+    }
 
     port->close_on_exec = (flags & EPOLL_CLOEXEC) != 0;
     atomic_init(&port->waiter_active, 0);
@@ -3211,6 +3543,9 @@ fail:
         int saved_errno = ep_last_err();
         if (port->afd != NULL) {
             CloseHandle(port->afd);
+        }
+        if (port->udp_probe_event != NULL) {
+            CloseHandle(port->udp_probe_event);
         }
         if (port->iocp != NULL) {
             CloseHandle(port->iocp);
@@ -3385,6 +3720,10 @@ static void ep_port_finish_destroy_locked(ep_port_t *port)
         (void)CloseHandle(port->afd);
         port->afd = NULL;
     }
+    if (port->udp_probe_event != NULL) {
+        (void)CloseHandle(port->udp_probe_event);
+        port->udp_probe_event = NULL;
+    }
     ep_port_precise_timeout_destroy(port);
     {
         HANDLE iocp_to_close = ep_port_revoke_iocp_posts(port);
@@ -3411,6 +3750,10 @@ static void ep_port_abandon_locked(ep_port_t *port)
     if (port->afd != NULL) {
         (void)CloseHandle(port->afd);
         port->afd = NULL;
+    }
+    if (port->udp_probe_event != NULL) {
+        (void)CloseHandle(port->udp_probe_event);
+        port->udp_probe_event = NULL;
     }
     ep_port_precise_timeout_destroy(port);
     {

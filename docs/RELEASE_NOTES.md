@@ -179,6 +179,20 @@ paths additionally passed 20 consecutive combined runs. Skips remained
 limited to the host-dependent UDP/ICMP probe and the four synchronized-mode
 native-reuse identity cases.
 
+The later July 30, 2026 UDP receive-error qualification used Linux/WSL GCC
+14.2 and Windows 10.0.19044 with MSYS2 MinGW GCC 15.2 and the same strict
+compiler flags. Linux native and forced-fallback Release CTest passed 4/4
+each, API/pool tests passed five repeats, and ASan/UBSan passed 3/3. The seven
+MinGW best-effort combined, static-only, shared-only, strict combined, strict
+shared-only, synchronized combined, and synchronized shared-only lanes
+contained 154, 152, 88, 154, 88, 154, and 88 CTest entries. Their
+passed/skipped counts were 153/1, 151/1, 87/1, 153/1, 87/1, 149/5, and 83/5.
+Three repeats of every applicable qualification subset passed. The only
+general skip was the host-dependent IPv4 ICMP/reset probe; synchronized mode
+also skipped the four native-reuse identity cases required by its
+DEL-before-close contract. IPv6 reset LT/ET/ONESHOT and application-owned IOCP
+isolation passed in every applicable lane.
+
 Windows socket lifetime is now an explicit CMake policy:
 `WEPOLL_EX_SOCKET_LIFETIME_MODE=best-effort|strict|synchronized`.
 Best-effort remains the default, strict rejects providers without stable WFP
@@ -227,12 +241,11 @@ notification remains owned until it can be replayed with current metadata
 before a new probe. An already-posted canceled packet may remain pending only
 until IOCP dequeue; Windows cannot un-consume a callback that wins immediately
 before MOD-to-zero linearizes. Flags-only ET is accepted for a dormant timer or
-mode-unknown event,
-while nonzero-interest ET remains rejected because the reset mode cannot be
-recovered from an arbitrary HANDLE. Auxiliary callback retirement failures now
-keep storage and pending accounting pinned, surface an asynchronous error, and
-retry through wait/DEL/close rather than permitting a stale cookie or premature
-free.
+mode-unknown event. Nonzero-interest ET remains rejected because the reset mode
+cannot be recovered from an arbitrary HANDLE. Auxiliary callback retirement
+failures now keep storage and pending accounting pinned, surface an asynchronous
+error, and retry through wait/DEL/close rather than permitting a stale cookie or
+premature free.
 
 Auxiliary cancellation no longer manufactures an IOCP cancellation packet
 when blocking disarm proves that no callback or queued packet can reference the
@@ -276,8 +289,20 @@ inert; independently generated `EPOLLERR` and `EPOLLHUP` remain unrequested
 terminal events. Public regressions cover exact ordinary, priority, and inert
 band-event masks plus MOD transitions, urgent LT/ET/ONESHOT behavior,
 `SO_OOBINLINE` LT/ET delivery as ordinary `EPOLLIN`, UDP IPv4/IPv6 readiness,
-and optional connected-UDP ICMP errors without HUP. Missing or ambiguous
-provider protocol metadata retains the conservative abort mapping.
+and connected-UDP ICMP errors without HUP. Confirmed UDP normal-read
+completions on overlapped provider handles are now qualified with a private
+one-byte direct AFD normal-plus-peek request. Only an unlayered base-provider
+chain is eligible; a duplicated provider handle is file-mode checked,
+endpoint-identity checked in hardened lifetime modes, and pinned
+through request settlement. `DeviceIoControl` low-bit event suppression keeps
+qualifier completions out of application-owned IOCPs; datagrams remain queued,
+while a queued `WSAECONNRESET` produces exact `EPOLLERR` without readable aliases
+and repeats under LT until consumed. Missing or ambiguous provider protocol
+metadata retains the conservative abort mapping. Synchronous/non-overlapped UDP sockets,
+layered providers, providers that return a recognized unsupported-operation
+error for the reverse-engineered receive request, registrations without
+normal-read interest, and errors queued behind unread datagrams retain the
+documented receive-qualification caveats.
 `SO_OOBINLINE` does not retain Linux's separate `EPOLLPRI` indication, and
 `EPOLLMSG` is never produced.
 
@@ -434,8 +459,10 @@ may combine with `EPOLLET`, but not with
 `EPOLLONESHOT`, `EPOLLRDHUP`, or unsupported event bits; virtual Windows epoll
 descriptors cannot be nested, socket `EPOLLRDBAND` and `EPOLLWRBAND` interests
 are accepted but inert, `EPOLLMSG` is not emitted, `SO_OOBINLINE` collapses
-priority into ordinary readability, unknown provider protocol metadata retains
-a conservative abort mapping, and pipe writable readiness can remain advisory
+priority into ordinary readability, UDP receive-side errors have the
+synchronous-socket, uninterested-read, and receive-head caveats described
+above, unknown provider protocol metadata retains a conservative abort
+mapping, and pipe writable readiness can remain advisory
 when native local information is unavailable or access is denied. Pure
 write-only outbound named-pipe server handles are the known access-denied case.
 Performance measurements are local loopback observations, not portable
