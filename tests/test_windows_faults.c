@@ -722,6 +722,65 @@ cleanup:
 #endif
 }
 
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+static int run_endpoint_closed_identity_fault(ep_fault_point_t point)
+{
+    struct sockaddr_in address;
+    struct epoll_event event;
+    SOCKET closed_receiver = INVALID_SOCKET;
+    SOCKET receiver = INVALID_SOCKET;
+    int ctl_error;
+    int ctl_result;
+    int epfd = -1;
+    int result = -1;
+
+    ep_fault_reset();
+    if (ep_global_init() != 0 ||
+        make_udp_receiver(&receiver, &address) != 0 ||
+        (epfd = epoll_create1(0)) < 0) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, receiver, &event) != 0 ||
+        ep_fault_configure(point, 1, EIO) != 0) {
+        goto cleanup;
+    }
+    closed_receiver = receiver;
+    if (closesocket(receiver) == SOCKET_ERROR) goto cleanup;
+    receiver = INVALID_SOCKET;
+
+    errno = 0;
+    ctl_result = epoll_ctl(epfd, EPOLL_CTL_MOD, closed_receiver, &event);
+    ctl_error = errno;
+    if (ctl_result != -1 || ctl_error != EBADF ||
+        epoll_fd_count(epfd) != 0 ||
+        ep_fault_hits(point) != 1) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (epfd >= 0 && wepoll_close(epfd) != 0) result = -1;
+    if (receiver != INVALID_SOCKET) closesocket(receiver);
+    return result;
+}
+#endif
+
+static int test_endpoint_closed_after_token_loss(void)
+{
+#ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+    puts("endpoint-closed-token-loss: skipped by synchronized lifetime contract");
+    return 0;
+#else
+    return run_endpoint_closed_identity_fault(
+               EP_FAULT_ENDPOINT_UNAVAILABLE) == 0 &&
+           run_endpoint_closed_identity_fault(
+               EP_FAULT_ENDPOINT_IDENTITY) == 0 ? 0 : -1;
+#endif
+}
+
 static int test_iocp_create(void)
 {
     ep_port_t *first = NULL;
@@ -1586,6 +1645,7 @@ static const fault_test_case_t g_tests[] = {
     { "afd-cancel", test_afd_cancel },
     { "endpoint-identity", test_endpoint_identity },
     { "endpoint-policy", test_endpoint_policy },
+    { "endpoint-closed-token-loss", test_endpoint_closed_after_token_loss },
     { "iocp-create", test_iocp_create },
     { "iocp-post", test_iocp_post },
     { "iocp-dequeue", test_iocp_dequeue },
@@ -1648,7 +1708,8 @@ int main(int argc, char **argv)
     fprintf(stderr,
             "usage: %s [all|framework|pool-init|pool-grow|provider-base|"
             "afd-open|afd-submit|afd-cancel|endpoint-identity|"
-            "endpoint-policy|iocp-create|iocp-post|iocp-dequeue|"
+            "endpoint-policy|endpoint-closed-token-loss|iocp-create|"
+            "iocp-post|iocp-dequeue|"
             "aux-closed-iocp|aux-post|aux-post-immediate|ready-node-alloc|"
             "waitable-ready-node-alloc|waitable-zero-disarm|"
             "aux-waitable-disarm|"

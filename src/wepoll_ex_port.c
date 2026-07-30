@@ -23,6 +23,7 @@
 #define EP_MAX_ACTIVE_QUARANTINES        4U
 #define EP_100NS_PER_MILLISECOND         UINT64_C(10000)
 #define EP_MAX_FINITE_IOCP_WAIT_MS       (INFINITE - 1U)
+#define EP_MAX_SIZE_HINT                  4096U
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #  define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002UL
@@ -683,6 +684,7 @@ static int ep_handle_wait_access(HANDLE handle)
         handle, (ULONG)ObjectBasicInformation, &info, (ULONG)sizeof(info),
         &return_length);
     if (status < 0) {
+        ep_set_errno(ep_winerr_to_errno(ep_ntstatus_to_winerr(status)));
         return 0;
     }
     return (info.GrantedAccess & SYNCHRONIZE) != 0 ? 1 : -2;
@@ -714,6 +716,7 @@ static int ep_handle_waitability(HANDLE handle, DWORD file_type,
             handle, (ULONG)ObjectTypeInformation, storage,
             (ULONG)sizeof(storage), &return_length);
         if (status < 0) {
+            ep_set_errno(ep_winerr_to_errno(ep_ntstatus_to_winerr(status)));
             return 0;
         }
         type_info = (PUBLIC_OBJECT_TYPE_INFORMATION *)storage;
@@ -871,6 +874,185 @@ static int ep_pipe_query_access(HANDLE handle, uint8_t *access_out)
     }
     *access_out = access;
     return 0;
+}
+
+typedef enum ep_target_kind {
+    EP_TARGET_INVALID = 0,
+    EP_TARGET_SOCKET,
+    EP_TARGET_PIPE,
+    EP_TARGET_WAITABLE,
+    EP_TARGET_UNSUPPORTED
+} ep_target_kind_t;
+
+typedef struct ep_target_info {
+    ep_target_kind_t kind;
+    SOCKET base_socket;
+    uint8_t pipe_access;
+    uint8_t waitable_semantics;
+    int registration_error;
+} ep_target_info_t;
+
+/* Classify one public target without consuming waitable state.  Winsock is
+ * probed first because socket handles are also kernel file handles.  A failed
+ * provider-base lookup is separated from socket validity with SO_TYPE: this
+ * lets MOD/DEL report ENOENT for an otherwise valid unregistered socket while
+ * ADD still preserves the provider error needed to create an AFD poll.
+ *
+ * Non-socket HANDLEs are duplicated for the duration of the multi-step query.
+ * The duplicate pins one object while GetFileType/NtQueryObject inspect it, so
+ * a concurrent CloseHandle cannot make those probes classify different reused
+ * numeric handles.  The duplicate is never waited on and is closed before
+ * return; registered HANDLE lifetime remains governed by the documented
+ * DEL-before-CloseHandle contract. */
+static int ep_target_probe(SOCKET fd, ep_target_info_t *target)
+{
+    HANDLE duplicate = NULL;
+    int base_error;
+    int option_length;
+    int socket_type;
+    int socket_error;
+    DWORD file_type;
+    int waitability;
+    uint8_t waitable_semantics = EP_WAITABLE_ET_UNSUPPORTED;
+
+    memset(target, 0, sizeof(*target));
+    target->kind = EP_TARGET_INVALID;
+    target->base_socket = INVALID_SOCKET;
+
+    if (fd == INVALID_SOCKET) {
+        return 0;
+    }
+
+    target->base_socket = ep_socket_get_base(fd);
+    if (target->base_socket != INVALID_SOCKET) {
+        target->kind = EP_TARGET_SOCKET;
+        return 0;
+    }
+    base_error = ep_last_err();
+    if (base_error == 0) {
+        base_error = EIO;
+    }
+
+    socket_type = 0;
+    option_length = (int)sizeof(socket_type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, (char *)&socket_type,
+                   &option_length) == 0) {
+        target->kind = EP_TARGET_SOCKET;
+        target->registration_error = base_error;
+        return 0;
+    }
+    socket_error = ep_winerr_to_errno((DWORD)WSAGetLastError());
+    if (socket_error != ENOTSOCK && socket_error != EBADF) {
+        ep_set_errno(socket_error != 0 ? socket_error : EIO);
+        return -1;
+    }
+
+    if (!DuplicateHandle(GetCurrentProcess(), (HANDLE)fd,
+                         GetCurrentProcess(), &duplicate,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        int error = ep_winerr_to_errno(GetLastError());
+
+        if (error == EBADF) {
+            target->kind = EP_TARGET_INVALID;
+            return 0;
+        }
+        ep_set_errno(error != 0 ? error : EIO);
+        return -1;
+    }
+
+    file_type = GetFileType(duplicate);
+    waitability = file_type == FILE_TYPE_PIPE ||
+        file_type == FILE_TYPE_DISK ? 0 :
+        ep_handle_waitability(duplicate, file_type, &waitable_semantics);
+
+    if (file_type == FILE_TYPE_PIPE) {
+        target->kind = EP_TARGET_PIPE;
+        if (ep_pipe_query_access(duplicate, &target->pipe_access) != 0) {
+            target->registration_error = ep_last_err();
+        }
+    } else if (file_type == FILE_TYPE_DISK) {
+        target->kind = EP_TARGET_UNSUPPORTED;
+    } else if (waitability == -2) {
+        target->kind = EP_TARGET_WAITABLE;
+        target->waitable_semantics = waitable_semantics;
+        target->registration_error = EACCES;
+    } else if (waitability > 0) {
+        target->kind = EP_TARGET_WAITABLE;
+        target->waitable_semantics = waitable_semantics;
+    } else if (waitability < 0) {
+        target->kind = EP_TARGET_UNSUPPORTED;
+    } else {
+        int error = ep_last_err();
+
+        (void)CloseHandle(duplicate);
+        ep_set_errno(error != 0 ? error : EIO);
+        return -1;
+    }
+
+    (void)CloseHandle(duplicate);
+    return 0;
+}
+
+int ep_port_validate_target(ep_port_t *port, SOCKET fd,
+                            ep_target_validation_mode_t mode)
+{
+    ep_target_info_t target;
+
+    if (port == NULL ||
+        atomic_load_explicit(&port->closing, memory_order_acquire)) {
+        ep_set_errno(EBADF);
+        return -1;
+    }
+    if (mode != EP_TARGET_VALIDATE_CONTROL &&
+        mode != EP_TARGET_VALIDATE_ADD) {
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+    if (ep_target_probe(fd, &target) != 0) {
+        return -1;
+    }
+    if (target.kind == EP_TARGET_INVALID) {
+        ep_set_errno(EBADF);
+        return -1;
+    }
+    if (target.kind == EP_TARGET_UNSUPPORTED) {
+        ep_set_errno(EPERM);
+        return -1;
+    }
+    if (mode == EP_TARGET_VALIDATE_ADD &&
+        target.registration_error != 0) {
+        ep_set_errno(target.registration_error);
+        return -1;
+    }
+    return 0;
+}
+
+static int ep_target_fail_absent(SOCKET fd)
+{
+    ep_target_info_t target;
+    int error;
+
+    if (ep_target_probe(fd, &target) != 0) {
+        return -1;
+    }
+    switch (target.kind) {
+    case EP_TARGET_INVALID:
+        error = EBADF;
+        break;
+    case EP_TARGET_UNSUPPORTED:
+        error = EPERM;
+        break;
+    case EP_TARGET_SOCKET:
+    case EP_TARGET_PIPE:
+    case EP_TARGET_WAITABLE:
+        error = ENOENT;
+        break;
+    default:
+        error = EIO;
+        break;
+    }
+    ep_set_errno(error);
+    return -1;
 }
 
 typedef struct ep_pipe_local_information {
@@ -1816,21 +1998,63 @@ static ep_identity_check_t ep_sock_validate_identity_locked(
     uint64_t endpoint_id;
     int identity_result;
 
-    if (sock->endpoint_id_state == EP_SOCKET_ID_UNAVAILABLE) {
+    if (sock->kind != EP_REG_SOCKET) {
         return EP_IDENTITY_MATCH;
+    }
+    if (sock->endpoint_id_state == EP_SOCKET_ID_UNAVAILABLE) {
+        int socket_type = 0;
+        int option_length = (int)sizeof(socket_type);
+
+        /* Providers without an endpoint token retain best-effort numeric
+         * identity semantics, but a cheap SO_TYPE probe can still distinguish
+         * a live socket from an actually closed handle.  It deliberately
+         * cannot identify same-numeric reuse by another live socket. */
+        if (getsockopt(sock->fd, SOL_SOCKET, SO_TYPE, (char *)&socket_type,
+                       &option_length) == 0) {
+            return EP_IDENTITY_MATCH;
+        }
+        {
+            int error = ep_winerr_to_errno((DWORD)WSAGetLastError());
+
+            if (error == ENOTSOCK || error == EBADF) {
+                return EP_IDENTITY_CLOSED;
+            }
+            sock->port->identity_failures++;
+            ep_set_errno(error != 0 ? error : EIO);
+            return EP_IDENTITY_ERROR;
+        }
     }
 
     identity_result = ep_socket_get_endpoint_id(sock->fd, &endpoint_id);
     if (identity_result == 0) {
+        int socket_type = 0;
+        int option_length = (int)sizeof(socket_type);
+
         /* A provider that never exposed an ALE token remains supported with
          * legacy numeric-handle semantics.  Losing a token that was already
-         * observed is not a safe identity match. */
+         * observed is not a safe identity match.  Some providers report the
+         * same unsupported-query result after closesocket(), so probe SO_TYPE
+         * before treating the missing token as a hard identity failure. */
+        if (getsockopt(sock->fd, SOL_SOCKET, SO_TYPE, (char *)&socket_type,
+                       &option_length) == SOCKET_ERROR) {
+            int error = ep_winerr_to_errno((DWORD)WSAGetLastError());
+
+            if (error == ENOTSOCK || error == EBADF) {
+                return EP_IDENTITY_CLOSED;
+            }
+            sock->port->identity_failures++;
+            ep_set_errno(error != 0 ? error : EIO);
+            return EP_IDENTITY_ERROR;
+        }
         ep_set_errno(EIO);
         sock->port->identity_failures++;
         return EP_IDENTITY_ERROR;
     }
     if (identity_result < 0) {
         int error = ep_last_err();
+        int socket_type = 0;
+        int option_length = (int)sizeof(socket_type);
+
         if (error == 0) {
             error = EIO;
             ep_set_errno(error);
@@ -1838,7 +2062,19 @@ static ep_identity_check_t ep_sock_validate_identity_locked(
         if (error == ENOTSOCK || error == EBADF) {
             return EP_IDENTITY_CLOSED;
         }
+        /* A provider-specific identity error can still be the result of a
+         * native close. Preserve the original error for a live socket, but
+         * let the control path classify a definitely closed/reused value. */
+        if (getsockopt(sock->fd, SOL_SOCKET, SO_TYPE, (char *)&socket_type,
+                       &option_length) == SOCKET_ERROR) {
+            int live_error = ep_winerr_to_errno((DWORD)WSAGetLastError());
+
+            if (live_error == ENOTSOCK || live_error == EBADF) {
+                return EP_IDENTITY_CLOSED;
+            }
+        }
         sock->port->identity_failures++;
+        ep_set_errno(error);
         return EP_IDENTITY_ERROR;
     }
 
@@ -1867,13 +2103,28 @@ static ep_identity_check_t ep_sock_validate_identity_locked(
 }
 #endif
 
-static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
+static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd,
+                                       const ep_target_info_t *target)
 {
-    ep_sock_t *sock = (ep_sock_t *)calloc(1, sizeof(*sock));
+    ep_sock_t *sock;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     int identity_result;
 #endif
-    int base_error = 0;
+
+    if (target->kind == EP_TARGET_INVALID) {
+        ep_set_errno(EBADF);
+        return NULL;
+    }
+    if (target->kind == EP_TARGET_UNSUPPORTED) {
+        ep_set_errno(EPERM);
+        return NULL;
+    }
+    if (target->registration_error != 0) {
+        ep_set_errno(target->registration_error);
+        return NULL;
+    }
+
+    sock = (ep_sock_t *)calloc(1, sizeof(*sock));
     if (sock == NULL) {
         ep_set_errno(ENOMEM);
         return NULL;
@@ -1882,61 +2133,25 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd)
     sock->kind = EP_REG_SOCKET;
     sock->wait_registration = NULL;
     sock->exclusive_claim_base = INVALID_SOCKET;
-    sock->base_socket = ep_socket_get_base(fd);
-    if (sock->base_socket == INVALID_SOCKET) {
-        DWORD file_type;
-        int waitability;
-        int handle_candidate;
-        uint8_t waitable_semantics = EP_WAITABLE_ET_UNSUPPORTED;
-
-        base_error = ep_last_err();
-        file_type = GetFileType((HANDLE)fd);
-        handle_candidate = base_error == ENOTSOCK || base_error == EBADF ||
-            base_error == 0;
-        waitability = file_type == FILE_TYPE_PIPE ||
-            file_type == FILE_TYPE_DISK ? 0 :
-            ep_handle_waitability((HANDLE)fd, file_type,
-                                  &waitable_semantics);
-        if (handle_candidate && file_type == FILE_TYPE_PIPE) {
-            if (ep_pipe_query_access((HANDLE)fd, &sock->pipe_access) != 0) {
-                free(sock);
-                return NULL;
-            }
-            sock->kind = EP_REG_PIPE;
-            sock->base_socket = fd;
-            sock->afd_info = NULL;
+    sock->base_socket = target->base_socket;
+    if (target->kind == EP_TARGET_PIPE) {
+        sock->kind = EP_REG_PIPE;
+        sock->pipe_access = target->pipe_access;
+        sock->base_socket = fd;
+        sock->afd_info = NULL;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
-            sock->endpoint_id = 0;
-            sock->endpoint_id_state = EP_SOCKET_ID_UNAVAILABLE;
+        sock->endpoint_id = 0;
+        sock->endpoint_id_state = EP_SOCKET_ID_UNAVAILABLE;
 #endif
-        } else if (file_type == FILE_TYPE_DISK) {
-            free(sock);
-            ep_set_errno(EPERM);
-            return NULL;
-        } else if (handle_candidate && waitability == -2) {
-            free(sock);
-            ep_set_errno(EACCES);
-            return NULL;
-        } else if (handle_candidate && waitability > 0) {
-            sock->kind = EP_REG_WAITABLE;
-            sock->waitable_semantics = waitable_semantics;
-            sock->base_socket = fd;
-            sock->afd_info = NULL;
+    } else if (target->kind == EP_TARGET_WAITABLE) {
+        sock->kind = EP_REG_WAITABLE;
+        sock->waitable_semantics = target->waitable_semantics;
+        sock->base_socket = fd;
+        sock->afd_info = NULL;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
-            sock->endpoint_id = 0;
-            sock->endpoint_id_state = EP_SOCKET_ID_UNAVAILABLE;
+        sock->endpoint_id = 0;
+        sock->endpoint_id_state = EP_SOCKET_ID_UNAVAILABLE;
 #endif
-        } else {
-            free(sock);
-            if (handle_candidate && waitability < 0) {
-                ep_set_errno(EPERM);
-            } else if (base_error != 0) {
-                ep_set_errno(base_error);
-            } else {
-                ep_set_errno(ENOTSOCK);
-            }
-            return NULL;
-        }
     } else {
         sock->socket_protocol = ep_socket_get_protocol(fd);
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
@@ -2419,11 +2634,28 @@ static int ep_sock_validate_control_locked(ep_port_t *port, ep_sock_t *sock)
         return -1;
     }
 
-    {
-        int error = identity_check == EP_IDENTITY_STALE
-            ? ENOENT : ENOTSOCK;
+    if (identity_check == EP_IDENTITY_STALE) {
         ep_sock_retire_stale_locked(port, sock);
-        ep_set_errno(error);
+        ep_set_errno(ENOENT);
+        return 1;
+    }
+
+    {
+        ep_target_info_t target;
+        int probe_result = ep_target_probe(sock->fd, &target);
+        int error = probe_result == 0
+            ? (target.kind == EP_TARGET_INVALID ? EBADF :
+               target.kind == EP_TARGET_UNSUPPORTED ? EPERM : ENOENT)
+            : ep_last_err();
+
+        /* The registered socket no longer exists.  If the numeric value now
+         * names another valid supported target, it is unregistered and must
+         * report ENOENT; if it names nothing, report EBADF. */
+        ep_sock_retire_stale_locked(port, sock);
+        ep_set_errno(error != 0 ? error : EIO);
+        if (probe_result != 0) {
+            return -1;
+        }
     }
     return 1;
 #endif
@@ -2875,24 +3107,27 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     ready_initialized = 1;
 
     if (size_hint > 0) {
-        size_t hint = (size_t)size_hint;
-        if (hint > SIZE_MAX / 2) {
+        size_t capacity_hint = (size_t)size_hint;
+        size_t table_hint;
+
+        if (capacity_hint > EP_MAX_SIZE_HINT) {
+            capacity_hint = EP_MAX_SIZE_HINT;
+        }
+        table_hint = capacity_hint;
+        if (table_hint > SIZE_MAX / 2) {
             ep_set_errno(ENOMEM);
             goto fail;
         }
-        hint *= 2;
-        if (hint < WEPOLL_INITIAL_FDS) {
-            hint = WEPOLL_INITIAL_FDS;
+        table_hint *= 2;
+        if (table_hint < WEPOLL_INITIAL_FDS) {
+            table_hint = WEPOLL_INITIAL_FDS;
         }
-        if (ep_fd_table_grow(port, hint) != 0) {
+        if (ep_fd_table_grow(port, table_hint) != 0) {
             goto fail;
         }
 
-        if ((size_t)size_hint > pool_capacity) {
-            pool_capacity = (size_t)size_hint;
-            if (pool_capacity > 4096) {
-                pool_capacity = 4096;
-            }
+        if (capacity_hint > pool_capacity) {
+            pool_capacity = capacity_hint;
         }
     }
 
@@ -3390,6 +3625,7 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
 {
     ep_sock_t *existing;
     ep_sock_t *sock;
+    ep_target_info_t target;
 
     if (fd == INVALID_SOCKET) {
         ep_set_errno(EBADF);
@@ -3419,7 +3655,11 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
          * the new registration while the old cancellation completion drains. */
     }
 
-    sock = ep_sock_alloc_locked(port, fd);
+    if (ep_target_probe(fd, &target) != 0) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return -1;
+    }
+    sock = ep_sock_alloc_locked(port, fd, &target);
     if (sock == NULL) {
         pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
@@ -3527,9 +3767,10 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     pthread_mutex_lock(&port->fd_table_lock);
     ep_sock_t *sock = ep_fd_table_lookup(port, fd);
     if (sock == NULL) {
+        int result = ep_target_fail_absent(fd);
+
         pthread_mutex_unlock(&port->fd_table_lock);
-        ep_set_errno(ENOENT);
-        return -1;
+        return result;
     }
     if (ep_sock_validate_control_locked(port, sock) != 0) {
         pthread_mutex_unlock(&port->fd_table_lock);
@@ -3746,9 +3987,10 @@ int ep_port_unregister(ep_port_t *port, SOCKET fd)
     pthread_mutex_lock(&port->fd_table_lock);
     ep_sock_t *sock = ep_fd_table_lookup(port, fd);
     if (sock == NULL) {
+        int result = ep_target_fail_absent(fd);
+
         pthread_mutex_unlock(&port->fd_table_lock);
-        ep_set_errno(ENOENT);
-        return -1;
+        return result;
     }
     if (ep_sock_validate_control_locked(port, sock) != 0) {
         pthread_mutex_unlock(&port->fd_table_lock);
@@ -3805,9 +4047,10 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     pthread_mutex_lock(&port->fd_table_lock);
     ep_sock_t *sock = ep_fd_table_lookup(port, fd);
     if (sock == NULL) {
+        int result = ep_target_fail_absent(fd);
+
         pthread_mutex_unlock(&port->fd_table_lock);
-        ep_set_errno(ENOENT);
-        return -1;
+        return result;
     }
     if (ep_sock_validate_control_locked(port, sock) != 0) {
         pthread_mutex_unlock(&port->fd_table_lock);

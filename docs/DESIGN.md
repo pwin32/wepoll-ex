@@ -43,8 +43,21 @@ the nginx-embedded source build independent of a generated CMake header.
 ## Windows data flow and lifetime
 
 1. `epoll_create*` creates an `ep_port_t`, IOCP, AFD poll state, pools, and a
-   virtual integer `epfd` table entry.
-2. `EPOLL_CTL_ADD` validates a Winsock socket, resolves its base provider
+   virtual integer `epfd` table entry. Standard `epoll_create(size)` requires a
+   positive size but ignores its value. The extension `epoll_create_ex()` uses
+   a positive size only as an initial fd-table and pool-capacity hint whose
+   value is capped at 4096; it is not a registration limit. The POSIX extension
+   accepts and ignores the same hint.
+2. Windows control calls classify a target non-destructively before applying
+   the operation. An invalid or closed target returns `EBADF`; a valid socket,
+   pipe, or waitable that is absent from the port returns `ENOENT` for MOD,
+   DEL, or `epoll_rearm()`; and a valid unsupported object returns `EPERM`.
+   ADD additionally surfaces registration-specific access and provider errors,
+   including `EACCES` for a waitable without `SYNCHRONIZE`. For every numeric
+   operation other than `EPOLL_CTL_DEL`, the event value is copied once at API
+   entry and a null pointer returns `EFAULT` before epfd, target, or operation
+   validation. DEL does not inspect its event pointer.
+3. `EPOLL_CTL_ADD` validates a Winsock socket, resolves its base provider
    handle, records an optional WFP ALE endpoint token for stable native-handle
    reuse detection, stores the requested data and context, and assigns a
    generation. Stable registrations defer the first asynchronous `AFD_POLL`
@@ -59,11 +72,11 @@ the nginx-embedded source build independent of a generated CMake header.
    reports the error synchronously. Best-effort mode accepts a provider that
    cannot expose an endpoint token, strict mode rejects it with
    `EOPNOTSUPP`, and synchronized mode omits token queries entirely.
-3. Socket IOCP completions translate both the AFD per-handle `Events` bits and
+4. Socket IOCP completions translate both the AFD per-handle `Events` bits and
    its `Status`; a negative per-handle status contributes `EPOLLERR` even when
    the event bitset is empty. Ready nodes snapshot the data, context, socket
    number, and generation; they never retain a raw socket pointer.
-4. `epoll_wait*` serializes consumers because the ready queue is
+5. `epoll_wait*` serializes consumers because the ready queue is
    single-consumer, drains ready snapshots, waits for more IOCP packets, and
    skips stale generations. Lock acquisition is included in finite timeouts,
    and an early `WAIT_TIMEOUT` is retried against the absolute deadline. A
@@ -350,8 +363,17 @@ metadata reference before unwinding.
   rounded 100-nanosecond timer units when high-resolution timers are available,
   with an upward-rounded millisecond IOCP backstop and transparent coarse
   fallback. This improves requested deadline resolution but does not guarantee
-  an equivalent scheduler wake latency. Windows virtual epoll descriptors also
-  cannot be nested as monitored objects inside another epoll instance.
+  an equivalent scheduler wake latency.
+- Windows control entry points recognize a null event pointer without
+  dereferencing it, but cannot safely validate every arbitrary unreadable
+  non-null userspace pointer. Callers must supply valid event storage; an
+  invalid pointer may fault the process instead of returning `EFAULT` as a
+  kernel syscall would.
+- Windows virtual epoll descriptors cannot themselves be monitored or nested.
+  Because an `epfd` is a process-local integer rather than a kernel HANDLE,
+  self-registration and nested-epoll attempts cannot always reproduce Linux's
+  distinct `EINVAL` result and may instead classify as an invalid or unrelated
+  native target.
 - `SO_OOBINLINE` exposes urgent bytes as ordinary readable data without a
   separate `EPOLLPRI` bit on Windows.
 - `EPOLLWAKEUP` is accepted and ignored on Windows.

@@ -139,6 +139,33 @@ GCC 15.2 on Windows 10.0.19044 passed 107/108 with only the documented
 UDP/ICMP environment skip; both used `-Werror` and passed package/export
 contract checks.
 
+Core creation and control validation now more closely follows Linux.
+`epoll_create()` requires a positive legacy size but ignores its value;
+`epoll_create_ex()` uses a positive Windows capacity hint capped at 4096 and
+ignores the hint on POSIX. For every operation other than numeric
+`EPOLL_CTL_DEL`, the event is snapshotted once at entry and a null pointer
+returns `EFAULT` before epfd, target, and operation validation, while DEL
+ignores its event pointer. Windows control calls distinguish an invalid or
+closed target (`EBADF`), a valid supported but
+unregistered target (`ENOENT` for MOD, DEL, and `epoll_rearm()`), and a valid
+unsupported object (`EPERM`). ADD separately preserves access and provider
+eligibility errors such as `EACCES`. Arbitrary unreadable non-null pointers
+remain a userspace limitation and may fault instead of returning `EFAULT`.
+Virtual Windows epoll descriptors still cannot be monitored or nested, so the
+Linux self/nested-epoll `EINVAL` distinction is not always representable.
+
+Fresh qualification for this control-validation slice passed on Linux
+4.4.0-19041-Microsoft with GCC 14.2: strict release CTest 4/4, the forced
+`epoll_pwait2` fallback 4/4, five repeated API/pool runs, and ASan/UBSan 3/3
+using the qualification script's `-Werror` flag sets. MinGW GCC 15.2 on
+Windows 10.0.19044 passed all seven Release lanes with
+`-O2 -Wall -Wextra -Wpedantic -Werror`: combined best-effort, strict, and
+synchronized builds each completed 150/150; static-only best-effort completed
+148/148; and best-effort, strict, and synchronized shared-only builds each
+completed 84/84. The focused correctness subsets also passed three repeats in
+every lane. Skips were limited to the documented environment-dependent
+UDP/ICMP case and synchronized-mode native-reuse identity cases.
+
 Windows socket lifetime is now an explicit CMake policy:
 `WEPOLL_EX_SOCKET_LIFETIME_MODE=best-effort|strict|synchronized`.
 Best-effort remains the default, strict rejects providers without stable WFP

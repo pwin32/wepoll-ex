@@ -145,6 +145,16 @@ static void test_create_close(void)
         FAIL("double close should be EBADF");
         return;
     }
+    epfd = epoll_create(INT_MAX);
+    if (epfd < 0 || wepoll_close(epfd) != 0) {
+        FAIL("epoll_create should ignore a large positive size");
+        return;
+    }
+    epfd = epoll_create_ex(INT_MAX, 0);
+    if (epfd < 0 || wepoll_close(epfd) != 0) {
+        FAIL("epoll_create_ex should cap a large capacity hint");
+        return;
+    }
     PASS();
 }
 
@@ -259,9 +269,37 @@ static void test_invalid_args(void)
         return;
     }
     errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, (epoll_fd_t)1,
+                  NULL) != -1 || errno != EFAULT) {
+        FAIL("NULL MOD event");
+        wepoll_close(epfd);
+        return;
+    }
+    errno = 0;
+    if (epoll_ctl(-1, EPOLL_CTL_ADD, (epoll_fd_t)1,
+                  NULL) != -1 || errno != EFAULT) {
+        FAIL("NULL event precedence over bad epfd");
+        wepoll_close(epfd);
+        return;
+    }
+    errno = 0;
+    if (epoll_ctl(-1, EPOLL_CTL_ADD, EPOLL_FD_INVALID,
+                  NULL) != -1 || errno != EFAULT) {
+        FAIL("NULL event precedence over invalid descriptors");
+        wepoll_close(epfd);
+        return;
+    }
+    errno = 0;
     if (epoll_ctl(epfd, 99, (epoll_fd_t)1,
-                  &event) != -1 || errno != EINVAL) {
-        FAIL("invalid ctl operation");
+                  NULL) != -1 || errno != EFAULT) {
+        FAIL("NULL event precedence over invalid ctl operation");
+        wepoll_close(epfd);
+        return;
+    }
+    errno = 0;
+    if (epoll_ctl(epfd, 99, EPOLL_FD_INVALID,
+                  &event) != -1 || errno != EBADF) {
+        FAIL("invalid target precedence over ctl operation");
         wepoll_close(epfd);
         return;
     }
@@ -283,6 +321,161 @@ static void test_invalid_args(void)
         return;
     }
     wepoll_close(epfd);
+    PASS();
+}
+
+static int ctl_errno_is(int epfd, int op, epoll_fd_t fd,
+                        struct epoll_event *event, int expected)
+{
+    errno = 0;
+    return epoll_ctl(epfd, op, fd, event) == -1 && errno == expected;
+}
+
+static int rearm_errno_is(int epfd, epoll_fd_t fd, int expected)
+{
+    errno = 0;
+    return epoll_rearm(epfd, fd) == -1 && errno == expected;
+}
+
+static void test_ctl_target_errors(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    HANDLE event_handle = NULL;
+    HANDLE mutex_handle = NULL;
+    HANDLE null_handle = INVALID_HANDLE_VALUE;
+    HANDLE pipe_read = NULL;
+    HANDLE pipe_write = NULL;
+    SOCKET closed_socket = INVALID_SOCKET;
+    SOCKET unregistered_socket = INVALID_SOCKET;
+    int epfd = -1;
+    int ok = 0;
+
+    TEST("epoll_ctl distinguishes invalid, unsupported, and unregistered targets");
+    tcp_pair_init(&pair);
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+
+    epfd = epoll_create1(0);
+    unregistered_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    event_handle = CreateEventW(NULL, FALSE, TRUE, NULL);
+    mutex_handle = CreateMutexW(NULL, FALSE, NULL);
+    null_handle = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              NULL, OPEN_EXISTING, 0, NULL);
+    if (epfd < 0 || unregistered_socket == INVALID_SOCKET ||
+        event_handle == NULL || mutex_handle == NULL ||
+        null_handle == INVALID_HANDLE_VALUE ||
+        !CreatePipe(&pipe_read, &pipe_write, NULL, 0)) {
+        goto cleanup;
+    }
+
+    if (!ctl_errno_is(epfd, EPOLL_CTL_MOD, unregistered_socket,
+                      &event, ENOENT) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_DEL, unregistered_socket,
+                      (struct epoll_event *)(uintptr_t)1, ENOENT) ||
+        !ctl_errno_is(epfd, 99, unregistered_socket, &event, EINVAL) ||
+        !rearm_errno_is(epfd, unregistered_socket, ENOENT) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_MOD, (epoll_fd_t)event_handle,
+                      &event, ENOENT) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_DEL, (epoll_fd_t)event_handle,
+                      NULL, ENOENT) ||
+        !ctl_errno_is(epfd, 99, (epoll_fd_t)event_handle,
+                      &event, EINVAL) ||
+        !rearm_errno_is(epfd, (epoll_fd_t)event_handle, ENOENT) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_MOD, (epoll_fd_t)pipe_read,
+                      &event, ENOENT) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_DEL, (epoll_fd_t)pipe_read,
+                      NULL, ENOENT)) {
+        goto cleanup;
+    }
+    if (WaitForSingleObject(event_handle, 0) != WAIT_OBJECT_0 ||
+        WaitForSingleObject(event_handle, 0) != WAIT_TIMEOUT) {
+        goto cleanup;
+    }
+    event.events = EPOLLIN | EPOLLEXCLUSIVE;
+    if (!ctl_errno_is(epfd, EPOLL_CTL_MOD, unregistered_socket,
+                      &event, EINVAL)) {
+        goto cleanup;
+    }
+
+    event.events = EPOLLIN;
+    if (!ctl_errno_is(epfd, EPOLL_CTL_ADD, (epoll_fd_t)mutex_handle,
+                      &event, EPERM) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_MOD, (epoll_fd_t)mutex_handle,
+                      &event, EPERM) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_DEL, (epoll_fd_t)mutex_handle,
+                      NULL, EPERM) ||
+        !ctl_errno_is(epfd, 99, (epoll_fd_t)mutex_handle,
+                      &event, EPERM) ||
+        !rearm_errno_is(epfd, (epoll_fd_t)mutex_handle, EPERM) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_ADD, (epoll_fd_t)null_handle,
+                      &event, EPERM) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_MOD, (epoll_fd_t)null_handle,
+                      &event, EPERM) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_DEL, (epoll_fd_t)null_handle,
+                      NULL, EPERM)) {
+        goto cleanup;
+    }
+    event.events = EPOLLIN | EPOLLONESHOT | EPOLLEXCLUSIVE;
+    if (!ctl_errno_is(epfd, EPOLL_CTL_ADD, (epoll_fd_t)mutex_handle,
+                      &event, EPERM)) {
+        goto cleanup;
+    }
+
+    event.events = EPOLLIN;
+    closed_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (closed_socket == INVALID_SOCKET ||
+        closesocket(closed_socket) == SOCKET_ERROR ||
+        !ctl_errno_is(epfd, EPOLL_CTL_ADD, closed_socket, &event, EBADF) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_MOD, closed_socket, &event, EBADF) ||
+        !ctl_errno_is(epfd, EPOLL_CTL_DEL, closed_socket, NULL, EBADF) ||
+        !ctl_errno_is(epfd, 99, closed_socket, &event, EBADF) ||
+        !rearm_errno_is(epfd, closed_socket, EBADF)) {
+        goto cleanup;
+    }
+    event.events = EPOLLIN | EPOLLONESHOT | EPOLLEXCLUSIVE;
+    if (!ctl_errno_is(epfd, EPOLL_CTL_ADD, closed_socket,
+                      &event, EBADF)) {
+        goto cleanup;
+    }
+    closed_socket = INVALID_SOCKET;
+
+    event.events = EPOLLIN;
+    if (wepoll_ex_get_socket_lifetime_policy() !=
+            WEPOLL_EX_SOCKET_LIFETIME_SYNCHRONIZED) {
+        if (make_tcp_pair(&pair) != 0 ||
+            epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0) {
+            goto cleanup;
+        }
+        closed_socket = pair.server;
+        pair.server = INVALID_SOCKET;
+        if (closesocket(closed_socket) == SOCKET_ERROR ||
+            !ctl_errno_is(epfd, EPOLL_CTL_MOD, closed_socket,
+                          &event, EBADF) ||
+            epoll_fd_count(epfd) != 0) {
+            goto cleanup;
+        }
+        closed_socket = INVALID_SOCKET;
+    }
+
+    ok = 1;
+
+cleanup:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (unregistered_socket != INVALID_SOCKET)
+        closesocket(unregistered_socket);
+    if (closed_socket != INVALID_SOCKET) closesocket(closed_socket);
+    if (event_handle != NULL) CloseHandle(event_handle);
+    if (mutex_handle != NULL) CloseHandle(mutex_handle);
+    if (null_handle != INVALID_HANDLE_VALUE) CloseHandle(null_handle);
+    if (pipe_read != NULL) CloseHandle(pipe_read);
+    if (pipe_write != NULL) CloseHandle(pipe_write);
+    tcp_pair_close(&pair);
+    if (!ok) {
+        FAIL("target errno parity");
+        return;
+    }
     PASS();
 }
 
@@ -822,6 +1015,15 @@ static void test_unsupported_event_modes(void)
         tcp_pair_close(&pair);
         return;
     }
+    event.events = EPOLLIN | EPOLLONESHOT | EPOLLEXCLUSIVE;
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != -1 ||
+        errno != EINVAL) {
+        FAIL("invalid EPOLLEXCLUSIVE mask should beat EEXIST");
+        wepoll_close(epfd);
+        tcp_pair_close(&pair);
+        return;
+    }
     /* Linux rejects every MOD of a registration added exclusive, even when
      * the MOD event mask does not repeat EPOLLEXCLUSIVE. */
     event.events = EPOLLIN;
@@ -957,6 +1159,7 @@ static void test_batch_safety(void)
     epoll_fd_t fds[2];
     int duplicate_ops[2] = { EPOLL_CTL_ADD, EPOLL_CTL_ADD };
     int add_ops[2] = { EPOLL_CTL_ADD, EPOLL_CTL_ADD };
+    int add_mod_ops[2] = { EPOLL_CTL_ADD, EPOLL_CTL_MOD };
     int del_ops[2] = { EPOLL_CTL_DEL, EPOLL_CTL_DEL };
     int epfd;
 
@@ -990,6 +1193,15 @@ static void test_batch_safety(void)
     /* Rollback removes the public registration immediately even though its
      * cancelled AFD completion may still be queued internally. */
     fds[1] = second.server;
+    errno = 0;
+    if (epoll_ctl_batch(epfd, add_mod_ops, fds, events, 2) != -1 ||
+        errno != ENOENT || epoll_fd_count(epfd) != 0) {
+        FAIL("unregistered MOD batch rollback");
+        wepoll_close(epfd);
+        tcp_pair_close(&first);
+        tcp_pair_close(&second);
+        return;
+    }
     if (epoll_ctl_batch(epfd, add_ops, fds, events, 2) != 0 ||
         epoll_fd_count(epfd) != 2 ||
         epoll_ctl_batch(epfd, del_ops, fds, NULL, 2) != 0 ||
@@ -1273,6 +1485,7 @@ int main(void)
     test_create_close();
     test_operational_stats();
     test_invalid_args();
+    test_ctl_target_errors();
     test_basic_io();
     test_write_ready();
     test_remote_half_close();

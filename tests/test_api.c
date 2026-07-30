@@ -424,6 +424,12 @@ static void test_create_ex_and_timeout_validation(void)
         return;
     }
     wepoll_close(epfd);
+
+    epfd = epoll_create_ex(INT_MAX, 0);
+    if (epfd < 0 || wepoll_close(epfd) != 0) {
+        FAIL("large POSIX capacity hint should be ignored");
+        return;
+    }
     PASS();
 
     TEST("zero-timeout waits and sigmask path return immediately");

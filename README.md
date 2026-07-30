@@ -92,6 +92,24 @@ helpers, socket-lifetime policy and statistics queries, and `wepoll_close`.
 `epoll_ctl_batch` applies operations in order and best-effort rolls back ADDs;
 it is not transactional.
 
+The standard `epoll_create(size)` requires a positive argument but ignores its
+value, matching modern Linux. `epoll_create_ex(size, flags)` retains the size
+only as an extension hint: Windows caps the positive hint value at 4096, while
+POSIX accepts and ignores it. The hint is not a registration limit.
+
+Windows control calls classify the target before membership errors where Linux
+does: an invalid or closed target returns `EBADF`, a valid supported target
+that is not registered returns `ENOENT` for MOD, DEL, and `epoll_rearm()`, and
+a valid but unsupported object returns `EPERM`. ADD alone also reports
+registration eligibility failures such as missing HANDLE access (`EACCES`) or
+a Winsock provider-resolution error. Every operation other than numeric
+`EPOLL_CTL_DEL` snapshots one event value at entry; a null pointer returns
+`EFAULT` before descriptor and operation validation, while DEL ignores the
+pointer.
+As a userspace Windows API, wepoll-ex cannot safely probe every arbitrary
+unreadable non-null pointer: callers must provide valid event storage or the
+process may fault instead of receiving `EFAULT`.
+
 On Windows, registrations accept Winsock sockets, anonymous/named pipes, and
 selected waitable HANDLEs (events, semaphores, waitable timers, processes,
 and threads). Waitable HANDLEs must grant `SYNCHRONIZE`; otherwise ADD returns
@@ -205,7 +223,10 @@ provider protocol metadata retains a conservative abort mapping, pipe writable
 readiness can remain advisory when native local information is unavailable or
 access is denied,
 exclusive-claim updates serialize through one process-wide mutex, and virtual
-epoll descriptors cannot be nested.
+epoll descriptors cannot be monitored or nested. Consequently, Windows cannot
+reproduce Linux's distinct self-registration and nested-epoll `EINVAL` cases;
+the virtual integer may instead classify as an invalid or unrelated native
+target.
 
 On Linux, `epoll_fd_count()` reports registrations owned by the extension
 metadata, including successful `epoll_ctl_batch` operations. Native

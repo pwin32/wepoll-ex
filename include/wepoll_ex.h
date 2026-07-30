@@ -8,7 +8,8 @@
  * Public API contract:
  *   - Common Linux entry points are exposed on Windows, plus an `_ex`
  *     extension family for diagnostics and per-registration context.
- *   - All EPOLL* event flag bits defined by Linux uapi are present.
+ *   - All public EPOLL* event flag bits exposed by Linux <sys/epoll.h> are
+ *     present.
  *   - Windows implements EPOLLET (observed-edge) and ADD-time
  *     EPOLLEXCLUSIVE; non-null wait signal masks are accepted and ignored.
  *   - Windows also accepts selected waitable HANDLEs and pipes in addition to
@@ -211,10 +212,12 @@ WEPOLL_EX_API int  epoll_pwait2(int epfd, struct epoll_event *events,
  * be Linux-portable and should be guarded with #ifdef WEPOLL_EX_H_.
  * ------------------------------------------------------------------------- */
 
-/* Same as epoll_create1, with an optional Windows capacity hint.  A positive
- * size pre-grows the fd table and raises the initial AFD/ready pool capacity
- * (capped internally); it does not resize the fixed IOCP dequeue batch.
- * Passing 0 uses defaults.  POSIX accepts but otherwise ignores the hint. */
+/* Same as epoll_create1, with an optional Windows capacity hint. A positive
+ * size pre-grows the fd table and raises the initial AFD/ready pool capacity;
+ * the hint is capped at 4096 and does not limit later registrations or resize
+ * the fixed IOCP dequeue batch. Passing 0 uses defaults. POSIX accepts but
+ * otherwise ignores the hint. The standard epoll_create() always ignores its
+ * positive legacy size, matching Linux. */
 WEPOLL_EX_API int  epoll_create_ex(int size, int flags);
 
 /* epoll_ctl with an extra user_ctx pointer that will be surfaced in

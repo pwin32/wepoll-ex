@@ -667,6 +667,13 @@ int  ep_port_create(int size_hint, int flags, ep_port_t **out);
 int  ep_port_destroy(ep_port_t *port);
 void ep_port_begin_close(ep_port_t *port);
 
+typedef enum ep_target_validation_mode {
+    EP_TARGET_VALIDATE_CONTROL = 0,
+    EP_TARGET_VALIDATE_ADD = 1
+} ep_target_validation_mode_t;
+
+int  ep_port_validate_target(ep_port_t *port, SOCKET fd,
+                             ep_target_validation_mode_t mode);
 int  ep_port_register(ep_port_t *port, SOCKET fd,
                       uint32_t events, uint32_t flags,
                       epoll_data_t data, void *ctx);

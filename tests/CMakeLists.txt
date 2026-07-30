@@ -468,6 +468,7 @@ else()
                 afd-cancel
                 endpoint-identity
                 endpoint-policy
+                endpoint-closed-token-loss
                 provider-base
                 iocp-create
                 iocp-post

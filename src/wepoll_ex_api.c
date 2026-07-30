@@ -259,6 +259,11 @@ static int epoll_ctl_port(ep_port_t *port,
             uint32_t exclusive_allowed =
                 EPOLLIN | EPOLLOUT | EPOLLWAKEUP | EPOLLET |
                 EPOLLERR | EPOLLHUP | EPOLLEXCLUSIVE;
+
+            if (ep_port_validate_target(port, (SOCKET)fd,
+                                        EP_TARGET_VALIDATE_ADD) != 0) {
+                return -1;
+            }
             if ((event->events & ~exclusive_allowed) != 0) {
                 ep_set_errno(EINVAL);
                 return -1;
@@ -276,6 +281,10 @@ static int epoll_ctl_port(ep_port_t *port,
         }
         if ((event->events & EPOLLEXCLUSIVE) != 0) {
             /* Linux rejects EPOLLEXCLUSIVE on MOD. */
+            if (ep_port_validate_target(port, (SOCKET)fd,
+                                        EP_TARGET_VALIDATE_CONTROL) != 0) {
+                return -1;
+            }
             ep_set_errno(EINVAL);
             return -1;
         }
@@ -288,6 +297,10 @@ static int epoll_ctl_port(ep_port_t *port,
         return ep_port_unregister(port, (SOCKET)fd);
 
     default:
+        if (ep_port_validate_target(port, (SOCKET)fd,
+                                    EP_TARGET_VALIDATE_CONTROL) != 0) {
+            return -1;
+        }
         ep_set_errno(EINVAL);
         return -1;
     }
@@ -319,7 +332,10 @@ WEPOLL_EX_API int epoll_create(int size)
         ep_set_errno(EINVAL);
         return -1;
     }
-    return epoll_create_ex(size, 0);
+    /* Linux has ignored this legacy sizing argument since 2.6.8. Keep the
+     * standard entry point behavior-only compatible; callers that explicitly
+     * want Windows preallocation use epoll_create_ex(). */
+    return epoll_create_ex(0, 0);
 }
 
 WEPOLL_EX_API int epoll_create1(int flags)
@@ -367,13 +383,32 @@ WEPOLL_EX_API int epoll_ctl_ctx(int epfd,
                                 struct epoll_event *event,
                                 void *user_ctx)
 {
-    epfd_entry_t *entry = epfd_require(epfd);
+    struct epoll_event event_copy;
+    struct epoll_event *effective_event = NULL;
+    epfd_entry_t *entry;
     int result;
 
+    /* Mainline Linux copies every non-DEL event before acquiring either
+     * descriptor or validating the operation. DEL intentionally ignores its
+     * event argument. */
+    if (op != EPOLL_CTL_DEL) {
+        if (event == NULL) {
+            ep_set_errno(EFAULT);
+            return -1;
+        }
+        event_copy = *event;
+        effective_event = &event_copy;
+    }
+    if (fd == EPOLL_FD_INVALID) {
+        ep_set_errno(EBADF);
+        return -1;
+    }
+
+    entry = epfd_require(epfd);
     if (entry == NULL) {
         return -1;
     }
-    result = epoll_ctl_port(entry->port, op, fd, event, user_ctx);
+    result = epoll_ctl_port(entry->port, op, fd, effective_event, user_ctx);
     epfd_put(entry);
     return result;
 }
