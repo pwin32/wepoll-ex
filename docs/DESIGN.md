@@ -309,13 +309,17 @@ metadata reference before unwinding.
 - `EPOLLONESHOT`, context delivery, RDHUP mapping, zero-timeout waits, native
   socket close cleanup and stable numeric reuse, and concurrent epoll close
   have regression coverage.
-- AFD receive and accept map to the ordinary readable class; send maps to the
-  ordinary writable class; and expedited receive maps to urgent data. The
-  public result is filtered to the requested aliases: `EPOLLIN` and
-  `EPOLLRDNORM` share one class, `EPOLLOUT`, `EPOLLWRNORM`, and `EPOLLWRBAND`
-  share one class, and `EPOLLPRI` and `EPOLLRDBAND` share one class. A graceful
-  disconnect reports readable EOF plus `EPOLLRDHUP` without `EPOLLERR` or
-  `EPOLLHUP`. A TCP abortive close reports unrequested `EPOLLERR | EPOLLHUP`;
+- AFD receive and accept map to the ordinary readable class; send maps only to
+  the ordinary writable class; and expedited receive maps only to priority
+  data. The public result is filtered to the requested aliases: `EPOLLIN` and
+  `EPOLLRDNORM` share the normal-read class, `EPOLLOUT` and `EPOLLWRNORM`
+  share the normal-write class, and `EPOLLPRI` represents expedited receive.
+  `EPOLLRDBAND` and `EPOLLWRBAND` remain accepted for socket registrations but
+  are inert: they do not arm an AFD readiness class or appear in a result.
+  They do not suppress independently generated unrequested `EPOLLERR` or
+  `EPOLLHUP`. A graceful disconnect reports readable EOF plus `EPOLLRDHUP`
+  without `EPOLLERR` or `EPOLLHUP`. A TCP abortive close reports unrequested
+  `EPOLLERR | EPOLLHUP`;
   an abort on a socket whose cached protocol metadata is an exact IPv4/IPv6
   UDP match reports `EPOLLERR` without HUP; and connect failure reports the
   requested readable/writable aliases plus unrequested `EPOLLERR | EPOLLHUP`.
@@ -324,7 +328,12 @@ metadata reference before unwinding.
   metadata retains the conservative abort mapping with HUP.
 - TCP urgent-data readiness is qualified for LT persistence until
   `recv(MSG_OOB)`, observed ET suppression and re-edge, ONESHOT MOD rearm, and
-  MOD filtering/data replacement. With `SO_OOBINLINE`, the urgent byte is
+  MOD filtering/data replacement. Exact-event regressions verify that urgent
+  readiness produces only requested `EPOLLPRI`, writable readiness produces
+  only requested `EPOLLOUT`/`EPOLLWRNORM`, band-only masks produce no band
+  readiness absent a terminal condition, and MOD switches among those masks
+  without leaking stale aliases. With
+  `SO_OOBINLINE`, the urgent byte is
   qualified as ordinary `EPOLLIN`, is consumed by normal `recv()`, persists in
   LT, and re-edges under the observed ET rule. AFD does not expose a separate
   expedited class in that mode, so Windows does not also report Linux's

@@ -166,6 +166,19 @@ completed 84/84. The focused correctness subsets also passed three repeats in
 every lane. Skips were limited to the documented environment-dependent
 UDP/ICMP case and synchronized-mode native-reuse identity cases.
 
+The July 30, 2026 socket-band parity qualification used the same Linux and
+Windows hosts and strict compiler flags. Linux native and forced-fallback
+Release CTest passed 4/4 each, API/pool tests passed five repeats, and
+ASan/UBSan passed 3/3. The seven MinGW Release lanes completed 150 combined
+best-effort, 148 static-only, 84 shared-only, 150 strict combined, 84 strict
+shared-only, 150 synchronized combined, and 84 synchronized shared-only
+entries. Their passed/skipped counts were 149/1, 147/1, 83/1, 149/1, 83/1,
+145/5, and 79/5. Three repeats of every applicable qualification subset
+passed, and the exact AFD mapping, socket-alias, urgent LT, and urgent MOD
+paths additionally passed 20 consecutive combined runs. Skips remained
+limited to the host-dependent UDP/ICMP probe and the four synchronized-mode
+native-reuse identity cases.
+
 Windows socket lifetime is now an explicit CMake policy:
 `WEPOLL_EX_SOCKET_LIFETIME_MODE=best-effort|strict|synchronized`.
 Best-effort remains the default, strict rejects providers without stable WFP
@@ -256,13 +269,17 @@ as well as its event bits. A negative status contributes unrequested
 an abort on a confirmed IPv4/IPv6 UDP socket omits HUP; and a failed connect
 guarantees `EPOLLERR | EPOLLHUP` alongside the requested readable/writable
 aliases. Graceful disconnect remains readable EOF plus `EPOLLRDHUP`, without
-being promoted to an error. Public regressions now cover the readable/writable
-aliases, urgent `EPOLLPRI`/`EPOLLRDBAND` LT/ET/ONESHOT/MOD behavior,
+being promoted to an error. AFD send readiness now produces only the requested
+`EPOLLOUT`/`EPOLLWRNORM` aliases, and expedited receive produces only requested
+`EPOLLPRI`. `EPOLLRDBAND` and `EPOLLWRBAND` remain accepted for sockets but are
+inert; independently generated `EPOLLERR` and `EPOLLHUP` remain unrequested
+terminal events. Public regressions cover exact ordinary, priority, and inert
+band-event masks plus MOD transitions, urgent LT/ET/ONESHOT behavior,
 `SO_OOBINLINE` LT/ET delivery as ordinary `EPOLLIN`, UDP IPv4/IPv6 readiness,
 and optional connected-UDP ICMP errors without HUP. Missing or ambiguous
-provider protocol metadata retains the conservative abort mapping. AFD cannot
-distinguish the three writable aliases, `SO_OOBINLINE` does not retain Linux's
-separate `EPOLLPRI` indication, and `EPOLLMSG` is never produced.
+provider protocol metadata retains the conservative abort mapping.
+`SO_OOBINLINE` does not retain Linux's separate `EPOLLPRI` indication, and
+`EPOLLMSG` is never produced.
 
 Windows `EPOLLET` and ADD-time `EPOLLEXCLUSIVE` are no longer rejected.
 Socket edge-triggered delivery latches observed interest bits from AFD level
@@ -415,12 +432,12 @@ no-op, and high-resolution `epoll_pwait2*` deadlines remain subject to Windows
 scheduler latency and a transparent millisecond fallback. `EPOLLEXCLUSIVE`
 may combine with `EPOLLET`, but not with
 `EPOLLONESHOT`, `EPOLLRDHUP`, or unsupported event bits; virtual Windows epoll
-descriptors cannot be nested, AFD writable aliases share one readiness class,
-`EPOLLMSG` is not emitted, `SO_OOBINLINE` collapses priority into ordinary
-readability, unknown provider protocol metadata retains a conservative abort
-mapping, and pipe writable readiness can remain advisory when native local
-information is unavailable or access is denied. Pure write-only outbound
-named-pipe server handles are the known access-denied case.
+descriptors cannot be nested, socket `EPOLLRDBAND` and `EPOLLWRBAND` interests
+are accepted but inert, `EPOLLMSG` is not emitted, `SO_OOBINLINE` collapses
+priority into ordinary readability, unknown provider protocol metadata retains
+a conservative abort mapping, and pipe writable readiness can remain advisory
+when native local information is unavailable or access is denied. Pure
+write-only outbound named-pipe server handles are the known access-denied case.
 Performance measurements are local loopback observations, not portable
 throughput guarantees.
 

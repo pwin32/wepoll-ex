@@ -236,7 +236,49 @@ static int run_write_alias_case(uint32_t interest, uint32_t expected,
         goto cleanup;
     }
     registered = 1;
-    if (wait_exact(epfd, 2000, data, expected, name) != 0) {
+    if ((expected != 0 &&
+         wait_exact(epfd, 2000, data, expected, name) != 0) ||
+        (expected == 0 && wait_empty(epfd, 100, name) != 0)) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, pair.client, 0, 0) != 0) {
+        result = -1;
+    }
+    if (epfd >= 0) {
+        (void)wepoll_close(epfd);
+    }
+    tcp_pair_close(&pair);
+    return result;
+}
+
+static int test_write_band_mod(void)
+{
+    tcp_pair_t pair;
+    const uint64_t band_data = UINT64_C(0x4106);
+    const uint64_t out_data = UINT64_C(0x4107);
+    int epfd = -1;
+    int registered = 0;
+    int result = -1;
+
+    if (make_tcp_pair(&pair) != 0) {
+        return -1;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0 ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, pair.client,
+                   EPOLLWRBAND, band_data) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (wait_empty(epfd, 100, "WRBAND MOD no readiness") != 0 ||
+        ctl_socket(epfd, EPOLL_CTL_MOD, pair.client,
+                   EPOLLOUT, out_data) != 0 ||
+        wait_exact(epfd, 2000, out_data, EPOLLOUT,
+                   "WRBAND MOD to OUT") != 0) {
         goto cleanup;
     }
     result = 0;
@@ -262,11 +304,12 @@ static int test_aliases(void)
                             UINT64_C(0x4102), "IN+RDNORM") != 0 ||
         run_write_alias_case(EPOLLWRNORM, EPOLLWRNORM,
                              UINT64_C(0x4103), "WRNORM") != 0 ||
-        run_write_alias_case(EPOLLWRBAND, EPOLLWRBAND,
+        run_write_alias_case(EPOLLWRBAND, 0,
                              UINT64_C(0x4104), "WRBAND") != 0 ||
         run_write_alias_case(EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND,
-                             EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND,
-                             UINT64_C(0x4105), "write aliases") != 0) {
+                             EPOLLOUT | EPOLLWRNORM,
+                             UINT64_C(0x4105), "write aliases") != 0 ||
+        test_write_band_mod() != 0) {
         return -1;
     }
     puts("aliases: OK");
@@ -291,9 +334,13 @@ static int run_oob_lt_case(uint32_t interest, uint32_t expected,
     }
     registered = 1;
     if (send_normal(pair.client, 'n') != 0 ||
-        send_oob(pair.client, '!') != 0 ||
-        wait_exact(epfd, 2000, data, expected, name) != 0 ||
-        wait_exact(epfd, 2000, data, expected, name) != 0 ||
+        send_oob(pair.client, '!') != 0) {
+        goto cleanup;
+    }
+    if ((expected != 0 &&
+         (wait_exact(epfd, 2000, data, expected, name) != 0 ||
+          wait_exact(epfd, 2000, data, expected, name) != 0)) ||
+        (expected == 0 && wait_empty(epfd, 100, name) != 0) ||
         recv_oob(pair.server, '!') != 0) {
         goto cleanup;
     }
@@ -323,8 +370,10 @@ static int test_oob_lt(void)
 {
     if (run_oob_lt_case(EPOLLPRI, EPOLLPRI, UINT64_C(0x4201),
                         "PRI LT") != 0 ||
-        run_oob_lt_case(EPOLLRDBAND, EPOLLRDBAND, UINT64_C(0x4202),
+        run_oob_lt_case(EPOLLRDBAND, 0, UINT64_C(0x4202),
                         "RDBAND LT") != 0 ||
+        run_oob_lt_case(EPOLLPRI | EPOLLRDBAND, EPOLLPRI,
+                        UINT64_C(0x4204), "PRI+RDBAND LT") != 0 ||
         run_oob_lt_case(EPOLLIN | EPOLLPRI, EPOLLIN | EPOLLPRI,
                         UINT64_C(0x4203), "IN+PRI LT") != 0) {
         return -1;
@@ -430,6 +479,7 @@ cleanup:
 static int test_oob_mod(void)
 {
     tcp_pair_t pair;
+    const uint64_t band_data = UINT64_C(0x4500);
     const uint64_t in_data = UINT64_C(0x4501);
     const uint64_t pri_data = UINT64_C(0x4502);
     const uint64_t final_data = UINT64_C(0x4503);
@@ -443,11 +493,20 @@ static int test_oob_mod(void)
     epfd = epoll_create1(0);
     if (epfd < 0 ||
         ctl_socket(epfd, EPOLL_CTL_ADD, pair.server,
-                   EPOLLIN, in_data) != 0) {
+                   EPOLLRDBAND, band_data) != 0) {
         goto cleanup;
     }
     registered = 1;
-    if (send_normal(pair.client, 'm') != 0 ||
+    if (send_oob(pair.client, 'b') != 0 ||
+        wait_empty(epfd, 100, "MOD RDBAND no readiness") != 0 ||
+        ctl_socket(epfd, EPOLL_CTL_MOD, pair.server,
+                   EPOLLPRI, pri_data) != 0 ||
+        wait_exact(epfd, 2000, pri_data, EPOLLPRI,
+                   "MOD RDBAND to PRI") != 0 ||
+        recv_oob(pair.server, 'b') != 0 ||
+        ctl_socket(epfd, EPOLL_CTL_MOD, pair.server,
+                   EPOLLIN, in_data) != 0 ||
+        send_normal(pair.client, 'm') != 0 ||
         send_oob(pair.client, 'p') != 0 ||
         wait_exact(epfd, 2000, in_data, EPOLLIN, "MOD IN") != 0 ||
         ctl_socket(epfd, EPOLL_CTL_MOD, pair.server,

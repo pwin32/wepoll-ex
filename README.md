@@ -171,12 +171,16 @@ confirmed IPv4/IPv6 UDP abort reports `EPOLLERR` without the terminal HUP bit;
 and a failed connect reports the requested readable/writable aliases plus
 unrequested `EPOLLERR | EPOLLHUP`. Graceful disconnect remains readable EOF
 and `EPOLLRDHUP`, without being promoted to an error. TCP urgent data maps the
-single AFD expedited-read class to `EPOLLPRI` and `EPOLLRDBAND`, filtered to
-the aliases requested by the registration. LT readiness persists until
+AFD expedited-read class to `EPOLLPRI` only. LT readiness persists until
 `recv(MSG_OOB)`, ET re-edges after the urgent level clears and reappears,
-ONESHOT requires MOD rearm, and MOD applies the latest mask/data. AFD likewise
-does not distinguish ordinary writable aliases: `EPOLLOUT`, `EPOLLWRNORM`,
-and `EPOLLWRBAND` describe one readiness class. With `SO_OOBINLINE`, urgent
+ONESHOT requires MOD rearm, and MOD applies the latest mask/data. AFD send
+readiness maps only to the ordinary `EPOLLOUT` and `EPOLLWRNORM` aliases,
+filtered to the bits requested by the registration. `EPOLLRDBAND` and
+`EPOLLWRBAND` remain accepted for sockets but are inert: they do not arm or
+synthesize readiness, although independently generated `EPOLLERR` and
+`EPOLLHUP` remain unrequested terminal events. Public exact-event regressions
+cover each socket alias and MOD transitions between ordinary, priority, and
+band-only masks. With `SO_OOBINLINE`, urgent
 bytes are qualified as ordinary `EPOLLIN` readiness, remain level-ready until
 normal `recv()`, and follow the same observed ET suppression/re-edge rule. AFD
 does not retain a separate priority indication in this mode, so Windows does
@@ -216,12 +220,12 @@ for prompt Linux extended-wait wakeup.
 Remaining platform limits are explicit: Windows signal masks and
 `EPOLLWAKEUP` have no native effect, high-resolution timeout support is
 optional and Windows scheduling can wake later than the requested deadline,
-edge delivery is observed-level rather than Linux kernel queue semantics, AFD
-collapses the writable aliases into one readiness class, `EPOLLMSG` is never
-produced, `SO_OOBINLINE` collapses priority into ordinary readability, unknown
-provider protocol metadata retains a conservative abort mapping, pipe writable
-readiness can remain advisory when native local information is unavailable or
-access is denied,
+edge delivery is observed-level rather than Linux kernel queue semantics,
+socket `EPOLLRDBAND` and `EPOLLWRBAND` interests are accepted but inert,
+`EPOLLMSG` is never produced, `SO_OOBINLINE` collapses priority into ordinary
+readability, unknown provider protocol metadata retains a conservative abort
+mapping, pipe writable readiness can remain advisory when native local
+information is unavailable or access is denied,
 exclusive-claim updates serialize through one process-wide mutex, and virtual
 epoll descriptors cannot be monitored or nested. Consequently, Windows cannot
 reproduce Linux's distinct self-registration and nested-epoll `EINVAL` cases;
@@ -335,9 +339,10 @@ Linux qualification covers API contracts, close/wait/cancellation races,
 native `epoll_pwait2` where libc and the kernel provide it, plus a separately
 forced fallback build, signal-mask waits, metadata changes, reused-fd identity,
 the pool, and package consumption. The MinGW suite covers TCP/UDP IPv4 and
-IPv6 readiness; read, write, and urgent-data aliases; LT, ET, ONESHOT, and MOD
-transitions; per-handle AFD status errors; reset and refused-connect terminal
-flags; provider-handle fallback; multi-epfd waits; deferred ADD failure; IOCP
+IPv6 readiness; exact ordinary, priority, and inert band-event masks; LT, ET,
+ONESHOT, and MOD transitions; per-handle AFD status errors; reset and
+refused-connect terminal flags; provider-handle fallback; multi-epfd waits;
+deferred ADD failure; IOCP
 batch draining; timeout deadlines; fail-at-N injection; bounded
 close/quarantine cleanup; randomized lifecycle stress; and package consumers.
 MinGW final binaries select the static winpthreads archive, and CTest rejects

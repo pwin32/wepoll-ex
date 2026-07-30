@@ -289,8 +289,7 @@ static int test_mapping(void)
         AFD_POLL_ABORT | AFD_POLL_CONNECT_FAIL | AFD_POLL_LOCAL_CLOSE;
     const uint32_t all_epoll =
         EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLERR | EPOLLHUP |
-        EPOLLRDNORM | EPOLLRDBAND | EPOLLWRNORM | EPOLLWRBAND |
-        EPOLLRDHUP;
+        EPOLLRDNORM | EPOLLWRNORM | EPOLLRDHUP;
     const ULONG all_afd =
         AFD_POLL_RECEIVE | AFD_POLL_RECEIVE_EXPEDITED | AFD_POLL_SEND |
         AFD_POLL_DISCONNECT | AFD_POLL_ABORT | AFD_POLL_LOCAL_CLOSE |
@@ -311,12 +310,12 @@ static int test_mapping(void)
                    ep_afd_to_epoll_events(AFD_POLL_RECEIVE_EXPEDITED,
                                           STATUS_SUCCESS,
                                           EP_SOCKET_PROTOCOL_UNKNOWN),
-                   EPOLLPRI | EPOLLRDBAND) != 0 ||
+                   EPOLLPRI) != 0 ||
         check_mask("AFD send",
                    ep_afd_to_epoll_events(AFD_POLL_SEND,
                                           STATUS_SUCCESS,
                                           EP_SOCKET_PROTOCOL_UNKNOWN),
-                   EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND) != 0 ||
+                   EPOLLOUT | EPOLLWRNORM) != 0 ||
         check_mask("AFD disconnect",
                    ep_afd_to_epoll_events(AFD_POLL_DISCONNECT,
                                           STATUS_SUCCESS,
@@ -378,8 +377,19 @@ static int test_mapping(void)
         check_mask("epoll PRI", ep_epoll_to_afd_events(EPOLLPRI),
                    always_afd | AFD_POLL_RECEIVE_EXPEDITED) != 0 ||
         check_mask("epoll RDBAND", ep_epoll_to_afd_events(EPOLLRDBAND),
+                   always_afd) != 0 ||
+        check_mask("epoll PRI plus RDBAND",
+                   ep_epoll_to_afd_events(EPOLLPRI | EPOLLRDBAND),
                    always_afd | AFD_POLL_RECEIVE_EXPEDITED) != 0 ||
         check_mask("epoll OUT", ep_epoll_to_afd_events(EPOLLOUT),
+                   always_afd | AFD_POLL_SEND) != 0 ||
+        check_mask("epoll WRNORM", ep_epoll_to_afd_events(EPOLLWRNORM),
+                   always_afd | AFD_POLL_SEND) != 0 ||
+        check_mask("epoll WRBAND", ep_epoll_to_afd_events(EPOLLWRBAND),
+                   always_afd) != 0 ||
+        check_mask("epoll write aliases",
+                   ep_epoll_to_afd_events(EPOLLOUT | EPOLLWRNORM |
+                                          EPOLLWRBAND),
                    always_afd | AFD_POLL_SEND) != 0 ||
         check_mask("epoll ERR", ep_epoll_to_afd_events(EPOLLERR),
                    always_afd) != 0 ||

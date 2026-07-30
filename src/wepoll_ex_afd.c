@@ -571,9 +571,9 @@ uint32_t ep_afd_to_epoll_events(ULONG afd_events, NTSTATUS afd_status,
     if (afd_events & (AFD_POLL_RECEIVE | AFD_POLL_ACCEPT))
         out |= EPOLLIN | EPOLLRDNORM;
     if (afd_events & AFD_POLL_RECEIVE_EXPEDITED)
-        out |= EPOLLPRI | EPOLLRDBAND;
+        out |= EPOLLPRI;
     if (afd_events & AFD_POLL_SEND)
-        out |= EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
+        out |= EPOLLOUT | EPOLLWRNORM;
     if (afd_events & AFD_POLL_DISCONNECT)
         out |= EPOLLIN | EPOLLRDNORM | EPOLLRDHUP;
     if (afd_events & AFD_POLL_ABORT) {
@@ -605,9 +605,9 @@ uint32_t ep_epoll_to_afd_events(uint32_t epoll_events)
     } else if (epoll_events & EPOLLRDHUP) {
         afd |= AFD_POLL_DISCONNECT;
     }
-    if (epoll_events & (EPOLLPRI | EPOLLRDBAND))
+    if (epoll_events & EPOLLPRI)
         afd |= AFD_POLL_RECEIVE_EXPEDITED;
-    if (epoll_events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND))
+    if (epoll_events & (EPOLLOUT | EPOLLWRNORM))
         afd |= AFD_POLL_SEND;
     return afd;
 }

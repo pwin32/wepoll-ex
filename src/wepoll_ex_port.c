@@ -79,11 +79,11 @@ static uint8_t ep_exclusive_classes(uint32_t delivered)
 {
     uint8_t classes = 0;
 
-    if ((delivered & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP |
-                      EPOLLPRI | EPOLLRDBAND)) != 0) {
+    if ((delivered &
+         (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP | EPOLLPRI)) != 0) {
         classes |= EP_EXCLUSIVE_CLASS_READ;
     }
-    if ((delivered & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) != 0) {
+    if ((delivered & (EPOLLOUT | EPOLLWRNORM)) != 0) {
         classes |= EP_EXCLUSIVE_CLASS_WRITE;
     }
     if ((delivered & (EPOLLERR | EPOLLHUP)) != 0) {
@@ -110,11 +110,10 @@ static void ep_exclusive_filter_classes(uint32_t *delivered,
                                         uint8_t denied_classes)
 {
     if ((denied_classes & EP_EXCLUSIVE_CLASS_READ) != 0) {
-        *delivered &= ~(EPOLLIN | EPOLLRDNORM | EPOLLRDHUP |
-                        EPOLLPRI | EPOLLRDBAND);
+        *delivered &= ~(EPOLLIN | EPOLLRDNORM | EPOLLRDHUP | EPOLLPRI);
     }
     if ((denied_classes & EP_EXCLUSIVE_CLASS_WRITE) != 0) {
-        *delivered &= ~(EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND);
+        *delivered &= ~(EPOLLOUT | EPOLLWRNORM);
     }
     if ((denied_classes & EP_EXCLUSIVE_CLASS_TERMINAL) != 0) {
         *delivered &= ~(EPOLLERR | EPOLLHUP);
@@ -2920,7 +2919,7 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
             read_ready = ep_socket_select_ready(sock->fd, 0);
         }
         if (sample_all ||
-            (delivered & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) != 0) {
+            (delivered & (EPOLLOUT | EPOLLWRNORM)) != 0) {
             write_ready = ep_socket_select_ready(sock->fd, 1);
         }
         if (read_ready == 0) {
@@ -2928,7 +2927,7 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
             inactive_classes |= EP_EXCLUSIVE_CLASS_READ;
         }
         if (write_ready == 0) {
-            delivered &= ~(EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND);
+            delivered &= ~(EPOLLOUT | EPOLLWRNORM);
             inactive_classes |= EP_EXCLUSIVE_CLASS_WRITE;
         }
         if (sample_all && inactive_classes != 0) {
