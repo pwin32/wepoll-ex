@@ -376,9 +376,13 @@ static void test_wait_maxevents_bounds(void)
     int epfd = -1;
     int limit = INT_MAX / (int)sizeof(struct epoll_event);
     int over_limit = limit + 1;
+    int extended_limit = SIZE_MAX / sizeof(struct epoll_event_ex) <
+            (size_t)limit
+        ? (int)(SIZE_MAX / sizeof(struct epoll_event_ex)) : limit;
+    int extended_over_limit = extended_limit + 1;
     int result;
 
-    TEST("wait APIs enforce Linux maxevents and bounded batches");
+    TEST("wait APIs enforce Linux maxevents without proportional allocation");
     tcp_pair_init(&pair);
     epfd = epoll_create1(0);
     if (epfd < 0) {
@@ -451,12 +455,12 @@ static void test_wait_maxevents_bounds(void)
         goto cleanup;
     }
     errno = 0;
-    result = epoll_wait_ex(epfd, NULL, over_limit, 0);
+    result = epoll_wait_ex(epfd, NULL, extended_over_limit, 0);
     if (result != -1 || errno != EINVAL) {
         FAIL("epoll_wait_ex over-limit rejection");
         goto cleanup;
     }
-    result = epoll_wait_ex(epfd, &extended, limit, 0);
+    result = epoll_wait_ex(epfd, &extended, extended_limit, 0);
     if (result != 0) {
         FAIL("epoll_wait_ex exact limit should be safe");
         goto cleanup;
@@ -468,7 +472,8 @@ static void test_wait_maxevents_bounds(void)
         goto cleanup;
     }
     errno = 0;
-    result = epoll_pwait2_ex(epfd, NULL, over_limit, &zero, NULL);
+    result = epoll_pwait2_ex(epfd, NULL, extended_over_limit,
+                             &zero, NULL);
     if (result != -1 || errno != EINVAL) {
         FAIL("epoll_pwait2_ex over-limit rejection");
         goto cleanup;
@@ -479,7 +484,8 @@ static void test_wait_maxevents_bounds(void)
         FAIL("epoll_pwait2_ex valid maxevents with NULL events");
         goto cleanup;
     }
-    result = epoll_pwait2_ex(epfd, &extended, limit, &zero, NULL);
+    result = epoll_pwait2_ex(epfd, &extended, extended_limit,
+                             &zero, NULL);
     if (result != 0) {
         FAIL("epoll_pwait2_ex exact limit should be safe");
         goto cleanup;
@@ -534,10 +540,52 @@ static void test_wait_maxevents_bounds(void)
         FAIL("4097-event basic wait did not return readiness");
         goto cleanup;
     }
+    result = epoll_pwait(epfd, large_output, 4097, 1000, NULL);
+    if (result != 1 || (large_output[0].events & EPOLLIN) == 0 ||
+        large_output[0].data.u64 != event.data.u64 ||
+        recv_byte(pair.server) != 0 || send_byte(pair.client) != 0) {
+        FAIL("4097-event pwait did not return readiness");
+        goto cleanup;
+    }
+    {
+        struct timespec one_second = { 1, 0 };
+
+        result = epoll_pwait2(epfd, large_output, 4097,
+                              &one_second, NULL);
+    }
+    if (result != 1 || (large_output[0].events & EPOLLIN) == 0 ||
+        large_output[0].data.u64 != event.data.u64 ||
+        recv_byte(pair.server) != 0 || send_byte(pair.client) != 0) {
+        FAIL("4097-event pwait2 did not return readiness");
+        goto cleanup;
+    }
     result = epoll_wait_ex(epfd, large_extended, 4097, 1000);
     if (result != 1 || (large_extended[0].events & EPOLLIN) == 0 ||
-        large_extended[0].data.u64 != event.data.u64) {
+        large_extended[0].data.u64 != event.data.u64 ||
+        recv_byte(pair.server) != 0 || send_byte(pair.client) != 0) {
         FAIL("4097-event extended wait did not return readiness");
+        goto cleanup;
+    }
+    {
+        struct timespec one_second = { 1, 0 };
+
+        result = epoll_pwait2_ex(epfd, large_extended, 4097,
+                                 &one_second, NULL);
+    }
+    if (result != 1 || (large_extended[0].events & EPOLLIN) == 0 ||
+        large_extended[0].data.u64 != event.data.u64 ||
+        recv_byte(pair.server) != 0 || send_byte(pair.client) != 0) {
+        FAIL("4097-event extended pwait2 did not return readiness");
+        goto cleanup;
+    }
+    result = 0;
+    for (int attempt = 0; attempt < 100 && result == 0; attempt++) {
+        result = epoll_drain(epfd, large_output, 4097);
+        if (result == 0) Sleep(1);
+    }
+    if (result != 1 || (large_output[0].events & EPOLLIN) == 0 ||
+        large_output[0].data.u64 != event.data.u64) {
+        FAIL("4097-event drain did not return readiness");
         goto cleanup;
     }
 

@@ -92,16 +92,28 @@ helpers, socket-lifetime policy and statistics queries, and `wepoll_close`.
 `epoll_ctl_batch` applies operations in order and best-effort rolls back ADDs;
 it is not transactional.
 
-With a valid epoll descriptor, wait entry points reject `maxevents <= 0` and
-values above the Linux UAPI ceiling before checking the output pointer. On the
-qualified x86-64 Windows
-target that ceiling is 178,956,970, derived from Linux's packed 12-byte
-`epoll_event` transfer record; Linux extended waits derive it from the host
-UAPI structure. A legal large value is only a return-count upper bound: one
-Windows wait or POSIX extension wait returns at most 4096 events, so exact-
-limit empty or lightly ready waits do not allocate storage proportional to the
-caller-supplied value. `epoll_pwait2*` validates a non-null timespec before the
-count and output pointer, matching Linux's syscall order.
+With a valid epoll descriptor, standard wait entry points reject
+`maxevents <= 0` and values above the Linux UAPI ceiling before checking the
+output pointer. Extended waits also reject a count whose larger
+`epoll_event_ex` array would exceed `SIZE_MAX`; this is the tighter bound on
+32-bit targets. On the qualified x86-64 Windows target both ceilings are
+178,956,970, derived from Linux's packed 12-byte `epoll_event` transfer record;
+Linux extended waits derive the standard ceiling from the host UAPI structure.
+A legal large value is only a return-count upper bound.
+Windows writes basic or extended records directly into the caller's array and
+can fill beyond 4096 without allocating conversion storage proportional to
+`maxevents`; large waits also coalesce already-queued IOCP completion batches
+without rearming delivered LT registrations inside the call. Coalescing is
+bounded for every timeout mode, so even a positive or infinite wait may return
+fewer events than the supplied upper bound rather than monopolize the waiter
+while completions keep arriving. MOD and `epoll_rearm()` of an already selected
+registration defer their replacement generation to the next wait, which
+prevents that registration from appearing twice in the same logical result.
+POSIX extension waits retain a 4096-event
+per-call ceiling because chunking native waits cannot safely distinguish two
+registrations that share opaque `epoll_data`. `epoll_pwait2*` validates a
+non-null timespec before the count and output pointer, matching Linux's syscall
+order.
 
 On Windows x86 and x86-64, `struct epoll_event` uses Linux's UAPI layout:
 `data` begins at byte 4 and the structure size and array stride are 12 bytes.

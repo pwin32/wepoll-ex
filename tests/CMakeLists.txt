@@ -242,7 +242,8 @@ else()
                 waitable-zero-ready
                 waitable-queued-rearm
                 aux-post-close-lease
-                pipe-invalid-et)
+                pipe-invalid-et
+                large-wait)
             string(REPLACE "-" "_" _state_name "${_state_mode}")
             add_test(NAME wepoll_ex_windows_state_${_state_name}
                 COMMAND test_wepoll_ex_windows_state ${_state_mode})

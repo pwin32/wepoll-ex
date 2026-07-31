@@ -76,6 +76,7 @@ typedef struct posix_port {
 #define POSIX_PORT_MAP_SIZE  1024
 #define POSIX_WAKE_TOKEN     UINT64_C(0x5745504f4c4c4558)
 #define POSIX_WAIT_STACK_EVENTS  32
+#define POSIX_WAIT_BATCH_EVENTS  4096
 static pthread_mutex_t g_posix_lock = PTHREAD_MUTEX_INITIALIZER;
 static posix_port_t   *g_posix_map[POSIX_PORT_MAP_SIZE];
 
@@ -844,7 +845,7 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
 {
     int batch_events;
 
-    if (maxevents <= 0 || maxevents > WEPOLL_EPOLL_MAX_EVENTS) {
+    if (maxevents <= 0 || maxevents > WEPOLL_EPOLL_EX_MAX_EVENTS) {
         errno = EINVAL;
         return -1;
     }
@@ -852,8 +853,8 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
         errno = EFAULT;
         return -1;
     }
-    batch_events = maxevents < WEPOLL_WAIT_BATCH_EVENTS
-        ? maxevents : WEPOLL_WAIT_BATCH_EVENTS;
+    batch_events = maxevents < POSIX_WAIT_BATCH_EVENTS
+        ? maxevents : POSIX_WAIT_BATCH_EVENTS;
 
     /* Hold a metadata-port reference across the native wait.  The wait uses
      * the stable duplicate, not the caller's integer descriptor, so

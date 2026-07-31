@@ -19,6 +19,10 @@
 #define EP_CLOSE_DRAIN_SLICE_MS   100U
 #define EP_ZERO_TIMEOUT_DRAIN_BUDGET_MS 10U
 #define EP_ZERO_TIMEOUT_MIN_DEQUEUES     16U
+#define EP_WAIT_COALESCE_THRESHOLD       4096
+#define EP_WAIT_COALESCE_BUDGET_MS       10U
+#define EP_WAIT_COALESCE_MIN_DEQUEUES    64U
+#define EP_WAIT_COALESCE_MAX_DEQUEUES    128U
 #define EP_DEFERRED_REARM_RETRY_MS       1U
 #define EP_MAX_ACTIVE_QUARANTINES        4U
 #define EP_100NS_PER_MILLISECOND         UINT64_C(10000)
@@ -3566,6 +3570,7 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
 
     port->close_on_exec = (flags & EPOLL_CLOEXEC) != 0;
     atomic_init(&port->waiter_active, 0);
+    atomic_init(&port->waiter_coalescing, 0);
     atomic_init(&port->closing, 0);
     atomic_init(&port->iocp_closed, 0);
     atomic_init(&port->iocp_post_error, 0);
@@ -4095,7 +4100,10 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
      * with an active waiter must arm immediately so future readiness can wake
      * the already-blocked GetQueuedCompletionStatusEx call. */
     if (!ep_waitable_is_dormant(sock) &&
-        (atomic_load_explicit(&port->waiter_active, memory_order_acquire)
+        ((atomic_load_explicit(&port->waiter_active,
+                               memory_order_acquire) &&
+          !atomic_load_explicit(&port->waiter_coalescing,
+                                memory_order_acquire))
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
         || sock->endpoint_id_state == EP_SOCKET_ID_TRANSITIONAL
 #endif
@@ -4327,7 +4335,9 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     if (!new_waitable_dormant &&
         atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
             EP_POLL_IDLE &&
-        atomic_load_explicit(&port->waiter_active, memory_order_acquire)) {
+        atomic_load_explicit(&port->waiter_active, memory_order_acquire) &&
+        !atomic_load_explicit(&port->waiter_coalescing,
+                              memory_order_acquire)) {
         int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
         if (submit_result > 0) {
             int saved_errno = ep_last_err();
@@ -4496,7 +4506,9 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
         sock->generation = 1;
     }
     int result = 0;
-    if (atomic_load_explicit(&port->waiter_active, memory_order_acquire)) {
+    if (atomic_load_explicit(&port->waiter_active, memory_order_acquire) &&
+        !atomic_load_explicit(&port->waiter_coalescing,
+                              memory_order_acquire)) {
         result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
     }
     if (result > 0) {
@@ -4640,6 +4652,14 @@ static int ep_drain_to_buffer(ep_port_t *port,
                      * later MOD explicitly starts a fresh observation. */
                     sock->et_holdoff = 0;
                     ep_sock_set_needs_rearm_locked(sock, 1);
+                }
+                if (delivered == 0 &&
+                    maxevents > EP_WAIT_COALESCE_THRESHOLD) {
+                    /* fd_table_lock closes the race with MOD/rearm: after the
+                     * first snapshot is selected, no replacement generation
+                     * may be submitted until this logical wait returns. */
+                    atomic_store_explicit(&port->waiter_coalescing, 1,
+                                          memory_order_release);
                 }
             }
         } else {
@@ -4827,7 +4847,9 @@ static int ep_port_wait_timeout_impl(ep_port_t *port, void *out,
         ep_set_errno(EFAULT);
         return -1;
     }
-    if (maxevents <= 0) {
+    if (maxevents <= 0 ||
+        maxevents > (basic_events ? WEPOLL_EPOLL_MAX_EVENTS
+                                  : WEPOLL_EPOLL_EX_MAX_EVENTS)) {
         ep_set_errno(EINVAL);
         return -1;
     }
@@ -5054,32 +5076,85 @@ static int ep_port_wait_timeout_impl(ep_port_t *port, void *out,
         result = ep_drain_to_buffer(port, out, maxevents, basic_events);
         if (result > 0) {
 coalesce:
-            /* Linux can fill the caller's entire legal maxevents array.
-             * Once readiness exists, consume completion packets that are
-             * already queued and append their snapshots without another arm
-             * pass.  Drained registrations therefore cannot be resubmitted
-             * and duplicated within this call while large ready sets can
-             * cross the fixed-size IOCP dequeue batch. */
-            while (result < maxevents) {
-                ULONG coalesced = 0;
-                BOOL coalesce_ok = port->get_queued_completion_status_ex(
-                    port->iocp, port->iocp_entries, port->iocp_batch_size,
-                    &coalesced, 0, FALSE);
+            {
+                uint64_t coalesce_deadline = GetTickCount64() +
+                    EP_WAIT_COALESCE_BUDGET_MS;
+                unsigned int coalesce_dequeues = 0;
 
-                if (!coalesce_ok || coalesced == 0) {
-                    break;
+                /* Linux can fill the caller's entire legal maxevents array.
+                 * Once readiness exists, consume completion packets that are
+                 * already queued and append their snapshots without another
+                 * arm pass.  Drained registrations therefore cannot be
+                 * resubmitted and duplicated within this call while large
+                 * ready sets can cross the fixed-size IOCP dequeue batch.
+                 * Bound both the packet count and elapsed work so arrivals
+                 * racing the drain cannot keep a ready wait from returning. */
+                while (maxevents > EP_WAIT_COALESCE_THRESHOLD &&
+                       result < maxevents &&
+                       coalesce_dequeues <
+                           EP_WAIT_COALESCE_MAX_DEQUEUES) {
+                    ULONG coalesced = 0;
+                    BOOL coalesce_ok;
+                    DWORD coalesce_error;
+
+                    if (ep_fault_hit(EP_FAULT_IOCP_DEQUEUE) != 0) {
+                        int fault_error = ep_last_err();
+
+                        pthread_mutex_lock(&port->fd_table_lock);
+                        ep_port_record_async_error_locked(
+                            port, fault_error);
+                        pthread_mutex_unlock(&port->fd_table_lock);
+                        break;
+                    }
+                    coalesce_ok = port->get_queued_completion_status_ex(
+                        port->iocp, port->iocp_entries,
+                        port->iocp_batch_size, &coalesced, 0, FALSE);
+                    if (!coalesce_ok) {
+                        coalesce_error = GetLastError();
+                        if (coalesce_error != WAIT_TIMEOUT) {
+                            pthread_mutex_lock(&port->fd_table_lock);
+                            ep_port_record_async_error_locked(
+                                port, ep_winerr_to_errno(coalesce_error));
+                            pthread_mutex_unlock(&port->fd_table_lock);
+                        }
+                        break;
+                    }
+                    if (coalesced == 0) {
+                        break;
+                    }
+                    coalesce_dequeues++;
+                    for (ULONG i = 0; i < coalesced; i++) {
+                        (void)ep_port_dispatch_iocp_entry(
+                            port, &port->iocp_entries[i],
+                            wait_state.timeout_generation);
+                    }
+                    result += ep_drain_to_buffer(
+                        port, (unsigned char *)out +
+                            (size_t)result * (basic_events
+                                ? sizeof(struct epoll_event)
+                                : sizeof(epoll_event_ex)),
+                        maxevents - result, basic_events);
+                    if (!timeout->infinite && timeout->milliseconds == 0) {
+                        zero_timeout_dequeues++;
+                        if (zero_timeout_dequeues >=
+                                EP_ZERO_TIMEOUT_MIN_DEQUEUES &&
+                            GetTickCount64() >= zero_timeout_deadline) {
+                            pthread_mutex_lock(&port->fd_table_lock);
+                            port->zero_timeout_budget_hits++;
+                            pthread_mutex_unlock(&port->fd_table_lock);
+                            break;
+                        }
+                    }
+                    if (atomic_load_explicit(&port->closing,
+                                             memory_order_acquire)) {
+                        break;
+                    }
+                    if (coalesce_dequeues >=
+                            EP_WAIT_COALESCE_MIN_DEQUEUES &&
+                        GetTickCount64() >= coalesce_deadline) {
+                        break;
+                    }
                 }
-                for (ULONG i = 0; i < coalesced; i++) {
-                    (void)ep_port_dispatch_iocp_entry(
-                        port, &port->iocp_entries[i],
-                        wait_state.timeout_generation);
-                }
-                result += ep_drain_to_buffer(
-                    port, (unsigned char *)out +
-                        (size_t)result * (basic_events
-                            ? sizeof(struct epoll_event)
-                            : sizeof(epoll_event_ex)),
-                    maxevents - result, basic_events);
             }
             break;
         }
@@ -5127,6 +5202,8 @@ done:
     if (wait_state.timeout_generation != 0) {
         ep_port_precise_timeout_disarm(port);
     }
+    atomic_store_explicit(&port->waiter_coalescing, 0,
+                          memory_order_release);
     atomic_store_explicit(&port->waiter_active, 0, memory_order_release);
     pthread_mutex_unlock(&port->wait_lock);
     return result;

@@ -126,6 +126,15 @@
 #define WEPOLL_EPOLL_MAX_EVENTS \
     ((int)(INT_MAX / (int)sizeof(struct epoll_event)))
 
+/* Extended output records are larger than the Linux transfer record.  On
+ * 32-bit targets their addressable array can become the tighter bound even
+ * though the standard packed epoll_event count remains legal. */
+#define WEPOLL_EPOLL_EX_MAX_EVENTS                                      \
+    ((SIZE_MAX / sizeof(epoll_event_ex)) <                              \
+             (size_t)WEPOLL_EPOLL_MAX_EVENTS                            \
+         ? (int)(SIZE_MAX / sizeof(epoll_event_ex))                     \
+         : WEPOLL_EPOLL_MAX_EVENTS)
+
 /* ----------------------------------------------------------------------- */
 /* Forward declarations.                                                   */
 /* ----------------------------------------------------------------------- */
@@ -621,6 +630,10 @@ struct ep_port {
      * polls and waits for their IOCP completions before storage is freed. */
     pthread_mutex_t wait_lock;
     _Atomic int waiter_active;
+    /* Set after a large wait has selected its first ready snapshot.  Control
+     * operations then queue rearm work for the next wait instead of creating
+     * a second generation that the same coalescing drain could return. */
+    _Atomic int waiter_coalescing;
     _Atomic int closing;
     _Atomic int iocp_closed;
     _Atomic int iocp_post_error;

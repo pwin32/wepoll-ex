@@ -17,9 +17,6 @@
 /* Separate chaining keeps descriptor entries at stable addresses while
  * operations hold references and avoids open-addressing deletion holes. */
 #define EPFD_BUCKET_COUNT 64U
-/* Keep the common wait scratch to a few KiB while retaining a heap fallback
- * for larger caller-requested batches. */
-#define EP_WAIT_STACK_EVENTS 64U
 /* A stuck public operation must not make close hang forever.  This matches
  * the port's bounded AFD-completion drain while keeping the two waits
  * independent: this deadline covers only public API references. */
@@ -428,10 +425,6 @@ static int epoll_wait_basic_timeout(int epfd,
                                     const wepoll_sigset_t *sigmask)
 {
     epfd_entry_t *entry;
-    epoll_event_ex stack_events[EP_WAIT_STACK_EVENTS];
-    epoll_event_ex *extended = stack_events;
-    epoll_event_ex *heap_events = NULL;
-    int batch_events;
     int result;
 
     if (maxevents <= 0 || maxevents > WEPOLL_EPOLL_MAX_EVENTS) {
@@ -442,35 +435,13 @@ static int epoll_wait_basic_timeout(int epfd,
         ep_set_errno(EFAULT);
         return -1;
     }
-    batch_events = maxevents < WEPOLL_WAIT_BATCH_EVENTS
-        ? maxevents : WEPOLL_WAIT_BATCH_EVENTS;
-
     entry = epfd_require(epfd);
     if (entry == NULL) {
         return -1;
     }
 
-    if ((size_t)batch_events > EP_WAIT_STACK_EVENTS) {
-        heap_events = (epoll_event_ex *)calloc(
-            (size_t)batch_events, sizeof(*heap_events));
-        if (heap_events == NULL) {
-            epfd_put(entry);
-            ep_set_errno(ENOMEM);
-            return -1;
-        }
-        extended = heap_events;
-    }
-
-    result = epoll_wait_port_timeout(entry, extended, batch_events,
-                                     timeout, sigmask);
-    if (result >= 0) {
-        for (int i = 0; i < result; i++) {
-            events[i].events = extended[i].events;
-            events[i].data = extended[i].data;
-        }
-    }
-
-    free(heap_events);
+    result = ep_port_wait_basic_timeout(entry->port, events, maxevents,
+                                        timeout, sigmask);
     epfd_put(entry);
     return result;
 }
@@ -509,10 +480,9 @@ WEPOLL_EX_API int epoll_wait_ex(int epfd,
                                 int timeout)
 {
     epfd_entry_t *entry;
-    int batch_events;
     int result;
 
-    if (maxevents <= 0 || maxevents > WEPOLL_EPOLL_MAX_EVENTS) {
+    if (maxevents <= 0 || maxevents > WEPOLL_EPOLL_EX_MAX_EVENTS) {
         ep_set_errno(EINVAL);
         return -1;
     }
@@ -520,14 +490,11 @@ WEPOLL_EX_API int epoll_wait_ex(int epfd,
         ep_set_errno(EFAULT);
         return -1;
     }
-    batch_events = maxevents < WEPOLL_WAIT_BATCH_EVENTS
-        ? maxevents : WEPOLL_WAIT_BATCH_EVENTS;
-
     entry = epfd_require(epfd);
     if (entry == NULL) {
         return -1;
     }
-    result = epoll_wait_port(entry, events, batch_events, timeout, NULL);
+    result = epoll_wait_port(entry, events, maxevents, timeout, NULL);
     epfd_put(entry);
     return result;
 }
@@ -540,13 +507,12 @@ WEPOLL_EX_API int epoll_pwait2_ex(int epfd,
 {
     epfd_entry_t *entry;
     ep_wait_timeout_t wait_timeout;
-    int batch_events;
     int result;
 
     if (ep_wait_timeout_from_timespec(timeout, &wait_timeout) != 0) {
         return -1;
     }
-    if (maxevents <= 0 || maxevents > WEPOLL_EPOLL_MAX_EVENTS) {
+    if (maxevents <= 0 || maxevents > WEPOLL_EPOLL_EX_MAX_EVENTS) {
         ep_set_errno(EINVAL);
         return -1;
     }
@@ -554,14 +520,11 @@ WEPOLL_EX_API int epoll_pwait2_ex(int epfd,
         ep_set_errno(EFAULT);
         return -1;
     }
-    batch_events = maxevents < WEPOLL_WAIT_BATCH_EVENTS
-        ? maxevents : WEPOLL_WAIT_BATCH_EVENTS;
-
     entry = epfd_require(epfd);
     if (entry == NULL) {
         return -1;
     }
-    result = epoll_wait_port_timeout(entry, events, batch_events,
+    result = epoll_wait_port_timeout(entry, events, maxevents,
                                      &wait_timeout, sigmask);
     epfd_put(entry);
     return result;

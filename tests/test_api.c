@@ -128,7 +128,10 @@ static void test_wait_maxevents_bounds(void)
     int pair[2] = { -1, -1 };
     int epfd = -1;
     int limit = test_epoll_maxevents();
-    int over_limit = limit + 1;
+    int extended_limit = SIZE_MAX / sizeof(struct epoll_event_ex) <
+            (size_t)limit
+        ? (int)(SIZE_MAX / sizeof(struct epoll_event_ex)) : limit;
+    int extended_over_limit = extended_limit + 1;
     int result;
 
     TEST("extended waits enforce Linux maxevents and bounded batches");
@@ -145,7 +148,7 @@ static void test_wait_maxevents_bounds(void)
         goto cleanup;
     }
     errno = 0;
-    result = epoll_wait_ex(epfd, NULL, over_limit, 0);
+    result = epoll_wait_ex(epfd, NULL, extended_over_limit, 0);
     if (result != -1 || errno != EINVAL) {
         FAIL("over-limit maxevents must precede NULL events");
         goto cleanup;
@@ -157,13 +160,13 @@ static void test_wait_maxevents_bounds(void)
         goto cleanup;
     }
     errno = 0;
-    result = epoll_wait_ex(epfd, &output, over_limit, 0);
+    result = epoll_wait_ex(epfd, &output, extended_over_limit, 0);
     if (result != -1 || errno != EINVAL) {
         FAIL("epoll_wait_ex over-limit rejection");
         goto cleanup;
     }
     errno = 0;
-    result = epoll_wait_ex(epfd, &output, limit, 0);
+    result = epoll_wait_ex(epfd, &output, extended_limit, 0);
     if (result != 0) {
         FAIL("epoll_wait_ex exact limit should be safe on empty epfd");
         goto cleanup;
@@ -176,7 +179,8 @@ static void test_wait_maxevents_bounds(void)
         goto cleanup;
     }
     errno = 0;
-    result = epoll_pwait2_ex(epfd, NULL, over_limit, &zero, NULL);
+    result = epoll_pwait2_ex(epfd, NULL, extended_over_limit,
+                             &zero, NULL);
     if (result != -1 || errno != EINVAL) {
         FAIL("pwait2_ex over-limit rejection");
         goto cleanup;
@@ -188,7 +192,8 @@ static void test_wait_maxevents_bounds(void)
         goto cleanup;
     }
     errno = 0;
-    result = epoll_pwait2_ex(epfd, &output, limit, &zero, NULL);
+    result = epoll_pwait2_ex(epfd, &output, extended_limit,
+                             &zero, NULL);
     if (result != 0) {
         FAIL("pwait2_ex exact limit should be safe on empty epfd");
         goto cleanup;

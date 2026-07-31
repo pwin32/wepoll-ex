@@ -843,10 +843,17 @@ cleanup:
 static int test_iocp_dequeue(void)
 {
     ep_port_t *port = NULL;
+    epoll_event_ex *large_events = NULL;
     epoll_event_ex event;
+    epoll_data_t data;
+    HANDLE event_handle = NULL;
+    SOCKET fd;
+    int context = 1;
     int result = -1;
 
     ep_fault_reset();
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x494f4350434f414c);
     if (ep_port_create(0, 0, &port) != 0 ||
         ep_fault_configure(EP_FAULT_IOCP_DEQUEUE, 2, EIO) != 0 ||
         ep_port_wait(port, &event, 1, 0, NULL) != 0) {
@@ -859,11 +866,48 @@ static int test_iocp_dequeue(void)
     }
     ep_fault_reset();
     if (ep_port_wait(port, &event, 1, 0, NULL) != 0) goto cleanup;
+
+    large_events = (epoll_event_ex *)calloc(4097, sizeof(*large_events));
+    event_handle = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (large_events == NULL || event_handle == NULL) goto cleanup;
+    fd = (SOCKET)(uintptr_t)event_handle;
+    if (ep_port_register(port, fd, EPOLLIN, 0, data, &context) != 0 ||
+        ep_fault_configure(EP_FAULT_IOCP_DEQUEUE, 2, EIO) != 0 ||
+        !SetEvent(event_handle)) {
+        goto cleanup;
+    }
+
+    memset(large_events, 0, 4097 * sizeof(*large_events));
+    errno = 0;
+    if (ep_port_wait(port, large_events, 4097, 2000, NULL) != 1 ||
+        large_events[0].events != EPOLLIN ||
+        large_events[0].data.u64 != data.u64 ||
+        large_events[0].user_ctx != &context ||
+        ep_fault_hits(EP_FAULT_IOCP_DEQUEUE) != 2) {
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (ep_port_wait(port, &event, 1, 0, NULL) != -1 || errno != EIO ||
+        ep_fault_hits(EP_FAULT_IOCP_DEQUEUE) != 2) {
+        goto cleanup;
+    }
+
+    ep_fault_reset();
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 2000, NULL) != 1 ||
+        event.events != EPOLLIN || event.data.u64 != data.u64 ||
+        event.user_ctx != &context ||
+        ep_fault_hits(EP_FAULT_IOCP_DEQUEUE) != 0) {
+        goto cleanup;
+    }
     result = 0;
 
 cleanup:
     ep_fault_reset();
     if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    if (event_handle != NULL) CloseHandle(event_handle);
+    free(large_events);
     return result;
 }
 

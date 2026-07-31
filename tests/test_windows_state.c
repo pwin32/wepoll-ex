@@ -2843,6 +2843,846 @@ static int test_pipe_invalid_et_snapshot(void)
     return run_pipe_terminal_invalid_et_case();
 }
 
+#define LARGE_WAIT_EVENT_COUNT 4097U
+#define LARGE_WAIT_FEED_CHUNK 64U
+#define LARGE_WAIT_BUDGET_DEQUEUES 64U
+#define LARGE_WAIT_CONTROL_INITIAL 2U
+#define LARGE_WAIT_FD_BASE ((uintptr_t)UINT32_C(0x100000))
+#define LARGE_WAIT_TIMESTAMP_TAG UINT64_C(0x6c61726700000000)
+
+typedef struct large_wait_control_context {
+    ep_port_t *port;
+    ep_sock_t *modify_sock;
+    ep_sock_t *rearm_sock;
+    HANDLE start_event;
+    HANDLE done_event;
+    epoll_data_t modify_data;
+    void *modify_user_ctx;
+    _Atomic int triggered;
+    _Atomic size_t feed_calls_at_trigger;
+    _Atomic int worker_error;
+    _Atomic int saw_waiter_active;
+    _Atomic int saw_waiter_coalescing;
+    _Atomic int saw_targets_drained;
+    _Atomic int modify_result;
+    _Atomic int modify_error;
+    _Atomic int rearm_result;
+    _Atomic int rearm_error;
+} large_wait_control_context_t;
+
+typedef struct large_wait_fixture {
+    ep_port_t *port;
+    ep_sock_t **socks;
+    ep_ready_node_t **pending_nodes;
+    size_t count;
+    size_t feed_index;
+    size_t feed_calls;
+    size_t feed_chunk;
+    DWORD feed_delay_ms;
+    large_wait_control_context_t *control;
+    int feed_invalid;
+    int hook_installed;
+    PGetQueuedCompletionStatusEx original_dequeue;
+} large_wait_fixture_t;
+
+static large_wait_fixture_t *large_wait_feed_fixture;
+
+static void large_wait_fixture_reset(large_wait_fixture_t *fixture)
+{
+    memset(fixture, 0, sizeof(*fixture));
+}
+
+static void large_wait_uninstall_feed(large_wait_fixture_t *fixture)
+{
+    if (fixture->hook_installed && fixture->port != NULL) {
+        fixture->port->get_queued_completion_status_ex =
+            fixture->original_dequeue;
+    }
+    if (large_wait_feed_fixture == fixture) {
+        large_wait_feed_fixture = NULL;
+    }
+    fixture->hook_installed = 0;
+    fixture->original_dequeue = NULL;
+}
+
+static void large_wait_fixture_close(large_wait_fixture_t *fixture)
+{
+    ep_ready_node_t *chain;
+
+    large_wait_uninstall_feed(fixture);
+    if (fixture->port != NULL) {
+        if (fixture->pending_nodes != NULL) {
+            for (size_t i = 0; i < fixture->count; i++) {
+                if (fixture->pending_nodes[i] != NULL) {
+                    ep_ready_node_free(fixture->port,
+                                       fixture->pending_nodes[i]);
+                    fixture->pending_nodes[i] = NULL;
+                }
+            }
+        }
+        chain = ep_ready_drain(&fixture->port->ready_queue,
+                               (int)LARGE_WAIT_EVENT_COUNT);
+        while (chain != NULL) {
+            ep_ready_node_t *next = atomic_load_explicit(
+                &chain->next, memory_order_relaxed);
+
+            ep_ready_node_free(fixture->port, chain);
+            chain = next;
+        }
+        (void)ep_port_destroy(fixture->port);
+        fixture->port = NULL;
+    }
+    free(fixture->pending_nodes);
+    fixture->pending_nodes = NULL;
+    free(fixture->socks);
+    fixture->socks = NULL;
+    fixture->count = 0;
+}
+
+static int large_wait_table_insert(ep_port_t *port, ep_sock_t *sock)
+{
+    size_t slot;
+
+    if (port->fd_table_size == 0) {
+        return -1;
+    }
+    slot = (size_t)sock->fd % port->fd_table_size;
+    for (size_t probes = 0; probes < port->fd_table_size; probes++) {
+        if (port->fd_table[slot] == NULL) {
+            port->fd_table[slot] = sock;
+            port->fd_table_count++;
+            return 0;
+        }
+        slot = (slot + 1) % port->fd_table_size;
+    }
+    return -1;
+}
+
+static int large_wait_fixture_open(large_wait_fixture_t *fixture)
+{
+    ep_sock_t *previous = NULL;
+    ep_sock_t *previous_oneshot = NULL;
+
+    large_wait_fixture_reset(fixture);
+    fixture->count = LARGE_WAIT_EVENT_COUNT;
+    fixture->socks = (ep_sock_t **)calloc(
+        fixture->count, sizeof(*fixture->socks));
+    fixture->pending_nodes = (ep_ready_node_t **)calloc(
+        fixture->count, sizeof(*fixture->pending_nodes));
+    if (fixture->socks == NULL || fixture->pending_nodes == NULL ||
+        ep_port_create((int)fixture->count, 0, &fixture->port) != 0) {
+        large_wait_fixture_close(fixture);
+        return -1;
+    }
+
+    pthread_mutex_lock(&fixture->port->fd_table_lock);
+    for (size_t i = 0; i < fixture->count; i++) {
+        ep_sock_t *sock = (ep_sock_t *)calloc(1, sizeof(*sock));
+
+        if (sock == NULL) {
+            pthread_mutex_unlock(&fixture->port->fd_table_lock);
+            large_wait_fixture_close(fixture);
+            return -1;
+        }
+        fixture->socks[i] = sock;
+        sock->fd = (SOCKET)(LARGE_WAIT_FD_BASE + i);
+        sock->base_socket = sock->fd;
+        sock->kind = EP_REG_WAITABLE;
+        sock->waitable_semantics = EP_WAITABLE_PERSISTENT;
+        sock->user_events = EPOLLIN;
+        sock->user_flags = EPOLLONESHOT;
+        sock->port = fixture->port;
+        sock->generation = i + 1;
+        sock->exclusive_claim_base = INVALID_SOCKET;
+        atomic_init(&sock->state, EP_SOCK_REGISTERED);
+        atomic_init(&sock->poll_status, EP_POLL_IDLE);
+        atomic_init(&sock->delete_pending, 0);
+        atomic_init(&sock->ready_queued, 0);
+        atomic_init(&sock->callback_active, 0);
+        atomic_init(&sock->completion_posted, 0);
+        atomic_init(&sock->waitable_notification_owned, 0);
+        sock->oneshot_fired = 1;
+
+        if (large_wait_table_insert(fixture->port, sock) != 0) {
+            free(sock);
+            fixture->socks[i] = NULL;
+            pthread_mutex_unlock(&fixture->port->fd_table_lock);
+            large_wait_fixture_close(fixture);
+            ep_set_errno(EIO);
+            return -1;
+        }
+
+        sock->prev = previous;
+        if (previous != NULL) {
+            previous->next = sock;
+        } else {
+            fixture->port->sock_list_head = sock;
+        }
+        previous = sock;
+
+        sock->oneshot_prev = previous_oneshot;
+        if (previous_oneshot != NULL) {
+            previous_oneshot->oneshot_next = sock;
+        } else {
+            fixture->port->oneshot_head = sock;
+        }
+        previous_oneshot = sock;
+        fixture->port->oneshot_tail = sock;
+        fixture->port->oneshot_fired_count++;
+    }
+    fixture->port->next_sock_generation = fixture->count;
+    if (!ep_port_worklists_valid_locked(fixture->port)) {
+        pthread_mutex_unlock(&fixture->port->fd_table_lock);
+        large_wait_fixture_close(fixture);
+        ep_set_errno(EIO);
+        return -1;
+    }
+    pthread_mutex_unlock(&fixture->port->fd_table_lock);
+    return 0;
+}
+
+static uint64_t large_wait_timestamp(size_t index)
+{
+    return LARGE_WAIT_TIMESTAMP_TAG | (uint64_t)index;
+}
+
+static int large_wait_prepare(large_wait_fixture_t *fixture,
+                              uint64_t data_base,
+                              size_t initial_publish)
+{
+    if (initial_publish > fixture->count ||
+        atomic_load_explicit(&fixture->port->ready_queue.queued,
+                             memory_order_relaxed) != 0) {
+        ep_set_errno(EIO);
+        return -1;
+    }
+    for (size_t i = 0; i < fixture->count; i++) {
+        ep_ready_node_t *node;
+
+        if (fixture->pending_nodes[i] != NULL) {
+            ep_set_errno(EIO);
+            return -1;
+        }
+        node = ep_ready_node_alloc(fixture->port);
+        if (node == NULL) {
+            return -1;
+        }
+        fixture->pending_nodes[i] = node;
+        node->data.u64 = data_base + i;
+        node->user_ctx = fixture->socks[i];
+        node->fd = fixture->socks[i]->fd;
+        node->sock_generation = fixture->socks[i]->generation;
+        node->events = EPOLLIN;
+        node->flags = WEPOLL_FLAG_ONESHOT_FIRED;
+        node->timestamp = large_wait_timestamp(i);
+    }
+
+    pthread_mutex_lock(&fixture->port->fd_table_lock);
+    for (size_t i = 0; i < fixture->count; i++) {
+        ep_sock_t *sock = fixture->socks[i];
+
+        sock->user_data.u64 = data_base + i;
+        sock->user_ctx = sock;
+        sock->pending_events = EPOLLIN;
+        sock->needs_rearm = 0;
+        atomic_store_explicit(&sock->state, EP_SOCK_READY,
+                              memory_order_relaxed);
+        atomic_store_explicit(&sock->ready_queued, 1,
+                              memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&fixture->port->fd_table_lock);
+
+    for (size_t i = 0; i < initial_publish; i++) {
+        ep_ready_push(&fixture->port->ready_queue,
+                      fixture->pending_nodes[i]);
+        fixture->pending_nodes[i] = NULL;
+    }
+    fixture->feed_index = initial_publish;
+    fixture->feed_calls = 0;
+    fixture->feed_chunk = LARGE_WAIT_FEED_CHUNK;
+    fixture->feed_delay_ms = 0;
+    fixture->control = NULL;
+    fixture->feed_invalid = 0;
+    return 0;
+}
+
+static DWORD WINAPI large_wait_control_thread(void *parameter)
+{
+    large_wait_control_context_t *context =
+        (large_wait_control_context_t *)parameter;
+    DWORD wait_result;
+    int targets_drained;
+    int operation_result;
+
+    wait_result = WaitForSingleObject(context->start_event, 5000);
+    if (wait_result != WAIT_OBJECT_0) {
+        atomic_store_explicit(&context->worker_error, 1,
+                              memory_order_release);
+        (void)SetEvent(context->done_event);
+        return 1;
+    }
+
+    atomic_store_explicit(
+        &context->saw_waiter_active,
+        atomic_load_explicit(&context->port->waiter_active,
+                             memory_order_acquire) != 0,
+        memory_order_release);
+    atomic_store_explicit(
+        &context->saw_waiter_coalescing,
+        atomic_load_explicit(&context->port->waiter_coalescing,
+                             memory_order_acquire) != 0,
+        memory_order_release);
+
+    pthread_mutex_lock(&context->port->fd_table_lock);
+    targets_drained =
+        atomic_load_explicit(&context->modify_sock->state,
+                             memory_order_relaxed) == EP_SOCK_REGISTERED &&
+        atomic_load_explicit(&context->modify_sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        context->modify_sock->pending_events == 0 &&
+        context->modify_sock->oneshot_fired != 0 &&
+        atomic_load_explicit(&context->rearm_sock->state,
+                             memory_order_relaxed) == EP_SOCK_REGISTERED &&
+        atomic_load_explicit(&context->rearm_sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        context->rearm_sock->pending_events == 0 &&
+        context->rearm_sock->oneshot_fired != 0;
+    pthread_mutex_unlock(&context->port->fd_table_lock);
+    atomic_store_explicit(&context->saw_targets_drained, targets_drained,
+                          memory_order_release);
+
+    operation_result = ep_port_modify(
+        context->port, context->modify_sock->fd,
+        EPOLLIN, EPOLLONESHOT,
+        context->modify_data, context->modify_user_ctx);
+    atomic_store_explicit(&context->modify_result, operation_result,
+                          memory_order_release);
+    atomic_store_explicit(&context->modify_error,
+                          operation_result == 0 ? 0 : ep_last_err(),
+                          memory_order_release);
+
+    operation_result = ep_port_rearm(context->port,
+                                     context->rearm_sock->fd);
+    atomic_store_explicit(&context->rearm_result, operation_result,
+                          memory_order_release);
+    atomic_store_explicit(&context->rearm_error,
+                          operation_result == 0 ? 0 : ep_last_err(),
+                          memory_order_release);
+
+    if (!SetEvent(context->done_event)) {
+        atomic_store_explicit(&context->worker_error, 1,
+                              memory_order_release);
+        return 1;
+    }
+    return 0;
+}
+
+static BOOL WINAPI large_wait_dequeue_stub(
+    HANDLE completion_port,
+    OVERLAPPED_ENTRY *entries,
+    ULONG count,
+    PULONG removed,
+    DWORD milliseconds,
+    BOOL alertable)
+{
+    large_wait_fixture_t *fixture = large_wait_feed_fixture;
+    size_t end;
+
+    if (fixture == NULL || fixture->port == NULL ||
+        completion_port != fixture->port->iocp || entries == NULL ||
+        count == 0 || removed == NULL || milliseconds != 0 || alertable ||
+        fixture->feed_index >= fixture->count || fixture->feed_chunk == 0) {
+        if (fixture != NULL) fixture->feed_invalid = 1;
+        if (removed != NULL) *removed = 0;
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    if (fixture->control != NULL &&
+        atomic_exchange_explicit(&fixture->control->triggered, 1,
+                                 memory_order_acq_rel) == 0) {
+        atomic_store_explicit(&fixture->control->feed_calls_at_trigger,
+                              fixture->feed_calls,
+                              memory_order_release);
+        if (!atomic_load_explicit(&fixture->port->waiter_coalescing,
+                                  memory_order_acquire) ||
+            !SetEvent(fixture->control->start_event) ||
+            WaitForSingleObject(fixture->control->done_event, 5000) !=
+                WAIT_OBJECT_0) {
+            fixture->feed_invalid = 1;
+            *removed = 0;
+            SetLastError(ERROR_TIMEOUT);
+            return FALSE;
+        }
+    }
+
+    end = fixture->feed_index + fixture->feed_chunk;
+    if (end > fixture->count) end = fixture->count;
+    for (size_t i = fixture->feed_index; i < end; i++) {
+        if (fixture->pending_nodes[i] == NULL) {
+            fixture->feed_invalid = 1;
+            *removed = 0;
+            SetLastError(ERROR_INVALID_DATA);
+            return FALSE;
+        }
+    }
+    for (size_t i = fixture->feed_index; i < end; i++) {
+        ep_ready_push(&fixture->port->ready_queue,
+                      fixture->pending_nodes[i]);
+        fixture->pending_nodes[i] = NULL;
+    }
+    fixture->feed_index = end;
+    fixture->feed_calls++;
+    if (fixture->feed_delay_ms != 0) {
+        Sleep(fixture->feed_delay_ms);
+    }
+    memset(&entries[0], 0, sizeof(entries[0]));
+    *removed = 1;
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+static int large_wait_install_feed(large_wait_fixture_t *fixture)
+{
+    if (large_wait_feed_fixture != NULL || fixture->hook_installed ||
+        fixture->feed_index >= fixture->count) {
+        ep_set_errno(EIO);
+        return -1;
+    }
+    fixture->original_dequeue =
+        fixture->port->get_queued_completion_status_ex;
+    fixture->port->get_queued_completion_status_ex =
+        large_wait_dequeue_stub;
+    fixture->hook_installed = 1;
+    large_wait_feed_fixture = fixture;
+    return 0;
+}
+
+static int large_wait_publish_pending(large_wait_fixture_t *fixture)
+{
+    for (size_t i = fixture->feed_index; i < fixture->count; i++) {
+        if (fixture->pending_nodes[i] == NULL) {
+            ep_set_errno(EIO);
+            return -1;
+        }
+    }
+    for (size_t i = fixture->feed_index; i < fixture->count; i++) {
+        ep_ready_push(&fixture->port->ready_queue,
+                      fixture->pending_nodes[i]);
+        fixture->pending_nodes[i] = NULL;
+    }
+    fixture->feed_index = fixture->count;
+    return 0;
+}
+
+static int large_wait_validate_extended(
+    const large_wait_fixture_t *fixture,
+    const epoll_event_ex *events,
+    size_t event_count,
+    uint64_t data_base)
+{
+    unsigned char *seen = (unsigned char *)calloc(fixture->count, 1);
+    int result = -1;
+
+    if (seen == NULL) return -1;
+    for (size_t i = 0; i < event_count; i++) {
+        uint64_t value = events[i].data.u64;
+        size_t index;
+
+        if (value < data_base || value - data_base >= fixture->count) {
+            goto cleanup;
+        }
+        index = (size_t)(value - data_base);
+        if (seen[index] || events[i].events != EPOLLIN ||
+            events[i].flags != WEPOLL_FLAG_ONESHOT_FIRED ||
+            events[i].timestamp != large_wait_timestamp(index) ||
+            events[i].user_ctx != fixture->socks[index]) {
+            goto cleanup;
+        }
+        seen[index] = 1;
+    }
+    result = 0;
+
+cleanup:
+    free(seen);
+    if (result != 0) ep_set_errno(EIO);
+    return result;
+}
+
+static int large_wait_all_drained(large_wait_fixture_t *fixture)
+{
+    int valid = atomic_load_explicit(&fixture->port->ready_queue.queued,
+                                     memory_order_relaxed) == 0;
+
+    pthread_mutex_lock(&fixture->port->fd_table_lock);
+    for (size_t i = 0; valid && i < fixture->count; i++) {
+        ep_sock_t *sock = fixture->socks[i];
+
+        valid = atomic_load_explicit(&sock->state,
+                                     memory_order_relaxed) ==
+                    EP_SOCK_REGISTERED &&
+            atomic_load_explicit(&sock->ready_queued,
+                                 memory_order_relaxed) == 0 &&
+            sock->pending_events == 0 && sock->needs_rearm == 0 &&
+            sock->oneshot_fired != 0;
+    }
+    valid = valid && ep_port_worklists_valid_locked(fixture->port);
+    pthread_mutex_unlock(&fixture->port->fd_table_lock);
+    return valid;
+}
+
+static int large_wait_guard_unchanged(const struct epoll_event *guard)
+{
+    const unsigned char *bytes = (const unsigned char *)guard;
+
+    for (size_t i = 0; i < sizeof(*guard); i++) {
+        if (bytes[i] != 0xa5U) return 0;
+    }
+    return 1;
+}
+
+static int test_large_wait(void)
+{
+    static const uint64_t coalesced_base =
+        UINT64_C(0x4c57010000000000);
+    static const uint64_t residue_base =
+        UINT64_C(0x4c57020000000000);
+    static const uint64_t basic_base =
+        UINT64_C(0x4c57030000000000);
+    static const uint64_t budget_base =
+        UINT64_C(0x4c57040000000000);
+    static const uint64_t control_base =
+        UINT64_C(0x4c57050000000000);
+    static const uint64_t modified_data =
+        UINT64_C(0x4c57f00000000000);
+    large_wait_fixture_t fixture;
+    large_wait_control_context_t control;
+    epoll_event_ex *extended = NULL;
+    struct epoll_event *basic_storage = NULL;
+    struct epoll_event *basic;
+    ep_wait_timeout_t timeout;
+    HANDLE control_thread = NULL;
+    DWORD control_thread_exit = 1;
+    uint64_t modify_generation;
+    uint64_t rearm_generation;
+    uint64_t rearm_visits;
+    uint64_t oneshot_visits;
+    size_t queued;
+    size_t budget_first_count;
+    int state_ok;
+    int wait_result;
+    int result = -1;
+
+    large_wait_fixture_reset(&fixture);
+    memset(&control, 0, sizeof(control));
+    atomic_init(&control.triggered, 0);
+    atomic_init(&control.feed_calls_at_trigger, 0);
+    atomic_init(&control.worker_error, 0);
+    atomic_init(&control.saw_waiter_active, 0);
+    atomic_init(&control.saw_waiter_coalescing, 0);
+    atomic_init(&control.saw_targets_drained, 0);
+    atomic_init(&control.modify_result, -2);
+    atomic_init(&control.modify_error, 0);
+    atomic_init(&control.rearm_result, -2);
+    atomic_init(&control.rearm_error, 0);
+    extended = (epoll_event_ex *)calloc(
+        LARGE_WAIT_EVENT_COUNT, sizeof(*extended));
+    basic_storage = (struct epoll_event *)malloc(
+        (LARGE_WAIT_EVENT_COUNT + 2U) * sizeof(*basic_storage));
+    if (extended == NULL || basic_storage == NULL ||
+        large_wait_fixture_open(&fixture) != 0) {
+        goto cleanup;
+    }
+
+    if (large_wait_prepare(&fixture, coalesced_base,
+                           LARGE_WAIT_FEED_CHUNK) != 0 ||
+        large_wait_install_feed(&fixture) != 0) {
+        goto cleanup;
+    }
+    memset(extended, 0,
+           LARGE_WAIT_EVENT_COUNT * sizeof(*extended));
+    wait_result = ep_port_wait(fixture.port, extended,
+                               (int)LARGE_WAIT_EVENT_COUNT, 2000, NULL);
+    large_wait_uninstall_feed(&fixture);
+    if (wait_result != (int)LARGE_WAIT_EVENT_COUNT ||
+        fixture.feed_index != fixture.count || fixture.feed_calls < 2 ||
+        fixture.feed_invalid ||
+        large_wait_validate_extended(&fixture, extended,
+                                     fixture.count,
+                                     coalesced_base) != 0 ||
+        !large_wait_all_drained(&fixture)) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    if (large_wait_prepare(&fixture, residue_base,
+                           fixture.count) != 0) {
+        goto cleanup;
+    }
+    memset(extended, 0,
+           LARGE_WAIT_EVENT_COUNT * sizeof(*extended));
+    wait_result = ep_port_wait(fixture.port, extended, 4096, 0, NULL);
+    queued = atomic_load_explicit(&fixture.port->ready_queue.queued,
+                                  memory_order_relaxed);
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok = queued == 1;
+    for (size_t i = 0; state_ok && i < fixture.count; i++) {
+        int expected_ready = i == fixture.count - 1;
+        ep_sock_t *sock = fixture.socks[i];
+
+        state_ok =
+            (atomic_load_explicit(&sock->ready_queued,
+                                  memory_order_relaxed) != 0) ==
+                expected_ready &&
+            atomic_load_explicit(&sock->state,
+                                 memory_order_relaxed) ==
+                (expected_ready ? EP_SOCK_READY : EP_SOCK_REGISTERED) &&
+            sock->pending_events ==
+                (expected_ready ? EPOLLIN : 0);
+    }
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (wait_result != 4096 || !state_ok ||
+        large_wait_validate_extended(&fixture, extended, 4096,
+                                     residue_base) != 0) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+    memset(&extended[0], 0, sizeof(extended[0]));
+    if (ep_port_wait(fixture.port, &extended[0], 1, 0, NULL) != 1 ||
+        extended[0].events != EPOLLIN ||
+        extended[0].data.u64 !=
+            residue_base + LARGE_WAIT_EVENT_COUNT - 1U ||
+        extended[0].flags != WEPOLL_FLAG_ONESHOT_FIRED ||
+        extended[0].timestamp !=
+            large_wait_timestamp(LARGE_WAIT_EVENT_COUNT - 1U) ||
+        extended[0].user_ctx !=
+            fixture.socks[LARGE_WAIT_EVENT_COUNT - 1U] ||
+        !large_wait_all_drained(&fixture)) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    if (large_wait_prepare(&fixture, budget_base, 1) != 0) {
+        goto cleanup;
+    }
+    fixture.feed_chunk = 1;
+    fixture.feed_delay_ms = 1;
+    if (large_wait_install_feed(&fixture) != 0) {
+        goto cleanup;
+    }
+    memset(extended, 0,
+           LARGE_WAIT_EVENT_COUNT * sizeof(*extended));
+    wait_result = ep_port_wait(fixture.port, extended,
+                               (int)LARGE_WAIT_EVENT_COUNT, 2000, NULL);
+    large_wait_uninstall_feed(&fixture);
+    if (wait_result != (int)(1U + LARGE_WAIT_BUDGET_DEQUEUES) ||
+        fixture.feed_calls != LARGE_WAIT_BUDGET_DEQUEUES ||
+        fixture.feed_index != 1U + LARGE_WAIT_BUDGET_DEQUEUES ||
+        fixture.feed_invalid ||
+        large_wait_validate_extended(&fixture, extended,
+                                     (size_t)wait_result,
+                                     budget_base) != 0) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+    budget_first_count = (size_t)wait_result;
+    if (large_wait_publish_pending(&fixture) != 0) {
+        goto cleanup;
+    }
+    wait_result = ep_port_wait(
+        fixture.port, &extended[budget_first_count],
+        (int)(fixture.count - budget_first_count), 0, NULL);
+    if (wait_result != (int)(fixture.count - budget_first_count) ||
+        large_wait_validate_extended(&fixture, extended, fixture.count,
+                                     budget_base) != 0 ||
+        !large_wait_all_drained(&fixture)) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    if (sizeof(struct epoll_event) != 12U ||
+        offsetof(struct epoll_event, data) != 4U) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+    if (large_wait_prepare(&fixture, basic_base,
+                           LARGE_WAIT_FEED_CHUNK) != 0 ||
+        large_wait_install_feed(&fixture) != 0) {
+        goto cleanup;
+    }
+    memset(basic_storage, 0xa5,
+           (LARGE_WAIT_EVENT_COUNT + 2U) * sizeof(*basic_storage));
+    basic = &basic_storage[1];
+    ep_wait_timeout_from_milliseconds(2000, &timeout);
+    wait_result = ep_port_wait_basic_timeout(
+        fixture.port, basic, (int)LARGE_WAIT_EVENT_COUNT, &timeout, NULL);
+    large_wait_uninstall_feed(&fixture);
+    if (wait_result != (int)LARGE_WAIT_EVENT_COUNT ||
+        fixture.feed_index != fixture.count || fixture.feed_calls < 2 ||
+        fixture.feed_invalid ||
+        !large_wait_guard_unchanged(&basic_storage[0]) ||
+        !large_wait_guard_unchanged(
+            &basic_storage[LARGE_WAIT_EVENT_COUNT + 1U]) ||
+        basic[4095].events != EPOLLIN ||
+        basic[4095].data.u64 != basic_base + 4095U ||
+        basic[4096].events != EPOLLIN ||
+        basic[4096].data.u64 != basic_base + 4096U ||
+        !large_wait_all_drained(&fixture)) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    if (large_wait_prepare(&fixture, control_base,
+                           LARGE_WAIT_CONTROL_INITIAL) != 0) {
+        goto cleanup;
+    }
+    control.port = fixture.port;
+    control.modify_sock = fixture.socks[0];
+    control.rearm_sock = fixture.socks[1];
+    control.modify_data.u64 = modified_data;
+    control.modify_user_ctx = &control;
+    control.start_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    control.done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (control.start_event == NULL || control.done_event == NULL) {
+        goto cleanup;
+    }
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    modify_generation = control.modify_sock->generation;
+    rearm_generation = control.rearm_sock->generation;
+    rearm_visits = fixture.port->rearm_work_visits;
+    oneshot_visits = fixture.port->oneshot_probe_visits;
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    control_thread = CreateThread(NULL, 0, large_wait_control_thread,
+                                  &control, 0, NULL);
+    if (control_thread == NULL) {
+        goto cleanup;
+    }
+    fixture.control = &control;
+    if (large_wait_install_feed(&fixture) != 0) {
+        goto cleanup;
+    }
+    memset(extended, 0,
+           LARGE_WAIT_EVENT_COUNT * sizeof(*extended));
+    wait_result = ep_port_wait(fixture.port, extended,
+                               (int)LARGE_WAIT_EVENT_COUNT, 2000, NULL);
+    large_wait_uninstall_feed(&fixture);
+    fixture.control = NULL;
+    if (WaitForSingleObject(control_thread, 5000) != WAIT_OBJECT_0 ||
+        !GetExitCodeThread(control_thread, &control_thread_exit)) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+    CloseHandle(control_thread);
+    control_thread = NULL;
+    CloseHandle(control.done_event);
+    control.done_event = NULL;
+    CloseHandle(control.start_event);
+    control.start_event = NULL;
+
+    if (wait_result != (int)fixture.count ||
+        fixture.feed_index != fixture.count || fixture.feed_calls < 2 ||
+        fixture.feed_invalid || control_thread_exit != 0 ||
+        atomic_load_explicit(&control.triggered,
+                             memory_order_acquire) != 1 ||
+        atomic_load_explicit(&control.feed_calls_at_trigger,
+                             memory_order_acquire) != 0 ||
+        atomic_load_explicit(&control.worker_error,
+                             memory_order_acquire) != 0 ||
+        atomic_load_explicit(&control.saw_waiter_active,
+                             memory_order_acquire) == 0 ||
+        atomic_load_explicit(&control.saw_waiter_coalescing,
+                             memory_order_acquire) == 0 ||
+        atomic_load_explicit(&control.saw_targets_drained,
+                             memory_order_acquire) == 0 ||
+        atomic_load_explicit(&control.modify_result,
+                             memory_order_acquire) != 0 ||
+        atomic_load_explicit(&control.modify_error,
+                             memory_order_acquire) != 0 ||
+        atomic_load_explicit(&control.rearm_result,
+                             memory_order_acquire) != 0 ||
+        atomic_load_explicit(&control.rearm_error,
+                             memory_order_acquire) != 0 ||
+        large_wait_validate_extended(&fixture, extended, fixture.count,
+                                     control_base) != 0) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    queued = atomic_load_explicit(&fixture.port->ready_queue.queued,
+                                  memory_order_relaxed);
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok = queued == 0 && fixture.port->pending_poll_count == 0 &&
+        fixture.port->needs_rearm_count == 2 &&
+        fixture.port->rearm_head == control.modify_sock &&
+        fixture.port->rearm_tail == control.rearm_sock &&
+        control.modify_sock->rearm_prev == NULL &&
+        control.modify_sock->rearm_next == control.rearm_sock &&
+        control.rearm_sock->rearm_prev == control.modify_sock &&
+        control.rearm_sock->rearm_next == NULL &&
+        fixture.port->oneshot_fired_count == fixture.count - 2U &&
+        fixture.port->rearm_work_visits == rearm_visits &&
+        fixture.port->oneshot_probe_visits == oneshot_visits &&
+        control.modify_sock->generation != modify_generation &&
+        control.rearm_sock->generation != rearm_generation &&
+        control.modify_sock->user_events == EPOLLIN &&
+        control.modify_sock->user_flags == EPOLLONESHOT &&
+        control.modify_sock->user_data.u64 == modified_data &&
+        control.modify_sock->user_ctx == &control;
+    for (size_t i = 0; state_ok && i < fixture.count; i++) {
+        ep_sock_t *sock = fixture.socks[i];
+        int controlled = i < LARGE_WAIT_CONTROL_INITIAL;
+
+        state_ok =
+            atomic_load_explicit(&sock->state,
+                                 memory_order_relaxed) ==
+                EP_SOCK_REGISTERED &&
+            atomic_load_explicit(&sock->poll_status,
+                                 memory_order_relaxed) == EP_POLL_IDLE &&
+            atomic_load_explicit(&sock->ready_queued,
+                                 memory_order_relaxed) == 0 &&
+            atomic_load_explicit(&sock->callback_active,
+                                 memory_order_relaxed) == 0 &&
+            atomic_load_explicit(&sock->completion_posted,
+                                 memory_order_relaxed) == 0 &&
+            sock->wait_registration == NULL && sock->pending_events == 0 &&
+            (sock->needs_rearm != 0) == controlled &&
+            (sock->oneshot_fired == 0) == controlled;
+    }
+    state_ok = state_ok && ep_port_worklists_valid_locked(fixture.port);
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok ||
+        atomic_load_explicit(&fixture.port->waiter_active,
+                             memory_order_acquire) != 0 ||
+        atomic_load_explicit(&fixture.port->waiter_coalescing,
+                             memory_order_acquire) != 0) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    result = 0;
+
+cleanup:
+    fixture.control = NULL;
+    large_wait_uninstall_feed(&fixture);
+    if (control.start_event != NULL) {
+        (void)SetEvent(control.start_event);
+    }
+    if (control_thread != NULL) {
+        if (WaitForSingleObject(control_thread, 5000) != WAIT_OBJECT_0) {
+            (void)TerminateThread(control_thread, 1);
+            (void)WaitForSingleObject(control_thread, 5000);
+            result = -1;
+        }
+        CloseHandle(control_thread);
+    }
+    if (control.done_event != NULL) CloseHandle(control.done_event);
+    if (control.start_event != NULL) CloseHandle(control.start_event);
+    large_wait_fixture_close(&fixture);
+    free(basic_storage);
+    free(extended);
+    return result;
+}
+
 int main(int argc, char **argv)
 {
     WSADATA wsa_data;
@@ -2887,6 +3727,8 @@ int main(int argc, char **argv)
         result = test_aux_post_close_lease();
     } else if (strcmp(argv[1], "pipe-invalid-et") == 0) {
         result = test_pipe_invalid_et_snapshot();
+    } else if (strcmp(argv[1], "large-wait") == 0) {
+        result = test_large_wait();
     }
     (void)WSACleanup();
 

@@ -95,15 +95,28 @@ the nginx-embedded source build independent of a generated CMake header.
    guarantee scheduler wake latency. Long finite waits are accepted and use
    bounded IOCP chunks rather than overflowing a `DWORD` timeout. Integer
    `epoll_wait` and `epoll_pwait` retain their millisecond contract. Public
-   waits with a valid epoll descriptor validate the Linux UAPI `maxevents`
-   ceiling before the output pointer; `epoll_pwait2*` validates its timespec
-   first. The qualified x86-64 Windows
-   ABI uses Linux's packed 12-byte event-record ceiling (178,956,970), while
-   POSIX extension waits derive the ceiling from the host `epoll_event`.
-   One Windows wait returns at most 4096 events, so the caller's upper bound
-   does not force a proportional allocation. Durations
-   too large for the internal 100-nanosecond representation bypass the precise
-   timer and retain the longer millisecond/chunked deadline.
+   standard waits with a valid epoll descriptor validate the Linux UAPI
+   `maxevents` ceiling before the output pointer; extended waits additionally
+   bound the larger output array by `SIZE_MAX`, which is tighter on 32-bit
+   targets. `epoll_pwait2*` validates its timespec first. The qualified x86-64
+   Windows ABI uses Linux's packed 12-byte event-record ceiling (178,956,970)
+   for both forms, while POSIX extension waits derive the standard ceiling
+   from the host `epoll_event`.
+   Windows writes either packed basic records or extended records directly to
+   the caller's array, so a legal wait can return beyond 4096 without a
+   proportional conversion allocation. For requests above 4096, the
+   single-consumer wait may append already-queued IOCP batches after the first
+   readiness snapshot without running another arm pass; this prevents ordinary
+   LT registrations from being resubmitted and duplicated within the logical
+   call. Every timeout mode bounds this append phase by both elapsed work and
+   dequeue count (currently 10 ms after at least 64 dequeues, with an absolute
+   128-dequeue ceiling), so an active completion stream can produce a partial
+   result rather than monopolize the waiter. Once the first snapshot is
+   selected under the fd-table lock, a concurrent MOD or `epoll_rearm()` of
+   that already selected registration leaves its replacement generation on the
+   deferred-rearm worklist for the next wait. Durations too large for the
+   internal 100-nanosecond representation bypass the precise timer and retain
+   the longer millisecond/chunked deadline.
    Level-triggered registrations are armed again on a later wait; oneshot
    registrations require MOD or `epoll_rearm()`. Failures discovered during
    completion processing or deferred rearming are latched and wake the wait
@@ -149,12 +162,13 @@ The ready queue is single-consumer MPSC. Producers append without a mutex; the
 consumer uses a sentinel before reclaiming nodes. Both AFD-buffer pools use a
 mutex-protected LIFO and grow with tracked fallback allocations.
 
-The Windows basic-wait adapter uses a 64-event stack buffer and allocates only
-for larger batches. Intrusive rearm and fired-oneshot worklists make the arm
-pass O(pending work), including the native-close probes required for fired
-oneshots; it does not scan every registration. List membership and visit
-counters are checked by internal invariants and a synthetic 50,000-node
-worklist regression that does not consume Winsock handles.
+The Windows wait sink writes packed basic records or full extended records
+directly, eliminating the former 64-event stack conversion and heap fallback.
+Intrusive rearm and fired-oneshot worklists make the arm pass O(pending work),
+including the native-close probes required for fired oneshots; it does not scan
+every registration. List membership and visit counters are checked by internal
+invariants and a synthetic 50,000-node worklist regression that does not
+consume Winsock handles.
 
 ## Linux path
 

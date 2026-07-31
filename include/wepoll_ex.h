@@ -250,11 +250,14 @@ WEPOLL_EX_API int  epoll_ctl_ctx(int epfd, int op, epoll_fd_t fd,
 /* epoll_wait that returns extended events.  POSIX waits use a stable
  * duplicate of the tracked epoll descriptor so wepoll_close() can wake a
  * blocked extended wait and make it fail with EBADF. Legal maxevents values
- * are Linux-UAPI bounds, not proportional internal allocation requests. */
+ * are bounded by both the Linux UAPI record count and the addressable size of
+ * the larger epoll_event_ex array; they are not proportional internal
+ * allocation requests. */
 WEPOLL_EX_API int  epoll_wait_ex(int epfd, struct epoll_event_ex *events,
                                  int maxevents, int timeout);
 
-/* epoll_pwait2 that returns extended events.  POSIX applies a non-NULL signal
+/* epoll_pwait2 that returns extended events and uses the same maxevents bounds
+ * as epoll_wait_ex.  POSIX applies a non-NULL signal
  * mask through native epoll_pwait2, or per chunk through epoll_pwait with an
  * inter-chunk signal bridge. Windows accepts and ignores a non-null mask
  * pointer. Positive finite Windows waits use an optional high-resolution

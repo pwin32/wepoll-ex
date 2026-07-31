@@ -239,18 +239,37 @@ path, and an error behind a parked unread datagram remains unavailable until
 the payload is drained and the registration is refreshed (DEL/ADD for an
 exclusive registration).
 
-The later July 31, 2026 qualification used Linux/WSL GCC 14.2 and Windows
-10.0.19044 with MSYS2 MinGW GCC 15.2 under `-O2 -Wall -Wextra -Wpedantic
--Werror`. POSIX native and forced-`epoll_pwait2`-fallback Release suites passed
-4/4 each, API/pool tests passed five repeats, and ASan/UBSan passed 3/3. The
-seven MinGW best-effort combined, static-only, shared-only, strict combined,
-strict shared-only, synchronized combined, and synchronized shared-only lanes
-contained 163, 161, 94, 163, 94, 163, and 94 tests. Their passed/skipped counts
-were 162/1, 160/1, 93/1, 162/1, 93/1, 158/5, and 89/5. Three repeats of every
-applicable focused UDP, socket-event, waitable, pipe, API, stress, backpressure,
-compatibility, timing, state, and fault subset passed. The only general skip
-was the host-dependent IPv4 ICMP/reset probe; synchronized mode also skipped
-the four native-reuse identity cases required by its DEL-before-close contract.
+The final July 31, 2026 qualification for this slice used Linux/WSL GCC 14.2
+and Windows 10.0.19044 with MSYS2 MinGW GCC 15.2 under `-O2 -Wall -Wextra
+-Wpedantic -Werror`. POSIX native and forced-`epoll_pwait2`-fallback Release
+suites passed 4/4 each, API/pool tests passed five repeats, and ASan/UBSan
+passed 3/3. The seven MinGW best-effort combined, static-only, shared-only,
+strict combined, strict shared-only, synchronized combined, and synchronized
+shared-only lanes contained 164, 162, 94, 164, 94, 164, and 94 tests. Their
+passed/skipped counts were 164/0, 162/0, 94/0, 164/0, 94/0, 160/4, and 90/4.
+Three repeats of every applicable focused UDP, socket-event, waitable, pipe,
+API, stress, backpressure, compatibility, timing, state, and fault subset
+passed (65 selections in combined/static lanes and 48 in shared-only lanes).
+Synchronized mode skipped only the four native-reuse identity cases required
+by its DEL-before-close contract.
+
+Windows waits now honor legal `maxevents` values beyond 4096 as a real return
+capacity rather than silently imposing that internal ceiling. The port's
+single wait/drain operation writes either Linux-layout basic records or full
+extended records directly into the caller array, removing the basic wait's
+conversion stack/heap allocation. Large requests can append already-queued
+IOCP batches without an intervening arm pass, so continuously ready LT
+registrations are not resubmitted and duplicated inside the call. Coalescing
+uses nonblocking dequeues, preserves ready-before-deferred-error ordering, and
+is bounded by elapsed work and dequeue count for every timeout mode, so an
+active completion stream may produce a partial result. MOD and
+`epoll_rearm()` of an already selected registration defer their replacement
+generation until the next wait, preventing duplicate generations in one
+logical result. POSIX extension waits
+remain capped at 4096 per call because repeated native waits expose only opaque
+`epoll_data` and cannot reliably deduplicate registrations. Extended waits
+also reject a count whose `epoll_event_ex` array size would overflow `SIZE_MAX`;
+this only tightens the standard Linux-record ceiling on 32-bit targets.
 
 Windows socket lifetime is now an explicit CMake policy:
 `WEPOLL_EX_SOCKET_LIFETIME_MODE=best-effort|strict|synchronized`.
@@ -519,8 +538,8 @@ may combine with `EPOLLET`, but not with
 descriptors cannot be nested, socket `EPOLLRDBAND` and `EPOLLWRBAND` interests
 are accepted but inert, `EPOLLMSG` is not emitted, `SO_OOBINLINE` collapses
 priority into ordinary readability, UDP receive-side errors have the
-synchronous-socket, uninterested-read, and receive-head caveats described
-above, unknown provider protocol metadata retains a conservative abort
+synchronous/layered-provider and parked receive-head caveats described above,
+unknown provider protocol metadata retains a conservative abort
 mapping, and pipe writable readiness can remain advisory
 when native local information is unavailable or access is denied. Pure
 write-only outbound named-pipe server handles are the known access-denied case.

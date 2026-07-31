@@ -67,7 +67,7 @@ configure_and_test()
     cmake --build "$build_dir" --parallel "$jobs"
     ctest --test-dir "$build_dir" --output-on-failure
     "$script_dir/repeat-ctest.sh" "$build_dir" "$repeat_count" \
-        'wepoll_ex_windows_(api|stress|backpressure|compat_concurrent_ctl|pwait2_(conversion|generation_deadline|readiness_wins|close|fallback)|pipe_.*|waitable_(zero_.*|timer_et|queued_rearm)|state_(waitable_(zero_(callback|ready)|queued_rearm)|udp_readless_(error|park|rollback))|fault_waitable_(ready_node_alloc|zero_disarm)|socket_events_(aliases|oob_(lt|et|oneshot|mod|inline_(lt|et))|udp_readless_data|udp_error_v6_(zero|err|out_et|readless_(et|oneshot)))|events_(mapping|status))$'
+        'wepoll_ex_windows_(api|stress|backpressure|compat_concurrent_ctl|pwait2_(conversion|generation_deadline|readiness_wins|close|fallback)|pipe_.*|waitable_(zero_.*|timer_et|queued_rearm)|state_(waitable_(zero_(callback|ready)|queued_rearm)|udp_readless_(error|park|rollback)|large_wait)|fault_waitable_(ready_node_alloc|zero_disarm)|socket_events_(aliases|oob_(lt|et|oneshot|mod|inline_(lt|et))|udp_readless_data|udp_error_v6_(zero|err|out_et|readless_(et|oneshot)))|events_(mapping|status))$'
 }
 
 if variant_enabled combined; then
