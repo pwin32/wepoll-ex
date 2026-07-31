@@ -353,7 +353,7 @@ metadata reference before unwinding.
   `EPOLLPRI` indication. `EPOLLMSG` is accepted but AFD has no event class that
   produces it. UDP IPv4/IPv6 readiness is covered publicly. For a confirmed
   UDP socket whose cached provider-file mode permits overlapped I/O, each
-  requested normal-read AFD completion is qualified with a one-byte direct
+  successful AFD receive completion is qualified with a one-byte direct
   `IOCTL_AFD_RECV` normal-plus-peek request issued through `DeviceIoControl`.
   Eligibility requires an unlayered base-provider protocol chain because this
   native request bypasses Winsock provider transformations. Each request
@@ -364,14 +364,25 @@ metadata reference before unwinding.
   requested readable aliases without consuming the datagram; an asynchronous
   network receive error removes those aliases and contributes
   exact unrequested `EPOLLERR` without HUP. A pending probe is cancelled and
-  joined before its stack state is released. IPv4/IPv6 connected-UDP ICMP
+  joined before its stack state is released. A qualifier-safe registration
+  without `EPOLLIN`/`EPOLLRDNORM` adds an internal `AFD_POLL_RECEIVE` bit so
+  receive-queue errors remain implicit. An ordinary unread datagram is
+  suppressed and parks that bit; completion immediately rearms the remaining
+  terminal interests even for ET, avoiding a persistent IOCP receive loop.
+  MOD and ONESHOT rearm clear the parked state and perform a fresh scan, with
+  full submit-failure rollback. The internal receive submission disables
+  native AFD exclusivity so it cannot cancel another registration's legitimate
+  read poll; process-local terminal claims still arbitrate error delivery.
+  IPv4/IPv6 connected-UDP ICMP
   probes require repeated LT `EPOLLERR`, then `recv() == WSAECONNRESET`, when
   `SIO_UDP_CONNRESET`, the provider, and host firewall expose the condition.
   A synchronous/non-overlapped socket, a layered provider, or a provider that
   returns a recognized unsupported-operation error for the reverse-engineered
   receive request retains the legacy AFD readable mapping. Receive-class errors
-  are not yet armed without `EPOLLIN`/`EPOLLRDNORM`, and an error behind an
-  unread datagram is visible only after that datagram leaves the receive head.
+  behind an unread datagram remain indistinguishable without consuming or
+  reordering it. Once the application drains that receive head, MOD refreshes a
+  parked readless registration; an exclusive registration requires DEL/ADD
+  because Linux-compatible exclusive MOD is rejected.
 - Socket `EPOLLET` is implemented as an observed-edge filter over AFD level
   snapshots: each interest bit is delivered once while continuously true, then
   suppressed until it drops out of the latest level and reappears. Empty edge
@@ -382,9 +393,12 @@ metadata reference before unwinding.
   ADD. It may be combined with `EPOLLET`, but not with `EPOLLONESHOT`,
   `EPOLLRDHUP`, or unsupported event bits. Every MOD of a registration added
   exclusive fails with `EINVAL`, even if the MOD mask omits `EPOLLEXCLUSIVE`.
-  AFD requests use `Exclusive=TRUE`; a process-wide claim filter tracks read,
-  write, and terminal readiness classes independently and removes only the
-  conflicting classes from mixed snapshots. A covering AFD submission that
+  AFD requests normally use `Exclusive=TRUE`; the temporary hidden receive
+  probe for readless UDP is submitted non-exclusive so an ordinary datagram
+  cannot cancel a peer read poll. This temporarily weakens cross-process native
+  exclusivity for a mixed readless request. A process-wide claim filter tracks
+  read, write, and terminal readiness classes independently and removes only
+  the conflicting classes from mixed snapshots. A covering AFD submission that
   returns `STATUS_PENDING`, or a zero-time sample proving one direction
   inactive, releases the corresponding class claims. Each live registration
   embeds one intrusive claim node whose class bitset is indexed through fixed

@@ -450,9 +450,16 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
     info->NumberOfHandles   = 1;
     /* Exclusive AFD polls cancel peer non-exclusive/exclusive requests for
      * the same provider handle, approximating Linux EPOLLEXCLUSIVE wake
-     * uniqueness among wepoll-ex instances watching the same socket. */
-    info->Exclusive         = (sock->user_flags & EPOLLEXCLUSIVE) != 0
-                                  ? TRUE : FALSE;
+     * uniqueness among wepoll-ex instances watching the same socket.  A
+     * readless UDP receive bit is internal error qualification, however: an
+     * ordinary datagram must not let that hidden interest cancel a peer's
+     * legitimate read poll. */
+    info->Exclusive =
+        (sock->user_flags & EPOLLEXCLUSIVE) != 0 &&
+        !(sock->socket_protocol == EP_SOCKET_PROTOCOL_UDP &&
+          (sock->user_events & (EPOLLIN | EPOLLRDNORM)) == 0 &&
+          (afd_events & AFD_POLL_RECEIVE) != 0)
+            ? TRUE : FALSE;
     info->Handles[0].Handle = (HANDLE)sock->base_socket;
     info->Handles[0].Events = afd_events;
 

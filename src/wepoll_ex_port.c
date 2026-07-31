@@ -892,15 +892,6 @@ done:
     return capability;
 }
 
-typedef enum ep_udp_read_probe_result {
-    EP_UDP_READ_PROBE_UNAVAILABLE = -1,
-    EP_UDP_READ_PROBE_NOT_READY = 0,
-    EP_UDP_READ_PROBE_READY = 1,
-    EP_UDP_READ_PROBE_ERROR = 2,
-    EP_UDP_READ_PROBE_CLOSED = 3,
-    EP_UDP_READ_PROBE_IDENTITY_ERROR = 4
-} ep_udp_read_probe_result_t;
-
 static int ep_udp_probe_error_is_unavailable(DWORD error)
 {
     switch (error) {
@@ -2536,10 +2527,24 @@ static void ep_sock_drop_closed_locked(ep_port_t *port, ep_sock_t *sock)
     }
 }
 
-static uint32_t ep_sock_afd_events_locked(ep_sock_t *sock,
-                                          uint32_t user_events)
+static uint32_t ep_sock_afd_events_for_state_locked(
+    ep_sock_t *sock, uint32_t user_events,
+    uint8_t udp_readless_receive_parked)
 {
     uint32_t afd_events = ep_epoll_to_afd_events(user_events);
+
+    if (sock->socket_protocol == EP_SOCKET_PROTOCOL_UDP &&
+        sock->udp_afd_qualifier_eligible &&
+        sock->async_read_capability == EP_SOCKET_ASYNC_READ_SAFE &&
+        sock->port->udp_probe_event != NULL &&
+        sock->port->udp_probe_read != NULL &&
+        (user_events & (EPOLLIN | EPOLLRDNORM)) == 0 &&
+        !udp_readless_receive_parked) {
+        /* Windows exposes some connected-UDP receive errors only through the
+         * receive queue.  Probe that queue even without normal-read interest;
+         * completion filtering suppresses ordinary datagrams. */
+        afd_events |= AFD_POLL_RECEIVE;
+    }
 
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     if (sock->endpoint_id_state == EP_SOCKET_ID_TRANSITIONAL) {
@@ -2552,6 +2557,13 @@ static uint32_t ep_sock_afd_events_locked(ep_sock_t *sock,
     (void)sock;
 #endif
     return afd_events;
+}
+
+static uint32_t ep_sock_afd_events_locked(ep_sock_t *sock,
+                                          uint32_t user_events)
+{
+    return ep_sock_afd_events_for_state_locked(
+        sock, user_events, sock->udp_readless_receive_parked);
 }
 
 #ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
@@ -3019,6 +3031,7 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     uint32_t delivered = 0;
     uint32_t old_observed_events = 0;
     uint32_t old_poll_status;
+    int udp_receive_parked_now = 0;
 
     (void)bytes;
     pthread_mutex_lock(&port->fd_table_lock);
@@ -3161,10 +3174,11 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
 #endif
         if ((afd_events & AFD_POLL_RECEIVE) != 0 &&
             sock->afd_info->Handles[0].Status >= 0 &&
-            sock->socket_protocol == EP_SOCKET_PROTOCOL_UDP &&
-            (sock->user_events & (EPOLLIN | EPOLLRDNORM)) != 0) {
+            sock->socket_protocol == EP_SOCKET_PROTOCOL_UDP) {
+            int readless =
+                (sock->user_events & (EPOLLIN | EPOLLRDNORM)) == 0;
             ep_udp_read_probe_result_t probe =
-                ep_udp_probe_read_locked(sock, &udp_identity_error);
+                port->udp_probe_read(sock, &udp_identity_error);
 
             if (probe == EP_UDP_READ_PROBE_CLOSED) {
                 ep_sock_drop_closed_locked(port, sock);
@@ -3182,8 +3196,19 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
                 return;
             }
             if (probe == EP_UDP_READ_PROBE_NOT_READY ||
-                probe == EP_UDP_READ_PROBE_ERROR) {
+                probe == EP_UDP_READ_PROBE_ERROR ||
+                (readless &&
+                 (probe == EP_UDP_READ_PROBE_READY ||
+                  probe == EP_UDP_READ_PROBE_UNAVAILABLE))) {
                 afd_events &= ~AFD_POLL_RECEIVE;
+            }
+            if (readless &&
+                (probe == EP_UDP_READ_PROBE_READY ||
+                 probe == EP_UDP_READ_PROBE_UNAVAILABLE)) {
+                sock->udp_readless_receive_parked = 1;
+                udp_receive_parked_now = 1;
+            } else if (readless) {
+                sock->udp_readless_receive_parked = 0;
             }
             udp_probe_error = probe == EP_UDP_READ_PROBE_ERROR;
         }
@@ -3281,6 +3306,22 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     }
 
     if (delivered == 0) {
+        if (udp_receive_parked_now) {
+            /* An unread ordinary datagram is persistent AFD receive state.
+             * Rearm immediately without the hidden receive bit, including
+             * for ET, so the port remains covered for terminal conditions
+             * without repeatedly completing on the same datagram. */
+            sock->et_holdoff = 0;
+            ep_sock_set_needs_rearm_locked(sock, 1);
+            if (EP_SOCK_SUBMIT_LOCKED(sock, 0) < 0) {
+                int error = ep_last_err();
+
+                ep_sock_set_needs_rearm_locked(sock, 1);
+                ep_port_record_async_error_locked(port, error);
+            }
+            pthread_mutex_unlock(&port->fd_table_lock);
+            return;
+        }
         if (sock->kind == EP_REG_PIPE &&
             (sock->user_flags & EPOLLET) != 0 && pipe_snapshot.valid &&
             sock->pipe_terminal_delivered &&
@@ -3470,6 +3511,7 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     }
     port->get_queued_completion_status_ex = GetQueuedCompletionStatusEx;
     port->post_queued_completion_status = PostQueuedCompletionStatus;
+    port->udp_probe_read = ep_udp_probe_read_locked;
     {
         HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
 
@@ -4102,6 +4144,7 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     uint8_t old_oneshot_fired;
     uint8_t old_pipe_terminal_delivered;
     uint8_t old_et_holdoff;
+    uint8_t old_udp_readless_receive_parked;
     uint32_t old_waitable_notification_owned;
     int pending_poll_covers_request = 0;
     int new_waitable_dormant = 0;
@@ -4134,7 +4177,9 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
         }
     }
 
-    new_afd_events = ep_sock_afd_events_locked(sock, events);
+    /* Every MOD is a fresh readiness scan.  Compute the requested mask as if
+     * a previously parked readless UDP receive were active again. */
+    new_afd_events = ep_sock_afd_events_for_state_locked(sock, events, 0);
     poll_status = atomic_load_explicit(&sock->poll_status,
                                        memory_order_relaxed);
     if (poll_status == EP_POLL_PENDING) {
@@ -4178,6 +4223,8 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     old_needs_rearm = sock->needs_rearm;
     old_pipe_terminal_delivered = sock->pipe_terminal_delivered;
     old_et_holdoff = sock->et_holdoff;
+    old_udp_readless_receive_parked =
+        sock->udp_readless_receive_parked;
     old_waitable_notification_owned = atomic_load_explicit(
         &sock->waitable_notification_owned, memory_order_acquire);
     old_base_socket = sock->base_socket;
@@ -4225,6 +4272,7 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     sock->observed_events = 0;
     sock->pipe_terminal_delivered = 0;
     sock->et_holdoff = 0;
+    sock->udp_readless_receive_parked = 0;
     ep_sock_set_oneshot_fired_locked(sock, 0);
     if (transfer_waitable_notification) {
         atomic_store_explicit(&sock->waitable_notification_owned, 1,
@@ -4299,6 +4347,8 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
             ep_sock_set_needs_rearm_locked(sock, old_needs_rearm);
             sock->pipe_terminal_delivered = old_pipe_terminal_delivered;
             sock->et_holdoff = old_et_holdoff;
+            sock->udp_readless_receive_parked =
+                old_udp_readless_receive_parked;
             atomic_store_explicit(&sock->waitable_notification_owned,
                                   old_waitable_notification_owned,
                                   memory_order_release);
@@ -4384,6 +4434,7 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     uint8_t old_oneshot_fired;
     uint8_t old_pipe_terminal_delivered;
     uint8_t old_et_holdoff;
+    uint8_t old_udp_readless_receive_parked;
     uint32_t old_waitable_notification_owned;
 
     pthread_mutex_lock(&port->fd_table_lock);
@@ -4409,6 +4460,8 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     old_needs_rearm = sock->needs_rearm;
     old_pipe_terminal_delivered = sock->pipe_terminal_delivered;
     old_et_holdoff = sock->et_holdoff;
+    old_udp_readless_receive_parked =
+        sock->udp_readless_receive_parked;
     old_waitable_notification_owned = atomic_load_explicit(
         &sock->waitable_notification_owned, memory_order_acquire);
     old_base_socket = sock->base_socket;
@@ -4434,6 +4487,7 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     sock->observed_events = 0;
     sock->pipe_terminal_delivered = 0;
     sock->et_holdoff = 0;
+    sock->udp_readless_receive_parked = 0;
     ep_sock_set_needs_rearm_locked(sock, 1);
     atomic_store_explicit(&sock->ready_queued, 0, memory_order_relaxed);
     sock->generation = ++port->next_sock_generation;
@@ -4457,6 +4511,8 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
         ep_sock_set_needs_rearm_locked(sock, old_needs_rearm);
         sock->pipe_terminal_delivered = old_pipe_terminal_delivered;
         sock->et_holdoff = old_et_holdoff;
+        sock->udp_readless_receive_parked =
+            old_udp_readless_receive_parked;
         atomic_store_explicit(&sock->waitable_notification_owned,
                               old_waitable_notification_owned,
                               memory_order_release);
@@ -4484,8 +4540,9 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
 /* ------------------------------------------------------------------------- */
 
 static int ep_drain_to_buffer(ep_port_t *port,
-                              epoll_event_ex *out,
-                              int maxevents)
+                              void *out,
+                              int maxevents,
+                              int basic_events)
 {
     int delivered = 0;
 
@@ -4591,11 +4648,20 @@ static int ep_drain_to_buffer(ep_port_t *port,
         pthread_mutex_unlock(&port->fd_table_lock);
 
         if (valid) {
-            out[delivered].events = node->events;
-            out[delivered].data = node->data;
-            out[delivered].flags = node->flags;
-            out[delivered].timestamp = node->timestamp;
-            out[delivered].user_ctx = node->user_ctx;
+            if (basic_events) {
+                struct epoll_event *basic = (struct epoll_event *)out;
+
+                basic[delivered].events = node->events;
+                basic[delivered].data = node->data;
+            } else {
+                epoll_event_ex *extended = (epoll_event_ex *)out;
+
+                extended[delivered].events = node->events;
+                extended[delivered].data = node->data;
+                extended[delivered].flags = node->flags;
+                extended[delivered].timestamp = node->timestamp;
+                extended[delivered].user_ctx = node->user_ctx;
+            }
             delivered++;
         }
         ep_ready_node_free(port, node);
@@ -4745,9 +4811,11 @@ static int ep_wait_lock_acquire(ep_port_t *port,
     }
 }
 
-int ep_port_wait_timeout(ep_port_t *port, epoll_event_ex *out, int maxevents,
-                         const ep_wait_timeout_t *timeout,
-                         const wepoll_sigset_t *sigmask)
+static int ep_port_wait_timeout_impl(ep_port_t *port, void *out,
+                                     int maxevents,
+                                     const ep_wait_timeout_t *timeout,
+                                     const wepoll_sigset_t *sigmask,
+                                     int basic_events)
 {
     ep_wait_state_t wait_state;
     uint64_t zero_timeout_deadline = 0;
@@ -4835,9 +4903,9 @@ int ep_port_wait_timeout(ep_port_t *port, epoll_event_ex *out, int maxevents,
             break;
         }
 
-        result = ep_drain_to_buffer(port, out, maxevents);
+        result = ep_drain_to_buffer(port, out, maxevents, basic_events);
         if (result > 0) {
-            break;
+            goto coalesce;
         }
 
         pthread_mutex_lock(&port->fd_table_lock);
@@ -4853,7 +4921,7 @@ int ep_port_wait_timeout(ep_port_t *port, epoll_event_ex *out, int maxevents,
         if (arm_result != 0) {
             int arm_error = ep_last_err();
 
-            result = ep_drain_to_buffer(port, out, maxevents);
+            result = ep_drain_to_buffer(port, out, maxevents, basic_events);
             if (result <= 0) {
                 int wait_post_error = ep_port_take_iocp_post_error(port);
 
@@ -4871,9 +4939,9 @@ int ep_port_wait_timeout(ep_port_t *port, epoll_event_ex *out, int maxevents,
             break;
         }
 
-        result = ep_drain_to_buffer(port, out, maxevents);
+        result = ep_drain_to_buffer(port, out, maxevents, basic_events);
         if (result > 0) {
-            break;
+            goto coalesce;
         }
 
         DWORD wait_ms;
@@ -4983,8 +5051,36 @@ int ep_port_wait_timeout(ep_port_t *port, epoll_event_ex *out, int maxevents,
             zero_timeout_dequeues++;
         }
 
-        result = ep_drain_to_buffer(port, out, maxevents);
+        result = ep_drain_to_buffer(port, out, maxevents, basic_events);
         if (result > 0) {
+coalesce:
+            /* Linux can fill the caller's entire legal maxevents array.
+             * Once readiness exists, consume completion packets that are
+             * already queued and append their snapshots without another arm
+             * pass.  Drained registrations therefore cannot be resubmitted
+             * and duplicated within this call while large ready sets can
+             * cross the fixed-size IOCP dequeue batch. */
+            while (result < maxevents) {
+                ULONG coalesced = 0;
+                BOOL coalesce_ok = port->get_queued_completion_status_ex(
+                    port->iocp, port->iocp_entries, port->iocp_batch_size,
+                    &coalesced, 0, FALSE);
+
+                if (!coalesce_ok || coalesced == 0) {
+                    break;
+                }
+                for (ULONG i = 0; i < coalesced; i++) {
+                    (void)ep_port_dispatch_iocp_entry(
+                        port, &port->iocp_entries[i],
+                        wait_state.timeout_generation);
+                }
+                result += ep_drain_to_buffer(
+                    port, (unsigned char *)out +
+                        (size_t)result * (basic_events
+                            ? sizeof(struct epoll_event)
+                            : sizeof(epoll_event_ex)),
+                    maxevents - result, basic_events);
+            }
             break;
         }
         post_error = ep_port_take_iocp_post_error(port);
@@ -5034,6 +5130,23 @@ done:
     atomic_store_explicit(&port->waiter_active, 0, memory_order_release);
     pthread_mutex_unlock(&port->wait_lock);
     return result;
+}
+
+int ep_port_wait_timeout(ep_port_t *port, epoll_event_ex *out, int maxevents,
+                         const ep_wait_timeout_t *timeout,
+                         const wepoll_sigset_t *sigmask)
+{
+    return ep_port_wait_timeout_impl(port, out, maxevents, timeout, sigmask,
+                                     0);
+}
+
+int ep_port_wait_basic_timeout(ep_port_t *port, struct epoll_event *out,
+                               int maxevents,
+                               const ep_wait_timeout_t *timeout,
+                               const wepoll_sigset_t *sigmask)
+{
+    return ep_port_wait_timeout_impl(port, out, maxevents, timeout, sigmask,
+                                     1);
 }
 
 int ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,

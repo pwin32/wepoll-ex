@@ -207,15 +207,30 @@ accepted as an event bit but is never produced on Windows.
 UDP error coverage has two layers. Deterministic internal completions verify
 that an AFD status such as port-unreachable reaches public delivery as
 `EPOLLERR`. For a confirmed UDP socket whose provider handle safely permits
-overlapped I/O, an AFD receive completion is qualified with a private one-byte
-direct `IOCTL_AFD_RECV` normal-plus-peek request. `DeviceIoControl` supplies a
-low-bit private event, so the qualifier cannot place a packet on an
-application-owned IOCP; a pending empty-queue request is cancelled and joined
-before its stack state is released. A queued asynchronous receive error such
-as `WSAECONNRESET` therefore reports exact unrequested `EPOLLERR`, without
-`EPOLLIN`, `EPOLLRDNORM`, or `EPOLLHUP`, and remains level-ready until the
-application consumes it. Normal and oversized datagrams remain queued and
-retain the requested readable aliases. Public IPv4/IPv6 probes enable
+overlapped I/O, every successful AFD receive completion is qualified with a
+private one-byte direct `IOCTL_AFD_RECV` normal-plus-peek request. Readless
+registrations temporarily add an internal `AFD_POLL_RECEIVE` interest so a
+receive-queue error remains implicitly observable even when the caller did not
+request `EPOLLIN` or `EPOLLRDNORM`. `DeviceIoControl` supplies a low-bit private
+event, so the qualifier cannot place a packet on an application-owned IOCP; a
+pending empty-queue request is cancelled and joined before its stack state is
+released. A queued asynchronous receive error such as `WSAECONNRESET`
+therefore reports exact unrequested `EPOLLERR`, without `EPOLLIN`,
+`EPOLLRDNORM`, or `EPOLLHUP`, and remains level-ready until the application
+consumes it. Normal and oversized datagrams remain queued and retain requested
+readable aliases.
+
+An ordinary datagram observed by a readless registration is suppressed and
+parks the internal receive interest; the port immediately rearms only terminal
+AFD conditions so the unread datagram cannot drive an IOCP completion loop.
+Every successful MOD clears that parking state and performs a fresh scan, so
+MOD to normal-read interest exposes the preserved datagram and same-mask MOD
+refreshes implicit error observation. Flags-only ET and ONESHOT registrations
+use the same hidden probe and retain their duplicate-suppression/rearm rules.
+The hidden receive request deliberately uses non-exclusive AFD submission even
+for `EPOLLEXCLUSIVE`, because an ordinary datagram must not cancel a peer's
+legitimate read poll; the process-local terminal claim still arbitrates error
+delivery. Public IPv4/IPv6 probes enable
 `SIO_UDP_CONNRESET`, arm before sending, require two LT error observations,
 then verify `recv() == WSAECONNRESET`; a timeout is a genuine skip only when a
 nonblocking peek also reports `WSAEWOULDBLOCK`.
@@ -233,10 +248,11 @@ ambiguous provider metadata retains the conservative `EPOLLERR | EPOLLHUP`
 abort mapping. A synchronous/non-overlapped provider socket, a layered
 provider, or a provider that returns a recognized unsupported-operation error
 for the reverse-engineered receive request retains the legacy AFD readable
-mapping. A reset exposed only through AFD receive is currently qualified only
-when `EPOLLIN` or `EPOLLRDNORM` arms that class, and a reset queued behind an
-unread datagram cannot be distinguished until the datagram at the receive head
-is consumed.
+mapping. A reset queued behind an unread datagram cannot be distinguished
+without consuming or reordering that payload. After the application drains the
+receive head, a successful MOD refreshes a parked readless registration;
+Linux-compatible exclusive registrations reject MOD and therefore require
+DEL/ADD for that refresh.
 
 `EPOLLET` uses observed-readiness filtering with throttled re-sampling of an
 already-seen level. `EPOLLEXCLUSIVE` applies only to socket registrations and
@@ -264,9 +280,11 @@ optional and Windows scheduling can wake later than the requested deadline,
 edge delivery is observed-level rather than Linux kernel queue semantics,
 socket `EPOLLRDBAND` and `EPOLLWRBAND` interests are accepted but inert,
 `EPOLLMSG` is never produced, `SO_OOBINLINE` collapses priority into ordinary
-readability, UDP resets on synchronous/non-overlapped sockets or without
-normal-read interest retain the receive-qualification caveats above, unknown
-provider protocol metadata retains a conservative abort mapping, pipe
+readability, UDP resets on synchronous/non-overlapped or layered sockets and
+errors queued behind a parked unread datagram retain the receive-qualification
+caveats above, hidden readless UDP probes temporarily weaken native
+cross-process AFD exclusivity, unknown provider protocol metadata retains a
+conservative abort mapping, pipe
 writable readiness can remain advisory when native local
 information is unavailable or access is denied,
 exclusive-claim updates serialize through one process-wide mutex, and virtual

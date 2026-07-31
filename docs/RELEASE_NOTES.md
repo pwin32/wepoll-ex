@@ -221,6 +221,37 @@ FFI and serialized event buffers. This intentionally changes the experimental
 0.1.0 preview ABI; all consumers must rebuild against the updated header. The
 `maxevents` ceiling is now derived directly from the public structure size.
 
+Qualifier-safe Windows UDP registrations now observe receive-queue errors as
+implicit `EPOLLERR` even without `EPOLLIN` or `EPOLLRDNORM`. Readless masks add
+a hidden `AFD_POLL_RECEIVE`, qualify successful completions with the existing
+non-consuming direct AFD peek, suppress ordinary datagrams, and park that
+hidden interest before immediately rearming terminal-only state. This retains
+the payload without an IOCP hot loop. Successful MOD and ONESHOT rearm perform
+a fresh probe with exact rollback on submission failure. The hidden request is
+submitted without native AFD exclusivity so it cannot cancel a peer's real read
+poll; process-local terminal claims still suppress duplicate exclusive error
+delivery. Public regressions cover zero/explicit-ERR LT, flags-only ET and
+ONESHOT, write-only ET reset delivery, plus preserved normal data delivered
+after MOD to `EPOLLIN`; deterministic state regressions cover parking, masks,
+ET duplicate suppression, successful and failed rearm, rollback, and exclusive
+submission. Layered or synchronous providers retain the conservative
+path, and an error behind a parked unread datagram remains unavailable until
+the payload is drained and the registration is refreshed (DEL/ADD for an
+exclusive registration).
+
+The later July 31, 2026 qualification used Linux/WSL GCC 14.2 and Windows
+10.0.19044 with MSYS2 MinGW GCC 15.2 under `-O2 -Wall -Wextra -Wpedantic
+-Werror`. POSIX native and forced-`epoll_pwait2`-fallback Release suites passed
+4/4 each, API/pool tests passed five repeats, and ASan/UBSan passed 3/3. The
+seven MinGW best-effort combined, static-only, shared-only, strict combined,
+strict shared-only, synchronized combined, and synchronized shared-only lanes
+contained 163, 161, 94, 163, 94, 163, and 94 tests. Their passed/skipped counts
+were 162/1, 160/1, 93/1, 162/1, 93/1, 158/5, and 89/5. Three repeats of every
+applicable focused UDP, socket-event, waitable, pipe, API, stress, backpressure,
+compatibility, timing, state, and fault subset passed. The only general skip
+was the host-dependent IPv4 ICMP/reset probe; synchronized mode also skipped
+the four native-reuse identity cases required by its DEL-before-close contract.
+
 Windows socket lifetime is now an explicit CMake policy:
 `WEPOLL_EX_SOCKET_LIFETIME_MODE=best-effort|strict|synchronized`.
 Best-effort remains the default, strict rejects providers without stable WFP

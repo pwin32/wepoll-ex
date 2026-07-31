@@ -126,10 +126,6 @@
 #define WEPOLL_EPOLL_MAX_EVENTS \
     ((int)(INT_MAX / (int)sizeof(struct epoll_event)))
 
-/* A legal public maxevents value is only an upper bound.  Keep conversion
- * scratch and each single-consumer ready-queue drain bounded independently. */
-#define WEPOLL_WAIT_BATCH_EVENTS 4096
-
 /* ----------------------------------------------------------------------- */
 /* Forward declarations.                                                   */
 /* ----------------------------------------------------------------------- */
@@ -351,6 +347,20 @@ typedef enum ep_socket_async_read_capability {
     EP_SOCKET_ASYNC_READ_UNSAFE = 2
 } ep_socket_async_read_capability_t;
 
+typedef enum ep_udp_read_probe_result {
+    EP_UDP_READ_PROBE_UNAVAILABLE = -1,
+    EP_UDP_READ_PROBE_NOT_READY = 0,
+    EP_UDP_READ_PROBE_READY = 1,
+    EP_UDP_READ_PROBE_ERROR = 2,
+    EP_UDP_READ_PROBE_CLOSED = 3,
+    EP_UDP_READ_PROBE_IDENTITY_ERROR = 4
+} ep_udp_read_probe_result_t;
+
+#ifdef _WIN32
+typedef ep_udp_read_probe_result_t (*ep_udp_probe_read_fn)(
+    ep_sock_t *sock, int *identity_error_out);
+#endif
+
 typedef enum ep_waitable_semantics {
     EP_WAITABLE_NONE = 0,
     EP_WAITABLE_PERSISTENT = 1,
@@ -382,6 +392,11 @@ struct ep_sock {
     uint8_t socket_protocol; /* ep_socket_protocol_t */
     uint8_t udp_afd_qualifier_eligible;
     uint8_t async_read_capability; /* ep_socket_async_read_capability_t */
+    /* A readless UDP registration briefly adds AFD_POLL_RECEIVE so queued
+     * transport errors can still become implicit EPOLLERR.  Once an ordinary
+     * unread datagram is observed, park that internal interest until a fresh
+     * MOD/rearm scan so the persistent receive level cannot spin IOCP. */
+    uint8_t udp_readless_receive_parked;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     uint64_t endpoint_id;
     uint8_t endpoint_id_state;
@@ -549,6 +564,9 @@ struct ep_port {
     /* Private completion event for synchronous settlement of internal direct
      * AFD UDP qualifiers.  Its packets never enter an application IOCP. */
     HANDLE udp_probe_event;
+#ifdef _WIN32
+    ep_udp_probe_read_fn udp_probe_read;
+#endif
 
     /* Per-port fd table — indexed by SOCKET value masked by fd_mask.
      * Grows when more than 75 % full.  NULL entries are unused slots. */
@@ -723,6 +741,10 @@ int  ep_port_rearm(ep_port_t *port, SOCKET fd);
 
 int  ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
                   int timeout_ms, const wepoll_sigset_t *sigmask);
+int  ep_port_wait_basic_timeout(ep_port_t *port, struct epoll_event *out,
+                                int maxevents,
+                                const ep_wait_timeout_t *timeout,
+                                const wepoll_sigset_t *sigmask);
 #ifdef _WIN32
 void ep_wait_timeout_from_milliseconds(int timeout_ms,
                                        ep_wait_timeout_t *timeout);

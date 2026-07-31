@@ -1085,6 +1085,95 @@ cleanup:
     return result;
 }
 
+static int test_udp_readless_data(void)
+{
+    static const char payload[] = { 'p', 'a', 'r', 'k' };
+    static const uint64_t initial_data = UINT64_C(0x5041524b);
+    static const uint64_t refresh_data = UINT64_C(0x52454652);
+    static const uint64_t readable_data = UINT64_C(0x52454144);
+    udp_fixture_t fixture;
+    char peeked[sizeof(payload)];
+    char received[sizeof(payload)];
+    int epfd = -1;
+    int registered = 0;
+    int setup;
+    int result = TEST_FAILED;
+
+    setup = make_udp_fixture(&fixture, AF_INET);
+    if (setup != TEST_OK) {
+        return setup;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0 ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, fixture.receiver,
+                   0, initial_data) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (wait_empty(epfd, 0, "UDP readless initial arm") != 0 ||
+        queue_udp_datagram(&fixture, payload, (int)sizeof(payload),
+                           "UDP readless datagram") != 0 ||
+        wait_empty(epfd, 250, "UDP readless datagram suppression") != 0) {
+        goto cleanup;
+    }
+
+    memset(peeked, 0, sizeof(peeked));
+    if (recv(fixture.receiver, peeked, (int)sizeof(peeked), MSG_PEEK) !=
+            (int)sizeof(peeked) ||
+        memcmp(peeked, payload, sizeof(payload)) != 0) {
+        fprintf(stderr,
+                "UDP readless datagram was consumed or changed, WSA=%d\n",
+                WSAGetLastError());
+        goto cleanup;
+    }
+
+    if (ctl_socket(epfd, EPOLL_CTL_MOD, fixture.receiver,
+                   0, refresh_data) != 0 ||
+        wait_empty(epfd, 100, "UDP readless same-mask refresh") != 0) {
+        goto cleanup;
+    }
+    memset(peeked, 0, sizeof(peeked));
+    if (recv(fixture.receiver, peeked, (int)sizeof(peeked), MSG_PEEK) !=
+            (int)sizeof(peeked) ||
+        memcmp(peeked, payload, sizeof(payload)) != 0) {
+        fprintf(stderr,
+                "UDP readless refresh consumed or changed data, WSA=%d\n",
+                WSAGetLastError());
+        goto cleanup;
+    }
+
+    if (ctl_socket(epfd, EPOLL_CTL_MOD, fixture.receiver,
+                   EPOLLIN, readable_data) != 0 ||
+        wait_exact(epfd, 2000, readable_data, EPOLLIN,
+                   "UDP readless MOD-to-IN") != 0) {
+        goto cleanup;
+    }
+    memset(received, 0, sizeof(received));
+    if (recv(fixture.receiver, received, (int)sizeof(received), 0) !=
+            (int)sizeof(received) ||
+        memcmp(received, payload, sizeof(payload)) != 0 ||
+        wait_empty(epfd, 100, "UDP readless drained") != 0) {
+        fprintf(stderr, "UDP readless MOD payload mismatch, WSA=%d\n",
+                WSAGetLastError());
+        goto cleanup;
+    }
+    result = TEST_OK;
+
+cleanup:
+    if (registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, fixture.receiver, 0, 0) != 0) {
+        result = TEST_FAILED;
+    }
+    if (epfd >= 0) {
+        (void)wepoll_close(epfd);
+    }
+    udp_fixture_close(&fixture);
+    if (result == TEST_OK) {
+        puts("udp-readless-data: OK");
+    }
+    return result;
+}
+
 static int udp_connreset_unsupported(int error)
 {
     return error == WSAEINVAL || error == WSAEOPNOTSUPP ||
@@ -1092,7 +1181,8 @@ static int udp_connreset_unsupported(int error)
 }
 
 static int test_udp_error(int family, HANDLE application_iocp,
-                          uint32_t modifiers, const char *mode)
+                          uint32_t interest, uint32_t modifiers,
+                          const char *mode)
 {
     struct sockaddr_storage address;
     SOCKET reserved = INVALID_SOCKET;
@@ -1186,13 +1276,25 @@ static int test_udp_error(int family, HANDLE application_iocp,
     epfd = epoll_create1(0);
     if (epfd < 0 ||
         ctl_socket(epfd, EPOLL_CTL_ADD, sender,
-                   EPOLLIN | modifiers, data) != 0) {
+                   interest | modifiers, data) != 0) {
         goto cleanup;
     }
     registered = 1;
-    memset(&output, 0, sizeof(output));
-    if (epoll_wait(epfd, &output, 1, 0) != 0) {
-        goto cleanup;
+    if ((interest & (EPOLLOUT | EPOLLWRNORM)) != 0) {
+        uint32_t writable =
+            interest & (EPOLLOUT | EPOLLWRNORM);
+
+        if (wait_exact(epfd, 2000, data, writable,
+                       "UDP error initial writable edge") != 0 ||
+            wait_empty(epfd, 100,
+                       "UDP error initial writable duplicate") != 0) {
+            goto cleanup;
+        }
+    } else {
+        memset(&output, 0, sizeof(output));
+        if (epoll_wait(epfd, &output, 1, 0) != 0) {
+            goto cleanup;
+        }
     }
     if (application_iocp != NULL) {
         if (prove_socket_iocp_send(sender, application_iocp,
@@ -1258,7 +1360,7 @@ static int test_udp_error(int family, HANDLE application_iocp,
     } else if (modifiers == EPOLLONESHOT) {
         if (wait_empty(epfd, 100, "UDP error ONESHOT disabled") != 0 ||
             ctl_socket(epfd, EPOLL_CTL_MOD, sender,
-                       EPOLLIN | EPOLLONESHOT, rearm_data) != 0 ||
+                       interest | EPOLLONESHOT, rearm_data) != 0 ||
             wait_exact(epfd, 2000, rearm_data, EPOLLERR,
                        "UDP error ONESHOT MOD rearm") != 0 ||
             wait_empty(epfd, 100,
@@ -1305,7 +1407,7 @@ static int test_udp_error(int family, HANDLE application_iocp,
     }
     if (modifiers == EPOLLONESHOT &&
         ctl_socket(epfd, EPOLL_CTL_MOD, sender,
-                   EPOLLIN | EPOLLONESHOT, drained_data) != 0) {
+                   interest | EPOLLONESHOT, drained_data) != 0) {
         goto cleanup;
     }
     if (wait_empty(epfd, 100, "UDP error drained") != 0) {
@@ -1348,8 +1450,8 @@ static int test_udp_iocp_isolation(void)
     }
     result = test_udp_readiness(AF_INET, completion_port);
     if (result == TEST_OK) {
-        error_result = test_udp_error(AF_INET6, completion_port, 0,
-                                      "udp-error-v6");
+        error_result = test_udp_error(AF_INET6, completion_port,
+                                      EPOLLIN, 0, "udp-error-v6");
         if (error_result == TEST_FAILED) {
             result = TEST_FAILED;
         } else if (error_result == TEST_SKIPPED) {
@@ -1400,17 +1502,38 @@ static int run_mode(const char *mode)
     if (strcmp(mode, "udp-v6") == 0) {
         return test_udp_readiness(AF_INET6, NULL);
     }
+    if (strcmp(mode, "udp-readless-data") == 0) {
+        return test_udp_readless_data();
+    }
     if (strcmp(mode, "udp-error") == 0) {
-        return test_udp_error(AF_INET, NULL, 0, mode);
+        return test_udp_error(AF_INET, NULL, EPOLLIN, 0, mode);
     }
     if (strcmp(mode, "udp-error-v6") == 0) {
-        return test_udp_error(AF_INET6, NULL, 0, mode);
+        return test_udp_error(AF_INET6, NULL, EPOLLIN, 0, mode);
     }
     if (strcmp(mode, "udp-error-v6-et") == 0) {
-        return test_udp_error(AF_INET6, NULL, EPOLLET, mode);
+        return test_udp_error(AF_INET6, NULL, EPOLLIN, EPOLLET, mode);
     }
     if (strcmp(mode, "udp-error-v6-oneshot") == 0) {
-        return test_udp_error(AF_INET6, NULL, EPOLLONESHOT, mode);
+        return test_udp_error(AF_INET6, NULL, EPOLLIN,
+                              EPOLLONESHOT, mode);
+    }
+    if (strcmp(mode, "udp-error-v6-zero") == 0) {
+        return test_udp_error(AF_INET6, NULL, 0, 0, mode);
+    }
+    if (strcmp(mode, "udp-error-v6-err") == 0) {
+        return test_udp_error(AF_INET6, NULL, EPOLLERR, 0, mode);
+    }
+    if (strcmp(mode, "udp-error-v6-readless-et") == 0) {
+        return test_udp_error(AF_INET6, NULL, 0, EPOLLET, mode);
+    }
+    if (strcmp(mode, "udp-error-v6-readless-oneshot") == 0) {
+        return test_udp_error(AF_INET6, NULL, 0,
+                              EPOLLONESHOT, mode);
+    }
+    if (strcmp(mode, "udp-error-v6-out-et") == 0) {
+        return test_udp_error(AF_INET6, NULL, EPOLLOUT,
+                              EPOLLET, mode);
     }
     if (strcmp(mode, "udp-iocp") == 0) {
         return test_udp_iocp_isolation();
@@ -1418,8 +1541,11 @@ static int run_mode(const char *mode)
     fprintf(stderr,
             "usage: test_windows_socket_events "
             "[aliases|oob-lt|oob-et|oob-oneshot|oob-mod|"
-            "oob-inline-lt|oob-inline-et|udp-v4|udp-v6|udp-error|"
-            "udp-error-v6|udp-error-v6-et|udp-error-v6-oneshot|"
+            "oob-inline-lt|oob-inline-et|udp-v4|udp-v6|"
+            "udp-readless-data|udp-error|udp-error-v6|"
+            "udp-error-v6-et|udp-error-v6-oneshot|udp-error-v6-zero|"
+            "udp-error-v6-err|udp-error-v6-readless-et|"
+            "udp-error-v6-readless-oneshot|udp-error-v6-out-et|"
             "udp-iocp]\n");
     return TEST_FAILED;
 }

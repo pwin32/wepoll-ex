@@ -234,6 +234,9 @@ else()
                 pending-narrowing-mod
                 pending-expansion-mod
                 transitional-idle
+                udp-readless-error
+                udp-readless-park
+                udp-readless-rollback
                 aux-posted-cancel
                 waitable-zero-callback
                 waitable-zero-ready
@@ -306,10 +309,16 @@ else()
             oob-inline-et
             udp-v4
             udp-v6
+            udp-readless-data
             udp-error
             udp-error-v6
             udp-error-v6-et
             udp-error-v6-oneshot
+            udp-error-v6-zero
+            udp-error-v6-err
+            udp-error-v6-readless-et
+            udp-error-v6-readless-oneshot
+            udp-error-v6-out-et
             udp-iocp)
         string(REPLACE "-" "_" _socket_event_name
             "${_socket_event_mode}")
@@ -323,7 +332,13 @@ else()
            _socket_event_mode STREQUAL "udp-error" OR
            _socket_event_mode STREQUAL "udp-error-v6" OR
            _socket_event_mode STREQUAL "udp-error-v6-et" OR
-           _socket_event_mode STREQUAL "udp-error-v6-oneshot")
+           _socket_event_mode STREQUAL "udp-error-v6-oneshot" OR
+           _socket_event_mode STREQUAL "udp-error-v6-zero" OR
+           _socket_event_mode STREQUAL "udp-error-v6-err" OR
+           _socket_event_mode STREQUAL "udp-error-v6-readless-et" OR
+           _socket_event_mode STREQUAL
+               "udp-error-v6-readless-oneshot" OR
+           _socket_event_mode STREQUAL "udp-error-v6-out-et")
             set_tests_properties(
                 wepoll_ex_windows_socket_events_${_socket_event_name}
                 PROPERTIES SKIP_RETURN_CODE 77)

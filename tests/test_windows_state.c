@@ -91,6 +91,59 @@ fail:
     return -1;
 }
 
+static int fixture_open_udp(state_fixture_t *fixture)
+{
+    struct sockaddr_in client_address;
+    struct sockaddr_in server_address;
+    int client_address_length = (int)sizeof(client_address);
+    int server_address_length = (int)sizeof(server_address);
+
+    fixture_reset(fixture);
+    fixture->client = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP,
+                                 NULL, 0, WSA_FLAG_OVERLAPPED);
+    fixture->server = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP,
+                                 NULL, 0, WSA_FLAG_OVERLAPPED);
+    if (fixture->client == INVALID_SOCKET ||
+        fixture->server == INVALID_SOCKET) {
+        goto fail;
+    }
+
+    memset(&client_address, 0, sizeof(client_address));
+    client_address.sin_family = AF_INET;
+    client_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    client_address.sin_port = htons(0);
+    memset(&server_address, 0, sizeof(server_address));
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    server_address.sin_port = htons(0);
+    if (bind(fixture->client,
+             (const struct sockaddr *)&client_address,
+             (int)sizeof(client_address)) == SOCKET_ERROR ||
+        bind(fixture->server,
+             (const struct sockaddr *)&server_address,
+             (int)sizeof(server_address)) == SOCKET_ERROR ||
+        getsockname(fixture->client,
+                    (struct sockaddr *)&client_address,
+                    &client_address_length) == SOCKET_ERROR ||
+        getsockname(fixture->server,
+                    (struct sockaddr *)&server_address,
+                    &server_address_length) == SOCKET_ERROR ||
+        connect(fixture->client,
+                (const struct sockaddr *)&server_address,
+                server_address_length) == SOCKET_ERROR ||
+        connect(fixture->server,
+                (const struct sockaddr *)&client_address,
+                client_address_length) == SOCKET_ERROR ||
+        ep_port_create(0, 0, &fixture->port) != 0) {
+        goto fail;
+    }
+    return 0;
+
+fail:
+    fixture_close(fixture);
+    return -1;
+}
+
 static int send_byte(SOCKET socket_fd)
 {
     static const char byte = 'x';
@@ -998,6 +1051,79 @@ static NTSTATUS NTAPI submit_failure_stub(
     return STATUS_ACCESS_DENIED;
 }
 
+#define UDP_SUBMIT_CAPTURE_LIMIT 4
+
+static volatile LONG udp_submit_calls;
+static volatile LONG udp_submit_invalid;
+static ULONG udp_submit_events[UDP_SUBMIT_CAPTURE_LIMIT];
+static ULONG udp_submit_exclusive[UDP_SUBMIT_CAPTURE_LIMIT];
+static volatile LONG udp_probe_calls;
+static volatile LONG udp_probe_mismatch;
+static ep_sock_t *udp_probe_expected_sock;
+static ep_udp_read_probe_result_t udp_probe_result;
+static NTSTATUS udp_submit_result;
+
+static void udp_capture_reset(ep_udp_read_probe_result_t probe_result)
+{
+    InterlockedExchange(&udp_submit_calls, 0);
+    InterlockedExchange(&udp_submit_invalid, 0);
+    memset(udp_submit_events, 0, sizeof(udp_submit_events));
+    memset(udp_submit_exclusive, 0, sizeof(udp_submit_exclusive));
+    InterlockedExchange(&udp_probe_calls, 0);
+    InterlockedExchange(&udp_probe_mismatch, 0);
+    udp_probe_expected_sock = NULL;
+    udp_probe_result = probe_result;
+    udp_submit_result = STATUS_PENDING;
+}
+
+static NTSTATUS NTAPI udp_submit_capture_stub(
+    HANDLE file_handle,
+    HANDLE event,
+    PIO_APC_ROUTINE apc_routine,
+    PVOID apc_context,
+    PIO_STATUS_BLOCK io_status_block,
+    ULONG io_control_code,
+    PVOID input_buffer,
+    ULONG input_buffer_length,
+    PVOID output_buffer,
+    ULONG output_buffer_length)
+{
+    AFD_POLL_INFO *info = (AFD_POLL_INFO *)input_buffer;
+    LONG call = InterlockedIncrement(&udp_submit_calls) - 1;
+
+    (void)file_handle;
+    (void)event;
+    (void)apc_routine;
+    (void)apc_context;
+    (void)io_status_block;
+    (void)output_buffer;
+    if (io_control_code != IOCTL_AFD_POLL || info == NULL ||
+        input_buffer_length < sizeof(*info) ||
+        output_buffer_length < sizeof(*info) ||
+        info->NumberOfHandles != 1) {
+        InterlockedIncrement(&udp_submit_invalid);
+        return STATUS_ACCESS_DENIED;
+    }
+    if (call >= 0 && call < UDP_SUBMIT_CAPTURE_LIMIT) {
+        udp_submit_events[call] = info->Handles[0].Events;
+        udp_submit_exclusive[call] = info->Exclusive;
+    }
+    return udp_submit_result;
+}
+
+static ep_udp_read_probe_result_t udp_probe_stub(
+    ep_sock_t *sock, int *identity_error_out)
+{
+    InterlockedIncrement(&udp_probe_calls);
+    if (sock != udp_probe_expected_sock) {
+        InterlockedIncrement(&udp_probe_mismatch);
+    }
+    if (identity_error_out != NULL) {
+        *identity_error_out = 0;
+    }
+    return udp_probe_result;
+}
+
 #ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 static SOCKET cached_base_capture;
 static int cached_base_capture_calls;
@@ -1066,6 +1192,117 @@ static int test_cached_base_submit(void)
 }
 #endif
 
+typedef struct udp_state_case {
+    state_fixture_t fixture;
+    ep_sock_t *sock;
+    PNtDeviceIoControlFile original_submit;
+    ep_udp_probe_read_fn original_probe;
+    int submit_replaced;
+} udp_state_case_t;
+
+static void udp_state_case_init(udp_state_case_t *test_case)
+{
+    memset(test_case, 0, sizeof(*test_case));
+    fixture_reset(&test_case->fixture);
+}
+
+/* Capture stubs do not create a kernel request or completion packet.  Retire
+ * their synthetic pending accounting before normal fixture destruction. */
+static void udp_state_discard_synthetic_pending(udp_state_case_t *test_case)
+{
+    ep_port_t *port = test_case->fixture.port;
+    ep_sock_t *sock = test_case->sock;
+    uint32_t poll_status;
+
+    if (port == NULL) return;
+    if (sock == NULL) {
+        sock = fixture_sock(&test_case->fixture);
+        test_case->sock = sock;
+    }
+    if (sock == NULL) return;
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    poll_status = atomic_load_explicit(&sock->poll_status,
+                                       memory_order_relaxed);
+    if (poll_status == EP_POLL_PENDING ||
+        poll_status == EP_POLL_CANCELLED) {
+        if (port->pending_poll_count > 0) {
+            port->pending_poll_count--;
+        }
+        atomic_store_explicit(&sock->poll_status, EP_POLL_IDLE,
+                              memory_order_relaxed);
+        sock->io_status_block.Status = STATUS_CANCELLED;
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+}
+
+static void udp_state_case_close(udp_state_case_t *test_case)
+{
+    udp_state_discard_synthetic_pending(test_case);
+    if (test_case->submit_replaced) {
+        g_ntdll.NtDeviceIoControlFile = test_case->original_submit;
+        test_case->submit_replaced = 0;
+    }
+    if (test_case->fixture.port != NULL) {
+        test_case->fixture.port->udp_probe_read = test_case->original_probe;
+    }
+    fixture_close(&test_case->fixture);
+    test_case->sock = NULL;
+}
+
+static int udp_state_case_open(udp_state_case_t *test_case,
+                               uint32_t events, uint32_t flags,
+                               uint64_t value, void *context,
+                               ep_udp_read_probe_result_t probe_result)
+{
+    if (fixture_open_udp(&test_case->fixture) != 0) return -1;
+
+    test_case->original_submit = g_ntdll.NtDeviceIoControlFile;
+    test_case->original_probe = test_case->fixture.port->udp_probe_read;
+    udp_capture_reset(probe_result);
+    g_ntdll.NtDeviceIoControlFile = udp_submit_capture_stub;
+    test_case->fixture.port->udp_probe_read = udp_probe_stub;
+    test_case->submit_replaced = 1;
+    if (register_events(&test_case->fixture, events, flags,
+                        value, context) != 0) {
+        return -1;
+    }
+    test_case->sock = fixture_sock(&test_case->fixture);
+    if (test_case->sock == NULL) {
+        ep_set_errno(EIO);
+        return -1;
+    }
+    udp_probe_expected_sock = test_case->sock;
+    return 0;
+}
+
+static int udp_state_complete(udp_state_case_t *test_case,
+                              ULONG afd_events, NTSTATUS afd_status,
+                              NTSTATUS completion_status)
+{
+    ep_port_t *port = test_case->fixture.port;
+    ep_sock_t *sock = test_case->sock;
+    int pending;
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    pending = atomic_load_explicit(&sock->poll_status,
+                                   memory_order_relaxed) == EP_POLL_PENDING &&
+        port->pending_poll_count > 0 && sock->afd_info != NULL;
+    if (pending) {
+        sock->afd_info->NumberOfHandles = 1;
+        sock->afd_info->Handles[0].Events = afd_events;
+        sock->afd_info->Handles[0].Status = afd_status;
+        sock->io_status_block.Status = completion_status;
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!pending) {
+        ep_set_errno(EIO);
+        return -1;
+    }
+    ep_sock_handle_completion(sock, 0, completion_status);
+    return 0;
+}
+
 static int expect_one_oneshot(ep_port_t *port, uint64_t value,
                               void *context)
 {
@@ -1088,6 +1325,618 @@ static int expect_one_oneshot(ep_port_t *port, uint64_t value,
         return -1;
     }
     return 0;
+}
+
+static int test_udp_readless_error_lt(void)
+{
+    static const uint64_t value = UINT64_C(0x7564706572723031);
+    const uint32_t terminal_events = ep_epoll_to_afd_events(0);
+    const uint32_t hidden_events = terminal_events | AFD_POLL_RECEIVE;
+    udp_state_case_t test_case;
+    epoll_event_ex event;
+    ep_sock_t *sock;
+    int context;
+    int state_ok;
+    int result = -1;
+
+    udp_state_case_init(&test_case);
+    if (udp_state_case_open(&test_case, 0, 0, value, &context,
+                            EP_UDP_READ_PROBE_ERROR) != 0) {
+        goto cleanup;
+    }
+    sock = test_case.sock;
+
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    state_ok = sock->socket_protocol == EP_SOCKET_PROTOCOL_UDP &&
+        sock->udp_afd_qualifier_eligible != 0 &&
+        sock->async_read_capability == EP_SOCKET_ASYNC_READ_SAFE &&
+        sock->udp_readless_receive_parked == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING &&
+        sock->submitted_afd_events == hidden_events &&
+        test_case.fixture.port->pending_poll_count == 1 &&
+        sock->needs_rearm == 0 &&
+        InterlockedCompareExchange(&udp_submit_calls, 0, 0) == 1 &&
+        InterlockedCompareExchange(&udp_submit_invalid, 0, 0) == 0 &&
+        udp_submit_events[0] == hidden_events &&
+        udp_submit_exclusive[0] == FALSE &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok ||
+        udp_state_complete(&test_case, AFD_POLL_RECEIVE,
+                           STATUS_SUCCESS, STATUS_SUCCESS) != 0) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    state_ok = sock->udp_readless_receive_parked == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        test_case.fixture.port->pending_poll_count == 0 &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) != 0 &&
+        sock->pending_events == EPOLLERR &&
+        InterlockedCompareExchange(&udp_probe_calls, 0, 0) == 1 &&
+        InterlockedCompareExchange(&udp_probe_mismatch, 0, 0) == 0 &&
+        InterlockedCompareExchange(&udp_submit_calls, 0, 0) == 1 &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(test_case.fixture.port, &event, 1, 0, NULL) != 1 ||
+        event.events != EPOLLERR || event.data.u64 != value ||
+        event.user_ctx != &context || event.flags != 0) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    state_ok = sock->udp_readless_receive_parked == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        sock->pending_events == 0 && sock->needs_rearm != 0 &&
+        test_case.fixture.port->needs_rearm_count == 1 &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    udp_state_case_close(&test_case);
+    return result;
+}
+
+static int run_udp_readless_error_trigger_case(uint32_t flags)
+{
+    const uint64_t value = flags == EPOLLET
+        ? UINT64_C(0x7564706572726574)
+        : UINT64_C(0x7564706572726f73);
+    const uint32_t terminal_events = ep_epoll_to_afd_events(flags);
+    const uint32_t hidden_events = terminal_events | AFD_POLL_RECEIVE;
+    const uint32_t expected_flags = flags == EPOLLET
+        ? WEPOLL_FLAG_ET_DELIVERED | WEPOLL_FLAG_EDGE_ARMED
+        : WEPOLL_FLAG_ONESHOT_FIRED;
+    udp_state_case_t test_case;
+    epoll_event_ex event;
+    ep_sock_t *sock;
+    int context;
+    int state_ok;
+    int result = -1;
+
+    udp_state_case_init(&test_case);
+    if (udp_state_case_open(&test_case, flags, flags, value, &context,
+                            EP_UDP_READ_PROBE_ERROR) != 0) {
+        goto cleanup;
+    }
+    sock = test_case.sock;
+    if (udp_state_complete(&test_case, AFD_POLL_RECEIVE,
+                           STATUS_SUCCESS, STATUS_SUCCESS) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    state_ok = sock->udp_readless_receive_parked == 0 &&
+        sock->submitted_afd_events == hidden_events &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        test_case.fixture.port->pending_poll_count == 0 &&
+        sock->pending_events == EPOLLERR &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) != 0 &&
+        ((flags == EPOLLET && sock->observed_events == EPOLLERR &&
+          sock->oneshot_fired == 0) ||
+         (flags == EPOLLONESHOT && sock->observed_events == 0 &&
+          sock->oneshot_fired != 0)) &&
+        InterlockedCompareExchange(&udp_probe_calls, 0, 0) == 1 &&
+        InterlockedCompareExchange(&udp_submit_calls, 0, 0) == 1 &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(test_case.fixture.port, &event, 1, 0, NULL) != 1 ||
+        event.events != EPOLLERR || event.data.u64 != value ||
+        event.user_ctx != &context || event.flags != expected_flags) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    if (flags == EPOLLET) {
+        udp_submit_result = STATUS_SUCCESS;
+        memset(&event, 0, sizeof(event));
+        if (ep_port_wait(test_case.fixture.port, &event, 1, 0, NULL) != 0 ||
+            InterlockedCompareExchange(&udp_submit_calls, 0, 0) != 2 ||
+            udp_state_complete(&test_case, AFD_POLL_RECEIVE,
+                               STATUS_SUCCESS, STATUS_SUCCESS) != 0) {
+            ep_set_errno(EIO);
+            goto cleanup;
+        }
+        pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+        state_ok = sock->udp_readless_receive_parked == 0 &&
+            sock->observed_events == EPOLLERR && sock->et_holdoff != 0 &&
+            sock->needs_rearm != 0 &&
+            test_case.fixture.port->needs_rearm_count == 1 &&
+            sock->pending_events == 0 &&
+            atomic_load_explicit(&sock->ready_queued,
+                                 memory_order_relaxed) == 0 &&
+            atomic_load_explicit(&sock->poll_status,
+                                 memory_order_relaxed) == EP_POLL_IDLE &&
+            InterlockedCompareExchange(&udp_probe_calls, 0, 0) == 2 &&
+            ep_port_worklists_valid_locked(test_case.fixture.port);
+        pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+        if (!state_ok) {
+            ep_set_errno(EIO);
+            goto cleanup;
+        }
+    } else {
+        memset(&event, 0, sizeof(event));
+        if (ep_port_wait(test_case.fixture.port, &event, 1, 0, NULL) != 0 ||
+            InterlockedCompareExchange(&udp_submit_calls, 0, 0) != 1 ||
+            ep_port_rearm(test_case.fixture.port,
+                          test_case.fixture.server) != 0 ||
+            ep_port_wait(test_case.fixture.port, &event, 1, 0, NULL) != 0 ||
+            InterlockedCompareExchange(&udp_submit_calls, 0, 0) != 2 ||
+            udp_state_complete(&test_case, AFD_POLL_RECEIVE,
+                               STATUS_SUCCESS, STATUS_SUCCESS) != 0) {
+            ep_set_errno(EIO);
+            goto cleanup;
+        }
+        memset(&event, 0, sizeof(event));
+        if (ep_port_wait(test_case.fixture.port, &event, 1, 0, NULL) != 1 ||
+            event.events != EPOLLERR || event.data.u64 != value ||
+            event.user_ctx != &context ||
+            event.flags != WEPOLL_FLAG_ONESHOT_FIRED ||
+            InterlockedCompareExchange(&udp_probe_calls, 0, 0) != 2) {
+            ep_set_errno(EIO);
+            goto cleanup;
+        }
+    }
+    result = 0;
+
+cleanup:
+    udp_state_case_close(&test_case);
+    return result;
+}
+
+static int test_udp_readless_error(void)
+{
+    if (test_udp_readless_error_lt() != 0 ||
+        run_udp_readless_error_trigger_case(EPOLLET) != 0) {
+        return -1;
+    }
+    return run_udp_readless_error_trigger_case(EPOLLONESHOT);
+}
+
+static int run_udp_readless_park_case(
+    ep_udp_read_probe_result_t probe_result)
+{
+    static const uint64_t value = UINT64_C(0x7564707061726b31);
+    const uint32_t user_events = EPOLLERR | EPOLLEXCLUSIVE;
+    const uint32_t terminal_events =
+        ep_epoll_to_afd_events(user_events);
+    const uint32_t hidden_events = terminal_events | AFD_POLL_RECEIVE;
+    udp_state_case_t test_case;
+    ep_sock_t *sock;
+    int context;
+    int state_ok;
+    int result = -1;
+
+    udp_state_case_init(&test_case);
+    if (udp_state_case_open(&test_case, user_events, EPOLLEXCLUSIVE,
+                            value, &context, probe_result) != 0) {
+        goto cleanup;
+    }
+    sock = test_case.sock;
+
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    state_ok = sock->socket_protocol == EP_SOCKET_PROTOCOL_UDP &&
+        sock->udp_afd_qualifier_eligible != 0 &&
+        sock->async_read_capability == EP_SOCKET_ASYNC_READ_SAFE &&
+        sock->udp_readless_receive_parked == 0 &&
+        sock->submitted_afd_events == hidden_events &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING &&
+        test_case.fixture.port->pending_poll_count == 1 &&
+        InterlockedCompareExchange(&udp_submit_calls, 0, 0) == 1 &&
+        InterlockedCompareExchange(&udp_submit_invalid, 0, 0) == 0 &&
+        udp_submit_events[0] == hidden_events &&
+        udp_submit_exclusive[0] == FALSE &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok ||
+        udp_state_complete(&test_case, AFD_POLL_RECEIVE,
+                           STATUS_SUCCESS, STATUS_SUCCESS) != 0) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    state_ok = sock->udp_readless_receive_parked != 0 &&
+        sock->submitted_afd_events == terminal_events &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING &&
+        test_case.fixture.port->pending_poll_count == 1 &&
+        sock->needs_rearm == 0 && sock->pending_events == 0 &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        InterlockedCompareExchange(&udp_probe_calls, 0, 0) == 1 &&
+        InterlockedCompareExchange(&udp_probe_mismatch, 0, 0) == 0 &&
+        InterlockedCompareExchange(&udp_submit_calls, 0, 0) == 2 &&
+        InterlockedCompareExchange(&udp_submit_invalid, 0, 0) == 0 &&
+        udp_submit_events[1] == terminal_events &&
+        udp_submit_exclusive[1] == TRUE &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    udp_state_case_close(&test_case);
+    return result;
+}
+
+static int test_udp_readless_park_submit_failure(void)
+{
+    static const uint64_t value = UINT64_C(0x7564707061726b66);
+    const uint32_t user_events = EPOLLERR;
+    const uint32_t terminal_events = ep_epoll_to_afd_events(user_events);
+    const uint32_t hidden_events = terminal_events | AFD_POLL_RECEIVE;
+    udp_state_case_t test_case;
+    epoll_event_ex event;
+    ep_sock_t *sock;
+    int context;
+    int state_ok;
+    int result = -1;
+
+    udp_state_case_init(&test_case);
+    if (udp_state_case_open(&test_case, user_events, 0,
+                            value, &context,
+                            EP_UDP_READ_PROBE_READY) != 0) {
+        goto cleanup;
+    }
+    sock = test_case.sock;
+    udp_submit_result = STATUS_ACCESS_DENIED;
+    if (udp_state_complete(&test_case, AFD_POLL_RECEIVE,
+                           STATUS_SUCCESS, STATUS_SUCCESS) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    state_ok = sock->udp_readless_receive_parked != 0 &&
+        sock->submitted_afd_events == hidden_events &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        test_case.fixture.port->pending_poll_count == 0 &&
+        sock->needs_rearm != 0 &&
+        test_case.fixture.port->needs_rearm_count == 1 &&
+        sock->pending_events == 0 &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        test_case.fixture.port->asynchronous_errors == 1 &&
+        test_case.fixture.port->async_error == EACCES &&
+        InterlockedCompareExchange(&udp_probe_calls, 0, 0) == 1 &&
+        InterlockedCompareExchange(&udp_submit_calls, 0, 0) == 2 &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    errno = 0;
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(test_case.fixture.port, &event, 1, 0, NULL) != -1 ||
+        errno != EACCES) {
+        goto cleanup;
+    }
+    udp_submit_result = STATUS_PENDING;
+    if (ep_port_wait(test_case.fixture.port, &event, 1, 0, NULL) != 0) {
+        goto cleanup;
+    }
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    state_ok = sock->udp_readless_receive_parked != 0 &&
+        sock->submitted_afd_events == terminal_events &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING &&
+        test_case.fixture.port->pending_poll_count == 1 &&
+        sock->needs_rearm == 0 &&
+        InterlockedCompareExchange(&udp_submit_calls, 0, 0) == 3 &&
+        udp_submit_events[2] == terminal_events &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    udp_state_case_close(&test_case);
+    return result;
+}
+
+static int test_udp_readless_park(void)
+{
+    if (run_udp_readless_park_case(EP_UDP_READ_PROBE_READY) != 0) {
+        return -1;
+    }
+    if (run_udp_readless_park_case(EP_UDP_READ_PROBE_UNAVAILABLE) != 0) {
+        return -1;
+    }
+    return test_udp_readless_park_submit_failure();
+}
+
+static int test_udp_readless_mod_rollback(void)
+{
+    static const uint64_t old_value = UINT64_C(0x7564706d6f643031);
+    static const uint64_t new_value = UINT64_C(0x7564706d6f643032);
+    const uint32_t user_events = EPOLLERR;
+    const uint32_t terminal_events =
+        ep_epoll_to_afd_events(user_events);
+    udp_state_case_t test_case;
+    epoll_event_ex event;
+    ep_sock_t *sock;
+    uint64_t old_generation;
+    int old_context;
+    int new_context;
+    int modify_error;
+    int modify_result;
+    int state_ok;
+    int result = -1;
+
+    udp_state_case_init(&test_case);
+    if (udp_state_case_open(&test_case, user_events, 0,
+                            old_value, &old_context,
+                            EP_UDP_READ_PROBE_READY) != 0) {
+        goto cleanup;
+    }
+    sock = test_case.sock;
+    if (udp_state_complete(&test_case, AFD_POLL_RECEIVE,
+                           STATUS_SUCCESS, STATUS_SUCCESS) != 0 ||
+        udp_state_complete(&test_case, AFD_POLL_ABORT,
+                           STATUS_SUCCESS, STATUS_SUCCESS) != 0) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(test_case.fixture.port, &event, 1, 0, NULL) != 1 ||
+        event.events != EPOLLERR || event.data.u64 != old_value ||
+        event.user_ctx != &old_context || event.flags != 0) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    old_generation = sock->generation;
+    state_ok = sock->udp_readless_receive_parked != 0 &&
+        sock->submitted_afd_events == terminal_events &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        sock->needs_rearm != 0 &&
+        test_case.fixture.port->needs_rearm_count == 1 &&
+        test_case.fixture.port->rearm_head == sock &&
+        test_case.fixture.port->rearm_tail == sock &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        InterlockedCompareExchange(&udp_probe_calls, 0, 0) == 1 &&
+        InterlockedCompareExchange(&udp_submit_calls, 0, 0) == 2 &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    counted_submit_delegate = submit_failure_stub;
+    InterlockedExchange(&counted_submit_calls, 0);
+    g_ntdll.NtDeviceIoControlFile = counted_submit_stub;
+    atomic_store_explicit(&test_case.fixture.port->waiter_active, 1,
+                          memory_order_release);
+    errno = 0;
+    modify_result = modify_events(&test_case.fixture, user_events, 0,
+                                  new_value, &new_context);
+    modify_error = errno;
+    atomic_store_explicit(&test_case.fixture.port->waiter_active, 0,
+                          memory_order_release);
+    g_ntdll.NtDeviceIoControlFile = udp_submit_capture_stub;
+
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    state_ok = modify_result == -1 && modify_error == EACCES &&
+        InterlockedCompareExchange(&counted_submit_calls, 0, 0) == 1 &&
+        sock->udp_readless_receive_parked != 0 &&
+        sock->generation == old_generation &&
+        sock->user_events == user_events && sock->user_flags == 0 &&
+        sock->user_data.u64 == old_value &&
+        sock->user_ctx == &old_context &&
+        sock->submitted_afd_events == terminal_events &&
+        sock->pending_events == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        sock->needs_rearm != 0 &&
+        test_case.fixture.port->needs_rearm_count == 1 &&
+        test_case.fixture.port->rearm_head == sock &&
+        test_case.fixture.port->rearm_tail == sock &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (test_case.fixture.port != NULL) {
+        atomic_store_explicit(&test_case.fixture.port->waiter_active, 0,
+                              memory_order_release);
+    }
+    udp_state_case_close(&test_case);
+    return result;
+}
+
+static int test_udp_readless_rearm_rollback(void)
+{
+    static const uint64_t value = UINT64_C(0x756470726561726d);
+    const uint32_t user_events = EPOLLERR | EPOLLONESHOT;
+    const uint32_t terminal_events =
+        ep_epoll_to_afd_events(user_events);
+    udp_state_case_t test_case;
+    epoll_event_ex event;
+    ep_sock_t *sock;
+    uint64_t old_generation;
+    int context;
+    int rearm_error;
+    int rearm_result;
+    int state_ok;
+    int result = -1;
+
+    udp_state_case_init(&test_case);
+    if (udp_state_case_open(&test_case, user_events, EPOLLONESHOT,
+                            value, &context,
+                            EP_UDP_READ_PROBE_READY) != 0) {
+        goto cleanup;
+    }
+    sock = test_case.sock;
+    if (udp_state_complete(&test_case, AFD_POLL_RECEIVE,
+                           STATUS_SUCCESS, STATUS_SUCCESS) != 0 ||
+        udp_state_complete(&test_case, AFD_POLL_ABORT,
+                           STATUS_SUCCESS, STATUS_SUCCESS) != 0) {
+        goto cleanup;
+    }
+
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    old_generation = sock->generation;
+    state_ok = sock->udp_readless_receive_parked != 0 &&
+        sock->submitted_afd_events == terminal_events &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        sock->pending_events == EPOLLERR && sock->oneshot_fired != 0 &&
+        test_case.fixture.port->oneshot_fired_count == 1 &&
+        test_case.fixture.port->oneshot_head == sock &&
+        test_case.fixture.port->oneshot_tail == sock &&
+        sock->needs_rearm == 0 &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) != 0 &&
+        InterlockedCompareExchange(&udp_probe_calls, 0, 0) == 1 &&
+        InterlockedCompareExchange(&udp_submit_calls, 0, 0) == 2 &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    counted_submit_delegate = submit_failure_stub;
+    InterlockedExchange(&counted_submit_calls, 0);
+    g_ntdll.NtDeviceIoControlFile = counted_submit_stub;
+    atomic_store_explicit(&test_case.fixture.port->waiter_active, 1,
+                          memory_order_release);
+    errno = 0;
+    rearm_result = ep_port_rearm(test_case.fixture.port,
+                                 test_case.fixture.server);
+    rearm_error = errno;
+    atomic_store_explicit(&test_case.fixture.port->waiter_active, 0,
+                          memory_order_release);
+    g_ntdll.NtDeviceIoControlFile = udp_submit_capture_stub;
+
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    state_ok = rearm_result == -1 && rearm_error == EACCES &&
+        InterlockedCompareExchange(&counted_submit_calls, 0, 0) == 1 &&
+        sock->udp_readless_receive_parked != 0 &&
+        sock->generation == old_generation &&
+        sock->user_events == user_events &&
+        sock->user_flags == EPOLLONESHOT &&
+        sock->user_data.u64 == value && sock->user_ctx == &context &&
+        sock->submitted_afd_events == terminal_events &&
+        sock->pending_events == EPOLLERR && sock->oneshot_fired != 0 &&
+        test_case.fixture.port->oneshot_fired_count == 1 &&
+        test_case.fixture.port->oneshot_head == sock &&
+        test_case.fixture.port->oneshot_tail == sock &&
+        sock->needs_rearm == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) != 0 &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(test_case.fixture.port, &event, 1, 0, NULL) != 1 ||
+        event.events != EPOLLERR || event.data.u64 != value ||
+        event.user_ctx != &context ||
+        event.flags != WEPOLL_FLAG_ONESHOT_FIRED) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+    pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
+    state_ok = sock->udp_readless_receive_parked != 0 &&
+        sock->oneshot_fired != 0 &&
+        test_case.fixture.port->oneshot_fired_count == 1 &&
+        sock->needs_rearm == 0 &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        ep_port_worklists_valid_locked(test_case.fixture.port);
+    pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
+    if (!state_ok) {
+        ep_set_errno(EIO);
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (test_case.fixture.port != NULL) {
+        atomic_store_explicit(&test_case.fixture.port->waiter_active, 0,
+                              memory_order_release);
+    }
+    udp_state_case_close(&test_case);
+    return result;
+}
+
+static int test_udp_readless_rollback(void)
+{
+    if (test_udp_readless_mod_rollback() != 0) return -1;
+    return test_udp_readless_rearm_rollback();
 }
 
 static int test_queued_rearm(void)
@@ -2006,6 +2855,12 @@ int main(int argc, char **argv)
         result = test_queued_rearm();
     } else if (strcmp(argv[1], "queued-mod") == 0) {
         result = test_queued_mod();
+    } else if (strcmp(argv[1], "udp-readless-error") == 0) {
+        result = test_udp_readless_error();
+    } else if (strcmp(argv[1], "udp-readless-park") == 0) {
+        result = test_udp_readless_park();
+    } else if (strcmp(argv[1], "udp-readless-rollback") == 0) {
+        result = test_udp_readless_rollback();
     } else if (strcmp(argv[1], "deferred-add-failure") == 0) {
         result = test_deferred_add_failure();
     } else if (strcmp(argv[1], "failed-mod") == 0) {
