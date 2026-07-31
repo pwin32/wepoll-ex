@@ -99,10 +99,26 @@ typedef union epoll_data {
     epoll_fd_t sock; /* Windows socket-sized descriptor (extension). */
 } epoll_data_t;
 
+/* Linux x86/x86-64 exposes a 12-byte UAPI record with data at offset four.
+ * x86-64 packs it to one-byte alignment; x86 retains four-byte alignment.
+ * Match those public layouts on Windows so arrays and FFI bindings use the
+ * same representation. Other architectures retain native alignment. */
+#  if defined(__x86_64__) || defined(__amd64__) || \
+      defined(_M_X64) || defined(_M_AMD64)
+#    pragma pack(push, 1)
+#    define WEPOLL_EX_EPOLL_EVENT_PACK_POP 1
+#  elif defined(__i386__) || defined(_M_IX86)
+#    pragma pack(push, 4)
+#    define WEPOLL_EX_EPOLL_EVENT_PACK_POP 1
+#  endif
 typedef struct epoll_event {
     uint32_t      events;
     epoll_data_t  data;
 } epoll_event;
+#  if defined(WEPOLL_EX_EPOLL_EVENT_PACK_POP)
+#    pragma pack(pop)
+#    undef WEPOLL_EX_EPOLL_EVENT_PACK_POP
+#  endif
 #endif /* _WIN32 */
 
 /* ---------------------------------------------------------------------------

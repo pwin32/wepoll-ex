@@ -103,6 +103,12 @@ limit empty or lightly ready waits do not allocate storage proportional to the
 caller-supplied value. `epoll_pwait2*` validates a non-null timespec before the
 count and output pointer, matching Linux's syscall order.
 
+On Windows x86 and x86-64, `struct epoll_event` uses Linux's UAPI layout:
+`data` begins at byte 4 and the structure size and array stride are 12 bytes.
+Alignment is four bytes on x86 and one byte on x86-64. This preview ABI change
+makes native and FFI event buffers layout-compatible with Linux on those
+architectures.
+
 The standard `epoll_create(size)` requires a positive argument but ignores its
 value, matching modern Linux. `epoll_create_ex(size, flags)` retains the size
 only as an extension hint: Windows caps the positive hint value at 4096, while

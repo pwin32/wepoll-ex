@@ -324,6 +324,45 @@ static void test_invalid_args(void)
     PASS();
 }
 
+static void test_epoll_event_layout(void)
+{
+    struct epoll_event events[2];
+    unsigned char *first = (unsigned char *)&events[0];
+    unsigned char *second = (unsigned char *)&events[1];
+
+    TEST("epoll_event matches the Linux x86/x86-64 UAPI layout");
+#if defined(__x86_64__) || defined(__amd64__) || \
+    defined(_M_X64) || defined(_M_AMD64)
+    if (sizeof(struct epoll_event) != 12 ||
+        offsetof(struct epoll_event, data) != 4 ||
+        _Alignof(struct epoll_event) != 1) {
+        FAIL("x86-64 epoll_event layout mismatch");
+        return;
+    }
+#elif defined(__i386__) || defined(_M_IX86)
+    if (sizeof(struct epoll_event) != 12 ||
+        offsetof(struct epoll_event, data) != 4 ||
+        _Alignof(struct epoll_event) != 4) {
+        FAIL("x86 epoll_event layout mismatch");
+        return;
+    }
+#endif
+    memset(events, 0, sizeof(events));
+    events[0].events = EPOLLIN;
+    events[0].data.u64 = UINT64_C(0x1122334455667788);
+    events[1].events = EPOLLOUT;
+    events[1].data.u64 = UINT64_C(0x8877665544332211);
+    if (second - first != (ptrdiff_t)sizeof(events[0]) ||
+        events[0].events != EPOLLIN ||
+        events[0].data.u64 != UINT64_C(0x1122334455667788) ||
+        events[1].events != EPOLLOUT ||
+        events[1].data.u64 != UINT64_C(0x8877665544332211)) {
+        FAIL("epoll_event array stride or round-trip mismatch");
+        return;
+    }
+    PASS();
+}
+
 static void test_wait_maxevents_bounds(void)
 {
     tcp_pair_t pair;
@@ -335,13 +374,7 @@ static void test_wait_maxevents_bounds(void)
     struct timespec zero = { 0, 0 };
     struct timespec invalid = { 0, 1000000000L };
     int epfd = -1;
-#if defined(__i386__) || defined(_M_IX86) || \
-    defined(__x86_64__) || defined(__amd64__) || \
-    defined(_M_X64) || defined(_M_AMD64)
-    int limit = INT_MAX / 12; /* packed x86/x86-64 Linux UAPI size */
-#else
     int limit = INT_MAX / (int)sizeof(struct epoll_event);
-#endif
     int over_limit = limit + 1;
     int result;
 
@@ -1678,6 +1711,7 @@ int main(void)
     test_create_close();
     test_operational_stats();
     test_invalid_args();
+    test_epoll_event_layout();
     test_wait_maxevents_bounds();
     test_ctl_target_errors();
     test_basic_io();

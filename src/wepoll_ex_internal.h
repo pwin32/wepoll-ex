@@ -121,24 +121,10 @@
 #define WEPOLL_AFD_POOL_SIZE     64
 
 /* Linux bounds maxevents by the size of its userspace epoll_event transfer
- * record.  Windows x86/x86-64 emulate the packed 12-byte Linux UAPI record
- * (4-byte mask plus 8-byte data), even though the native Windows C structure
- * has wider alignment.  Other Windows targets and POSIX follow their host
- * structure size. */
-#ifdef _WIN32
-#  if defined(__i386__) || defined(_M_IX86) || \
-      defined(__x86_64__) || defined(__amd64__) || \
-      defined(_M_X64) || defined(_M_AMD64)
-#    define WEPOLL_LINUX_EPOLL_EVENT_SIZE 12
-#  else
-#    define WEPOLL_LINUX_EPOLL_EVENT_SIZE ((int)sizeof(struct epoll_event))
-#  endif
-#  define WEPOLL_EPOLL_MAX_EVENTS \
-      (INT_MAX / WEPOLL_LINUX_EPOLL_EVENT_SIZE)
-#else
-#  define WEPOLL_EPOLL_MAX_EVENTS \
-      ((int)(INT_MAX / (int)sizeof(struct epoll_event)))
-#endif
+ * record.  The public Windows type mirrors that architecture-specific UAPI
+ * layout, so every backend can derive the ceiling directly from its type. */
+#define WEPOLL_EPOLL_MAX_EVENTS \
+    ((int)(INT_MAX / (int)sizeof(struct epoll_event)))
 
 /* A legal public maxevents value is only an upper bound.  Keep conversion
  * scratch and each single-consumer ready-queue drain bounded independently. */

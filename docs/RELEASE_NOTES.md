@@ -213,6 +213,14 @@ CTest suites passed 153/154, 151/152, 87/88, 153/154, 87/88, 149/154, and
 capability skip and synchronized-mode native-reuse skips. Every applicable
 focused Windows test also passed three consecutive repetitions.
 
+The Windows x86/x86-64 public `struct epoll_event` now matches Linux's UAPI
+representation: `data` is at offset 4 and structure size/array stride is 12
+bytes, with alignment 4 on x86 and 1 on x86-64. The previous x86-64 natural
+Windows layout used a 16-byte stride and was incompatible with Linux-shaped
+FFI and serialized event buffers. This intentionally changes the experimental
+0.1.0 preview ABI; all consumers must rebuild against the updated header. The
+`maxevents` ceiling is now derived directly from the public structure size.
+
 Windows socket lifetime is now an explicit CMake policy:
 `WEPOLL_EX_SOCKET_LIFETIME_MODE=best-effort|strict|synchronized`.
 Best-effort remains the default, strict rejects providers without stable WFP

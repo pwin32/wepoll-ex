@@ -110,6 +110,10 @@ the nginx-embedded source build independent of a generated CMake header.
    path. Ready snapshots already in the queue are returned first; the pending
    error is reported by the next wait. Only the first currently pending error
    is returned, while the statistics counter records every occurrence.
+   The public Windows x86/x86-64 `epoll_event` itself uses Linux's UAPI layout:
+   `data` is at offset 4 and size/stride is 12, with alignment 4 on x86 and 1
+   on x86-64. Native arrays and FFI declarations therefore share the Linux
+   representation. Other architectures retain native Linux-style alignment.
 5. DEL and close remove public lookup immediately. Pending AFD requests and
    auxiliary registrations with an already-posted IOCP packet retain
    `ep_sock_t` storage until completion is consumed. Blocking auxiliary disarm
