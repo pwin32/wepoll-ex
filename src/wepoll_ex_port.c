@@ -56,11 +56,11 @@ static void ep_port_store_proc(void *target, size_t target_size, FARPROC proc)
 }
 #endif
 
-/* EPOLLEXCLUSIVE wake uniqueness among wepoll-ex instances.  AFD Exclusive
- * cancels peer polls when it can, but already-queued completions can still
- * race.  Claim each provider base/readiness class for one exclusive owner
- * while its reported AFD level remains active.  A later STATUS_PENDING
- * submission that covers a claimed class proves quiescence and releases it.
+/* EPOLLEXCLUSIVE wake uniqueness among local wepoll-ex instances.  AFD polls
+ * remain non-exclusive so every ordinary registration stays eligible.  Claim
+ * each provider base/readiness class for one exclusive owner while its
+ * reported AFD level remains active.  A later STATUS_PENDING submission that
+ * covers a claimed class proves quiescence and releases it.
  *
  * Each live registration supplies its own intrusive claim node, so claim
  * capacity grows with registrations and delivery never needs to allocate.
@@ -2480,6 +2480,10 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd,
 
 static void ep_sock_free_locked(ep_port_t *port, ep_sock_t *sock)
 {
+    assert(sock->afd_poll_key_owned == 0);
+    assert(sock->afd_poll_target == NULL);
+    assert(sock->afd_poll_key_reservation == NULL);
+    assert(sock->afd_poll_key_next == NULL);
     ep_sock_set_needs_rearm_locked(sock, 0);
     ep_sock_set_oneshot_fired_locked(sock, 0);
     if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
@@ -3046,6 +3050,13 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
         old_poll_status != EP_POLL_CANCELLED) {
         pthread_mutex_unlock(&port->fd_table_lock);
         return;
+    }
+    if (sock->kind == EP_REG_SOCKET) {
+        /* The kernel request represented by this packet has settled.  Drop
+         * its process-wide numeric target-key ownership before any path can
+         * rearm this registration or reclaim its storage.  Immediate-success
+         * submissions already released the key, so this is idempotent. */
+        ep_afd_poll_key_release(sock);
     }
     if (old_poll_status == EP_POLL_PENDING && status >= 0 &&
         ep_waitable_may_consume(sock)) {

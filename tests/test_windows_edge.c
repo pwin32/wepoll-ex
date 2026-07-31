@@ -12,6 +12,9 @@
 #ifdef _WIN32
 
 #define EXCLUSIVE_SCALE_REGISTRATIONS 129
+#define MULTI_WAITERS 4
+#define EXCLUSIVE_MIXED_ORDINARY 2
+#define MULTI_WAIT_TIMEOUT_MS 1000
 
 static int make_loopback_pair(SOCKET *listener_out, SOCKET *client_out,
                               SOCKET *accepted_out)
@@ -73,6 +76,26 @@ static int wait_one(int epfd, int timeout_ms, uint32_t *events_out,
     if (flags_out)
         *flags_out = events[0].flags;
     return 1;
+}
+
+typedef struct multi_wait_context {
+    int epfd;
+    HANDLE started;
+    struct epoll_event event;
+    int result;
+    int error;
+} multi_wait_context_t;
+
+static DWORD WINAPI multi_wait_thread(void *opaque)
+{
+    multi_wait_context_t *context = (multi_wait_context_t *)opaque;
+
+    (void)SetEvent(context->started);
+    errno = 0;
+    context->result = epoll_wait(context->epfd, &context->event, 1,
+                                 MULTI_WAIT_TIMEOUT_MS);
+    context->error = errno;
+    return 0;
 }
 
 static int test_edge_readable(void)
@@ -432,6 +455,469 @@ fail:
     if (client != INVALID_SOCKET) closesocket(client);
     if (listener != INVALID_SOCKET) closesocket(listener);
     return 1;
+}
+
+static void multi_wait_close_ports(int epfds[MULTI_WAITERS])
+{
+    int i;
+
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        if (epfds[i] >= 0) {
+            (void)wepoll_close(epfds[i]);
+            epfds[i] = -1;
+        }
+    }
+}
+
+static int multi_wait_cycle(
+    int epfds[MULTI_WAITERS], const int *waiter_order, SOCKET client,
+    SOCKET accepted, const char *suite_label, const char *order_label,
+    const char *trigger_label, int cycle, int ordinary_count,
+    uint64_t token_base)
+{
+    multi_wait_context_t contexts[MULTI_WAITERS];
+    HANDLE started[MULTI_WAITERS];
+    HANDLE threads[MULTI_WAITERS];
+    int created_threads = 0;
+    int all_threads_done = 0;
+    int exclusive_wakes = 0;
+    int result = 1;
+    int i;
+    char byte;
+
+    memset(contexts, 0, sizeof(contexts));
+    memset(started, 0, sizeof(started));
+    memset(threads, 0, sizeof(threads));
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        started[i] = CreateEventW(NULL, TRUE, FALSE, NULL);
+        contexts[i].epfd = epfds[i];
+        contexts[i].started = started[i];
+        contexts[i].result = -2;
+        if (started[i] == NULL) {
+            fprintf(stderr,
+                    "%s %s %s cycle %d: start event %d "
+                    "failed error=%lu\n",
+                    suite_label, order_label, trigger_label, cycle + 1, i,
+                    (unsigned long)GetLastError());
+            goto done;
+        }
+    }
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        int index = waiter_order[i];
+
+        threads[index] = CreateThread(NULL, 0, multi_wait_thread,
+                                      &contexts[index], 0, NULL);
+        if (threads[index] == NULL) {
+            fprintf(stderr,
+                    "%s %s %s cycle %d: waiter %d failed "
+                    "error=%lu\n",
+                    suite_label, order_label, trigger_label, cycle + 1,
+                    index,
+                    (unsigned long)GetLastError());
+            goto done;
+        }
+        created_threads++;
+    }
+    if (WaitForMultipleObjects(MULTI_WAITERS, started, TRUE,
+                               2000) != WAIT_OBJECT_0) {
+        fprintf(stderr,
+                "%s %s %s cycle %d: waiters did not start\n",
+                suite_label, order_label, trigger_label, cycle + 1);
+        goto done;
+    }
+
+    /* Keep the socket unread until every waiter returns.  This makes a late
+     * scheduled ordinary waiter observe the same persistent level instead of
+     * turning scheduler timing into a missed-wakeup result. */
+    Sleep(50);
+    if (send(client, "x", 1, 0) != 1) {
+        fprintf(stderr,
+                "%s %s %s cycle %d: send failed WSA=%d\n",
+                suite_label, order_label, trigger_label, cycle + 1,
+                WSAGetLastError());
+        goto done;
+    }
+    if (WaitForMultipleObjects(MULTI_WAITERS, threads, TRUE,
+                               MULTI_WAIT_TIMEOUT_MS + 2000) !=
+        WAIT_OBJECT_0) {
+        fprintf(stderr,
+                "%s %s %s cycle %d: bounded waiters hung\n",
+                suite_label, order_label, trigger_label, cycle + 1);
+        goto done;
+    }
+    all_threads_done = 1;
+
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        uint64_t expected = token_base + (uint64_t)i;
+
+        if (i < ordinary_count) {
+            if (contexts[i].result != 1 ||
+                (contexts[i].event.events & EPOLLIN) == 0 ||
+                contexts[i].event.data.u64 != expected) {
+                fprintf(stderr,
+                        "%s %s %s cycle %d: ordinary %d "
+                        "result=%d events=%u data=%llu errno=%d\n",
+                        suite_label, order_label, trigger_label,
+                        cycle + 1, i,
+                        contexts[i].result, contexts[i].event.events,
+                        (unsigned long long)contexts[i].event.data.u64,
+                        contexts[i].error);
+                goto done;
+            }
+        } else if (contexts[i].result == 1) {
+            if ((contexts[i].event.events & EPOLLIN) == 0 ||
+                contexts[i].event.data.u64 != expected) {
+                fprintf(stderr,
+                        "%s %s %s cycle %d: exclusive %d "
+                        "events=%u data=%llu errno=%d\n",
+                        suite_label, order_label, trigger_label,
+                        cycle + 1, i - ordinary_count,
+                        contexts[i].event.events,
+                        (unsigned long long)contexts[i].event.data.u64,
+                        contexts[i].error);
+                goto done;
+            }
+            exclusive_wakes++;
+        } else if (contexts[i].result != 0) {
+            fprintf(stderr,
+                    "%s %s %s cycle %d: exclusive %d "
+                    "result=%d errno=%d\n",
+                    suite_label, order_label, trigger_label, cycle + 1,
+                    i - ordinary_count,
+                    contexts[i].result, contexts[i].error);
+            goto done;
+        }
+    }
+    if (ordinary_count < MULTI_WAITERS && exclusive_wakes == 0) {
+        fprintf(stderr,
+                "%s %s %s cycle %d: no exclusive "
+                "registration woke\n",
+                suite_label, order_label, trigger_label, cycle + 1);
+        goto done;
+    }
+    if (recv(accepted, &byte, 1, 0) != 1) {
+        fprintf(stderr,
+                "%s %s %s cycle %d: recv failed WSA=%d\n",
+                suite_label, order_label, trigger_label, cycle + 1,
+                WSAGetLastError());
+        goto done;
+    }
+    result = 0;
+
+done:
+    if (!all_threads_done && created_threads != 0) {
+        /* Closing the ports is the bounded public wakeup path.  Termination
+         * below is only a last resort if a broken wait ignores that close. */
+        multi_wait_close_ports(epfds);
+    }
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        if (threads[i] != NULL &&
+            WaitForSingleObject(threads[i], 5000) != WAIT_OBJECT_0) {
+            (void)TerminateThread(threads[i], 1);
+        }
+    }
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        if (threads[i] != NULL) {
+            CloseHandle(threads[i]);
+        }
+        if (started[i] != NULL) {
+            CloseHandle(started[i]);
+        }
+    }
+    return result;
+}
+
+static int test_exclusive_mixed_order(int exclusive_first,
+                                      int edge_triggered)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    struct epoll_event output;
+    int epfds[MULTI_WAITERS];
+    int registration_order[MULTI_WAITERS];
+    const char *order_label = exclusive_first ? "exclusive-first" :
+                                                "ordinary-first";
+    const char *trigger_label = edge_triggered ? "ET" : "LT";
+    int result = 1;
+    int cycle;
+    int i;
+
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        epfds[i] = -1;
+        registration_order[i] = exclusive_first
+            ? (i + EXCLUSIVE_MIXED_ORDINARY) % MULTI_WAITERS
+            : i;
+    }
+
+    if (make_loopback_pair(&listener, &client, &accepted) != 0) {
+        fprintf(stderr,
+                "exclusive-mixed %s %s: pair setup failed WSA=%d\n",
+                order_label, trigger_label, WSAGetLastError());
+        goto done;
+    }
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        epfds[i] = epoll_create1(0);
+        if (epfds[i] < 0) {
+            fprintf(stderr,
+                    "exclusive-mixed %s %s: epoll_create1 %d failed "
+                    "errno=%d\n",
+                    order_label, trigger_label, i, errno);
+            goto done;
+        }
+    }
+
+    memset(&event, 0, sizeof(event));
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        int index = registration_order[i];
+
+        event.events = EPOLLIN | (edge_triggered ? EPOLLET : 0);
+        if (index >= EXCLUSIVE_MIXED_ORDINARY) {
+            event.events |= EPOLLEXCLUSIVE;
+        }
+        event.data.u64 = UINT64_C(100) + (uint64_t)index;
+        if (epoll_ctl(epfds[index], EPOLL_CTL_ADD, accepted, &event) != 0) {
+            fprintf(stderr,
+                    "exclusive-mixed %s %s: ADD %d failed errno=%d\n",
+                    order_label, trigger_label, index, errno);
+            goto done;
+        }
+    }
+
+    /* ADD records interest, while the first wait performs the AFD submit.
+     * Pre-arm in the requested order so both ordinary-first and
+     * exclusive-first cases exercise their named native request ordering. */
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        int index = registration_order[i];
+        int n = epoll_wait(epfds[index], &output, 1, 0);
+
+        if (n != 0) {
+            fprintf(stderr,
+                    "exclusive-mixed %s %s: pre-arm %d returned %d "
+                    "events=%u errno=%d\n",
+                    order_label, trigger_label, index, n,
+                    n > 0 ? output.events : 0U, errno);
+            goto done;
+        }
+    }
+
+    for (cycle = 0; cycle < 2; cycle++) {
+        if (cycle != 0) {
+            /* The prior byte is drained.  Every registration must observe
+             * quiescence and reopen its LT/ET readiness path before cycle 2. */
+            for (i = 0; i < MULTI_WAITERS; i++) {
+                int index = registration_order[i];
+                int n = epoll_wait(epfds[index], &output, 1, 0);
+
+                if (n != 0) {
+                    fprintf(stderr,
+                            "exclusive-mixed %s %s: rearm %d returned %d "
+                            "events=%u errno=%d\n",
+                            order_label, trigger_label, index, n,
+                            n > 0 ? output.events : 0U, errno);
+                    goto done;
+                }
+            }
+        }
+        if (multi_wait_cycle(
+                epfds, registration_order, client, accepted,
+                "exclusive-mixed", order_label, trigger_label, cycle,
+                EXCLUSIVE_MIXED_ORDINARY, UINT64_C(100)) != 0) {
+            goto done;
+        }
+        for (i = 0; i < MULTI_WAITERS; i++) {
+            if (epfds[i] < 0) {
+                fprintf(stderr,
+                        "exclusive-mixed %s %s: cycle %d closed port %d\n",
+                        order_label, trigger_label, cycle + 1, i);
+                goto done;
+            }
+        }
+    }
+    result = 0;
+
+done:
+    multi_wait_close_ports(epfds);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return result;
+}
+
+static int test_exclusive_mixed_waiters(void)
+{
+    int edge_triggered;
+    int exclusive_first;
+
+    for (edge_triggered = 0; edge_triggered <= 1; edge_triggered++) {
+        for (exclusive_first = 0; exclusive_first <= 1; exclusive_first++) {
+            if (test_exclusive_mixed_order(exclusive_first,
+                                           edge_triggered) != 0) {
+                return 1;
+            }
+        }
+    }
+    puts("exclusive-mixed: LT/ET ordinary and exclusive wake cycles OK");
+    return 0;
+}
+
+static int test_ordinary_multi_variant(int edge_triggered,
+                                       int readiness_before_wait)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    struct epoll_event output;
+    int epfds[MULTI_WAITERS];
+    int waiter_order[MULTI_WAITERS];
+    const char *suite_label = readiness_before_wait
+        ? "ordinary-prearmed"
+        : "ordinary-multi";
+    const char *trigger_label = edge_triggered ? "ET" : "LT";
+    uint64_t token_base = readiness_before_wait
+        ? UINT64_C(300)
+        : UINT64_C(200);
+    int result = 1;
+    int cycle;
+    int i;
+
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        epfds[i] = -1;
+        waiter_order[i] = i;
+    }
+    if (make_loopback_pair(&listener, &client, &accepted) != 0) {
+        fprintf(stderr, "%s %s: pair setup failed WSA=%d\n",
+                suite_label, trigger_label, WSAGetLastError());
+        goto done;
+    }
+    for (i = 0; i < MULTI_WAITERS; i++) {
+        epfds[i] = epoll_create1(0);
+        if (epfds[i] < 0) {
+            fprintf(stderr,
+                    "%s %s: epoll_create1 %d failed errno=%d\n",
+                    suite_label, trigger_label, i, errno);
+            goto done;
+        }
+        memset(&event, 0, sizeof(event));
+        event.events = EPOLLIN | (edge_triggered ? EPOLLET : 0);
+        event.data.u64 = token_base + (uint64_t)i;
+        if (epoll_ctl(epfds[i], EPOLL_CTL_ADD, accepted, &event) != 0) {
+            fprintf(stderr, "%s %s: ADD %d failed errno=%d\n",
+                    suite_label, trigger_label, i, errno);
+            goto done;
+        }
+    }
+
+    for (cycle = 0; cycle < 2; cycle++) {
+        /* Every zero-time wait submits or rearms its native AFD request while
+         * the socket is quiescent. */
+        for (i = 0; i < MULTI_WAITERS; i++) {
+            int n = epoll_wait(epfds[i], &output, 1, 0);
+
+            if (n != 0) {
+                fprintf(stderr,
+                        "%s %s cycle %d: pre-arm %d returned %d "
+                        "events=%u errno=%d\n",
+                        suite_label, trigger_label, cycle + 1, i, n,
+                        n > 0 ? output.events : 0U, errno);
+                goto done;
+            }
+        }
+
+        if (!readiness_before_wait) {
+            if (multi_wait_cycle(
+                    epfds, waiter_order, client, accepted, suite_label,
+                    "concurrent", trigger_label, cycle, MULTI_WAITERS,
+                    token_base) != 0) {
+                goto done;
+            }
+        } else {
+            char byte;
+
+            if (send(client, "p", 1, 0) != 1) {
+                fprintf(stderr,
+                        "%s %s cycle %d: send failed WSA=%d\n",
+                        suite_label, trigger_label, cycle + 1,
+                        WSAGetLastError());
+                goto done;
+            }
+            /* Readiness exists before any sequential wait.  Waiting in the
+             * reverse of arm order makes a lone first-arm winner visible. */
+            Sleep(50);
+            for (i = 0; i < MULTI_WAITERS; i++) {
+                int index = MULTI_WAITERS - i - 1;
+                uint64_t expected = token_base + (uint64_t)index;
+                int n;
+
+                memset(&output, 0, sizeof(output));
+                errno = 0;
+                n = epoll_wait(epfds[index], &output, 1,
+                               MULTI_WAIT_TIMEOUT_MS);
+                if (n != 1 || (output.events & EPOLLIN) == 0 ||
+                    output.data.u64 != expected) {
+                    fprintf(stderr,
+                            "%s %s cycle %d: wait %d returned %d "
+                            "events=%u data=%llu errno=%d\n",
+                            suite_label, trigger_label, cycle + 1,
+                            index, n, n > 0 ? output.events : 0U,
+                            (unsigned long long)(n > 0
+                                ? output.data.u64
+                                : UINT64_C(0)),
+                            errno);
+                    goto done;
+                }
+            }
+            if (recv(accepted, &byte, 1, 0) != 1) {
+                fprintf(stderr,
+                        "%s %s cycle %d: recv failed WSA=%d\n",
+                        suite_label, trigger_label, cycle + 1,
+                        WSAGetLastError());
+                goto done;
+            }
+        }
+        for (i = 0; i < MULTI_WAITERS; i++) {
+            if (epfds[i] < 0) {
+                fprintf(stderr,
+                        "%s %s cycle %d: port %d closed unexpectedly\n",
+                        suite_label, trigger_label, cycle + 1, i);
+                goto done;
+            }
+        }
+    }
+    result = 0;
+
+done:
+    multi_wait_close_ports(epfds);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return result;
+}
+
+static int test_ordinary_multi_waiters(void)
+{
+    int edge_triggered;
+
+    for (edge_triggered = 0; edge_triggered <= 1; edge_triggered++) {
+        if (test_ordinary_multi_variant(edge_triggered, 0) != 0)
+            return 1;
+    }
+    puts("ordinary-multi: four LT/ET ports woke across two cycles");
+    return 0;
+}
+
+static int test_ordinary_prearmed_waiters(void)
+{
+    int edge_triggered;
+
+    for (edge_triggered = 0; edge_triggered <= 1; edge_triggered++) {
+        if (test_ordinary_multi_variant(edge_triggered, 1) != 0)
+            return 1;
+    }
+    puts("ordinary-prearmed: all idle LT/ET ports retained readiness");
+    return 0;
 }
 
 static int test_exclusive_disjoint_classes(void)
@@ -981,6 +1467,12 @@ static int run_mode(const char *mode)
         return test_exclusive_two_cycles(0);
     if (strcmp(mode, "exclusive-et") == 0)
         return test_exclusive_two_cycles(1);
+    if (strcmp(mode, "exclusive-mixed") == 0)
+        return test_exclusive_mixed_waiters();
+    if (strcmp(mode, "ordinary-multi") == 0)
+        return test_ordinary_multi_waiters();
+    if (strcmp(mode, "ordinary-prearmed") == 0)
+        return test_ordinary_prearmed_waiters();
     if (strcmp(mode, "exclusive-disjoint") == 0)
         return test_exclusive_disjoint_classes();
     if (strcmp(mode, "exclusive-scale") == 0)
@@ -1001,7 +1493,8 @@ int main(int argc, char **argv)
     int failures = 0;
     const char *modes[] = {
         "readable", "writable", "exclusive-mod", "exclusive-wake",
-        "exclusive-et", "exclusive-disjoint", "exclusive-scale",
+        "exclusive-et", "exclusive-mixed", "ordinary-multi",
+        "ordinary-prearmed", "exclusive-disjoint", "exclusive-scale",
         "exclusive-invalid", "pwait-sigmask", "wakeup-flag"
     };
     size_t i;

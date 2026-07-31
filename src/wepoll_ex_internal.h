@@ -461,6 +461,22 @@ struct ep_sock {
      * internal retry interval, avoiding a tight immediate-completion loop. */
     uint8_t et_holdoff;
 
+    /* Intrusive membership in the process-wide active AFD target-key index.
+     * AFD can couple poll requests that use the same numeric target HANDLE,
+     * even when they belong to different epoll ports.  Each in-flight poll
+     * therefore owns a distinct key.  A duplicated target is closed after
+     * the request reaches STATUS_PENDING; when possible, a live handle in
+     * afd_poll_key_reservation keeps that numeric slot occupied until the
+     * completion releases the index entry.  It is a non-socket event; a
+     * failed duplicate close is never retried by numeric HANDLE because reuse
+     * could target an unrelated object.  The global AFD key lock protects
+     * mutations and cross-port traversal of these fields; the owning port's
+     * fd_table_lock serializes ordinary same-registration reads. */
+    HANDLE afd_poll_target;
+    HANDLE afd_poll_key_reservation;
+    struct ep_sock *afd_poll_key_next;
+    uint8_t afd_poll_key_owned;
+
     /* Intrusive membership in the process-wide EPOLLEXCLUSIVE claim index.
      * A registration owns at most one node whose bitset represents its read,
      * write, and terminal claims.  The global exclusive lock protects these
@@ -697,6 +713,8 @@ typedef enum ep_fault_point {
     EP_FAULT_AFD_OPEN,
     EP_FAULT_AFD_SUBMIT,
     EP_FAULT_AFD_CANCEL,
+    EP_FAULT_AFD_KEY_RESERVATION,
+    EP_FAULT_AFD_KEY_COLLISION_GROW,
     EP_FAULT_ENDPOINT_IDENTITY,
     EP_FAULT_ENDPOINT_UNAVAILABLE,
     EP_FAULT_PROVIDER_BASE,
@@ -793,6 +811,7 @@ int      ep_afd_open(HANDLE iocp, HANDLE *out);
 int      ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events,
                             int *pending_out);
 int      ep_afd_cancel(ep_sock_t *sock);
+void     ep_afd_poll_key_release(ep_sock_t *sock);
 uint32_t ep_afd_to_epoll_events(ULONG afd_events, NTSTATUS afd_status,
                                 uint8_t socket_protocol);
 uint32_t ep_epoll_to_afd_events(uint32_t epoll_events);

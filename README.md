@@ -243,10 +243,10 @@ Every successful MOD clears that parking state and performs a fresh scan, so
 MOD to normal-read interest exposes the preserved datagram and same-mask MOD
 refreshes implicit error observation. Flags-only ET and ONESHOT registrations
 use the same hidden probe and retain their duplicate-suppression/rearm rules.
-The hidden receive request deliberately uses non-exclusive AFD submission even
-for `EPOLLEXCLUSIVE`, because an ordinary datagram must not cancel a peer's
-legitimate read poll; the process-local terminal claim still arbitrates error
-delivery. Public IPv4/IPv6 probes enable
+All public AFD polls use non-exclusive submission, including this hidden
+receive interest, so an exclusive registration cannot cancel an ordinary
+peer's legitimate poll. The process-local terminal claim still arbitrates
+exclusive error delivery. Public IPv4/IPv6 probes enable
 `SIO_UDP_CONNRESET`, arm before sending, require two LT error observations,
 then verify `recv() == WSAECONNRESET`; a timeout is a genuine skip only when a
 nonblocking peek also reports `WSAEWOULDBLOCK`.
@@ -277,7 +277,17 @@ unsupported event bits. Every MOD of a registration added exclusive returns
 `EINVAL`, even when the MOD mask omits `EPOLLEXCLUSIVE`. An allocation-free
 process-wide claim index uses intrusive registration nodes and hash buckets to
 track read, write, and terminal readiness independently, so a continuously
-writable exclusive owner does not suppress a disjoint read wake. Windows
+writable exclusive owner does not suppress a disjoint read wake. Kernel polls
+remain non-exclusive. Because AFD can nevertheless couple concurrent requests
+that name the same numeric target handle, an intrusive process-wide key index
+assigns every outstanding wepoll-ex poll a distinct target value. The first
+request can use the provider base directly; a collision uses a transient
+duplicate only through submission, then normally reserves that numeric slot
+with a non-socket event until completion. The logical index remains
+authoritative if slot reservation is unavailable. This lets every ordinary
+local epoll instance receive matching readiness without retaining the socket
+or delaying native `closesocket()`/peer FIN, while the claim index admits at
+least one local exclusive instance and filters the rest. Windows
 `epoll_pwait*` accepts a non-null signal-mask pointer and ignores it (there is
 no POSIX process signal mask). Linux `epoll_pwait2_ex` applies a supplied mask
 atomically through the native wait or its chunked fallback. Positive finite
@@ -298,9 +308,13 @@ socket `EPOLLRDBAND` and `EPOLLWRBAND` interests are accepted but inert,
 `EPOLLMSG` is never produced, `SO_OOBINLINE` collapses priority into ordinary
 readability, UDP resets on synchronous/non-overlapped or layered sockets and
 errors queued behind a parked unread datagram retain the receive-qualification
-caveats above, hidden readless UDP probes temporarily weaken native
-cross-process AFD exclusivity, unknown provider protocol metadata retains a
-conservative abort mapping, pipe
+caveats above, exclusive arbitration is process-local so separate processes
+may each receive an exclusive wake for the same socket, the claim and active-
+target indexes coordinate only registrations within one process and one loaded
+wepoll-ex image, separately linked static copies and distinct loaded DLL images
+do not coordinate, the active-target index cannot arbitrate unrelated raw AFD
+consumers, unknown provider protocol metadata retains a conservative abort
+mapping, pipe
 writable readiness can remain advisory when native local
 information is unavailable or access is denied,
 exclusive-claim updates serialize through one process-wide mutex, and virtual

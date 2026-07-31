@@ -161,6 +161,18 @@ static ep_sock_t *fixture_sock(state_fixture_t *fixture)
     return sock;
 }
 
+static ep_sock_t *single_port_sock(ep_port_t *port)
+{
+    ep_sock_t *sock;
+
+    if (port == NULL) return NULL;
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    if (sock != NULL && sock->next != NULL) sock = NULL;
+    pthread_mutex_unlock(&port->fd_table_lock);
+    return sock;
+}
+
 /* Attach inert registrations to the live-socket list without allocating
  * Winsock handles.  They are deliberately absent from both worklists and the
  * fd table; this lets the queued-rearm regression distinguish O(work) from an
@@ -1057,6 +1069,7 @@ static volatile LONG udp_submit_calls;
 static volatile LONG udp_submit_invalid;
 static ULONG udp_submit_events[UDP_SUBMIT_CAPTURE_LIMIT];
 static ULONG udp_submit_exclusive[UDP_SUBMIT_CAPTURE_LIMIT];
+static HANDLE udp_submit_handles[UDP_SUBMIT_CAPTURE_LIMIT];
 static volatile LONG udp_probe_calls;
 static volatile LONG udp_probe_mismatch;
 static ep_sock_t *udp_probe_expected_sock;
@@ -1069,6 +1082,7 @@ static void udp_capture_reset(ep_udp_read_probe_result_t probe_result)
     InterlockedExchange(&udp_submit_invalid, 0);
     memset(udp_submit_events, 0, sizeof(udp_submit_events));
     memset(udp_submit_exclusive, 0, sizeof(udp_submit_exclusive));
+    memset(udp_submit_handles, 0, sizeof(udp_submit_handles));
     InterlockedExchange(&udp_probe_calls, 0);
     InterlockedExchange(&udp_probe_mismatch, 0);
     udp_probe_expected_sock = NULL;
@@ -1107,6 +1121,7 @@ static NTSTATUS NTAPI udp_submit_capture_stub(
     if (call >= 0 && call < UDP_SUBMIT_CAPTURE_LIMIT) {
         udp_submit_events[call] = info->Handles[0].Events;
         udp_submit_exclusive[call] = info->Exclusive;
+        udp_submit_handles[call] = info->Handles[0].Handle;
     }
     return udp_submit_result;
 }
@@ -1186,6 +1201,7 @@ static int test_cached_base_submit(void)
         result = 0;
     }
     g_ntdll.NtDeviceIoControlFile = original_submit;
+    ep_afd_poll_key_release(&sock);
     atomic_store(&sock.poll_status, EP_POLL_IDLE);
     free(sock.afd_info);
     return result;
@@ -1226,6 +1242,7 @@ static void udp_state_discard_synthetic_pending(udp_state_case_t *test_case)
                                        memory_order_relaxed);
     if (poll_status == EP_POLL_PENDING ||
         poll_status == EP_POLL_CANCELLED) {
+        ep_afd_poll_key_release(sock);
         if (port->pending_poll_count > 0) {
             port->pending_poll_count--;
         }
@@ -1301,6 +1318,172 @@ static int udp_state_complete(udp_state_case_t *test_case,
     }
     ep_sock_handle_completion(sock, 0, completion_status);
     return 0;
+}
+
+static int state_complete_socket_receive(ep_port_t *port, ep_sock_t *sock)
+{
+    int pending;
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    pending = atomic_load_explicit(&sock->poll_status,
+                                   memory_order_relaxed) == EP_POLL_PENDING &&
+        port->pending_poll_count > 0 && sock->afd_info != NULL;
+    if (pending) {
+        sock->afd_info->NumberOfHandles = 1;
+        sock->afd_info->Handles[0].Events = AFD_POLL_RECEIVE;
+        sock->afd_info->Handles[0].Status = STATUS_SUCCESS;
+        sock->io_status_block.Status = STATUS_SUCCESS;
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!pending) {
+        ep_set_errno(EIO);
+        return -1;
+    }
+    ep_sock_handle_completion(sock, 0, STATUS_SUCCESS);
+    return 0;
+}
+
+static void state_discard_synthetic_pending(ep_port_t *port)
+{
+    ep_sock_t *sock = single_port_sock(port);
+    uint32_t poll_status;
+
+    if (sock == NULL) return;
+    pthread_mutex_lock(&port->fd_table_lock);
+    poll_status = atomic_load_explicit(&sock->poll_status,
+                                       memory_order_relaxed);
+    if (poll_status == EP_POLL_PENDING ||
+        poll_status == EP_POLL_CANCELLED) {
+        ep_afd_poll_key_release(sock);
+        if (port->pending_poll_count > 0) {
+            port->pending_poll_count--;
+        }
+        atomic_store_explicit(&sock->poll_status, EP_POLL_IDLE,
+                              memory_order_relaxed);
+        sock->io_status_block.Status = STATUS_CANCELLED;
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+}
+
+/* AFD's native Exclusive bit cancels peer polls for the same provider base,
+ * including ordinary registrations.  Linux mixed EPOLLEXCLUSIVE semantics
+ * require every ordinary watcher to remain eligible while at least one
+ * exclusive watcher may win.  Keep the native submission non-exclusive and
+ * exercise the process-wide claim filter with synthetic identical receives. */
+static int test_exclusive_mixed_submit(void)
+{
+    state_fixture_t fixture;
+    ep_port_t *exclusive_ports[2] = {NULL, NULL};
+    ep_sock_t *socks[3] = {NULL, NULL, NULL};
+    epoll_data_t data;
+    epoll_event_ex ignored;
+    PNtDeviceIoControlFile original_submit = NULL;
+    int contexts[3] = {0, 0, 0};
+    int submit_replaced = 0;
+    int result = -1;
+    int i;
+
+    fixture_reset(&fixture);
+    if (fixture_open(&fixture) != 0) return -1;
+
+    original_submit = g_ntdll.NtDeviceIoControlFile;
+    udp_capture_reset(EP_UDP_READ_PROBE_NOT_READY);
+    g_ntdll.NtDeviceIoControlFile = udp_submit_capture_stub;
+    submit_replaced = 1;
+
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x6d697865645f6f72); /* "mixed_or" */
+    if (ep_port_register(fixture.port, fixture.server, EPOLLIN, 0,
+                         data, &contexts[0]) != 0)
+        goto cleanup;
+    memset(&ignored, 0, sizeof(ignored));
+    if (ep_port_wait(fixture.port, &ignored, 1, 0, NULL) != 0)
+        goto cleanup;
+
+    for (i = 0; i < 2; i++) {
+        data.u64 = UINT64_C(0x6d697865645f6578) + (uint64_t)i;
+        if (ep_port_create(0, 0, &exclusive_ports[i]) != 0 ||
+            ep_port_register(exclusive_ports[i], fixture.server,
+                             EPOLLIN | EPOLLEXCLUSIVE | EPOLLET,
+                             EPOLLEXCLUSIVE | EPOLLET, data,
+                             &contexts[i + 1]) != 0)
+            goto cleanup;
+        memset(&ignored, 0, sizeof(ignored));
+        if (ep_port_wait(exclusive_ports[i], &ignored, 1, 0, NULL) != 0)
+            goto cleanup;
+    }
+
+    /* The capture seam sees all public socket requests, including the two
+     * EPOLLEXCLUSIVE registrations.  None may ask AFD to cancel the ordinary
+     * pending request. */
+    if (InterlockedCompareExchange(&udp_submit_calls, 0, 0) != 3 ||
+        InterlockedCompareExchange(&udp_submit_invalid, 0, 0) != 0 ||
+        udp_submit_exclusive[0] != FALSE ||
+        udp_submit_exclusive[1] != FALSE ||
+        udp_submit_exclusive[2] != FALSE)
+        goto cleanup;
+
+    socks[0] = fixture_sock(&fixture);
+    socks[1] = single_port_sock(exclusive_ports[0]);
+    socks[2] = single_port_sock(exclusive_ports[1]);
+    if (socks[0] == NULL || socks[1] == NULL || socks[2] == NULL ||
+        socks[0]->base_socket != socks[1]->base_socket ||
+        socks[0]->base_socket != socks[2]->base_socket ||
+        udp_submit_handles[0] !=
+            (HANDLE)(uintptr_t)socks[0]->base_socket ||
+        udp_submit_handles[1] == udp_submit_handles[0] ||
+        udp_submit_handles[2] == udp_submit_handles[0] ||
+        udp_submit_handles[2] == udp_submit_handles[1] ||
+        socks[0]->afd_poll_key_reservation != NULL ||
+        (socks[1]->afd_poll_key_reservation != NULL &&
+         socks[1]->afd_poll_key_reservation != udp_submit_handles[1]) ||
+        (socks[2]->afd_poll_key_reservation != NULL &&
+         socks[2]->afd_poll_key_reservation != udp_submit_handles[2]) ||
+        (socks[1]->user_flags & EPOLLEXCLUSIVE) == 0 ||
+        (socks[2]->user_flags & EPOLLEXCLUSIVE) == 0)
+        goto cleanup;
+
+    if (send_byte(fixture.client) != 0 ||
+        state_complete_socket_receive(fixture.port, socks[0]) != 0 ||
+        state_complete_socket_receive(exclusive_ports[0], socks[1]) != 0 ||
+        state_complete_socket_receive(exclusive_ports[1], socks[2]) != 0)
+        goto cleanup;
+
+    if (atomic_load_explicit(&fixture.port->ready_queue.queued,
+                             memory_order_relaxed) != 1 ||
+        atomic_load_explicit(&exclusive_ports[0]->ready_queue.queued,
+                             memory_order_relaxed) != 1 ||
+        atomic_load_explicit(&exclusive_ports[1]->ready_queue.queued,
+                             memory_order_relaxed) != 0 ||
+        socks[1]->exclusive_claim_classes == 0 ||
+        socks[2]->exclusive_claim_classes != 0 ||
+        socks[0]->afd_poll_key_owned != 0 ||
+        socks[1]->afd_poll_key_owned != 0 ||
+        socks[2]->afd_poll_key_owned != 0 ||
+        socks[0]->afd_poll_key_reservation != NULL ||
+        socks[1]->afd_poll_key_reservation != NULL ||
+        socks[2]->afd_poll_key_reservation != NULL ||
+        socks[1]->needs_rearm != 0 || socks[2]->needs_rearm == 0 ||
+        fixture.port->pending_poll_count != 0 ||
+        exclusive_ports[0]->pending_poll_count != 0 ||
+        exclusive_ports[1]->pending_poll_count != 0)
+        goto cleanup;
+
+    result = 0;
+
+cleanup:
+    if (submit_replaced)
+        g_ntdll.NtDeviceIoControlFile = original_submit;
+    for (i = 0; i < 2; i++) {
+        if (exclusive_ports[i] != NULL) {
+            state_discard_synthetic_pending(exclusive_ports[i]);
+            if (ep_port_destroy(exclusive_ports[i]) != 0) result = -1;
+            exclusive_ports[i] = NULL;
+        }
+    }
+    state_discard_synthetic_pending(fixture.port);
+    fixture_close(&fixture);
+    return result;
 }
 
 static int expect_one_oneshot(ep_port_t *port, uint64_t value,
@@ -1596,7 +1779,7 @@ static int run_udp_readless_park_case(
         InterlockedCompareExchange(&udp_submit_calls, 0, 0) == 2 &&
         InterlockedCompareExchange(&udp_submit_invalid, 0, 0) == 0 &&
         udp_submit_events[1] == terminal_events &&
-        udp_submit_exclusive[1] == TRUE &&
+        udp_submit_exclusive[1] == FALSE &&
         ep_port_worklists_valid_locked(test_case.fixture.port);
     pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
     if (!state_ok) {
@@ -3729,6 +3912,8 @@ int main(int argc, char **argv)
         result = test_pipe_invalid_et_snapshot();
     } else if (strcmp(argv[1], "large-wait") == 0) {
         result = test_large_wait();
+    } else if (strcmp(argv[1], "exclusive-mixed-submit") == 0) {
+        result = test_exclusive_mixed_submit();
     }
     (void)WSACleanup();
 

@@ -350,6 +350,8 @@ static int test_afd_submit(void)
 cleanup:
     if (stub_installed)
         g_ntdll.NtDeviceIoControlFile = original_submit;
+    ep_afd_poll_key_release(&first);
+    ep_afd_poll_key_release(&second);
     free(first.afd_info);
     free(second.afd_info);
     if (first_fd != INVALID_SOCKET)
@@ -357,6 +359,218 @@ cleanup:
     if (second_fd != INVALID_SOCKET)
         (void)closesocket(second_fd);
     ep_fault_reset();
+    return result;
+}
+
+#define AFD_KEY_UNRESERVED_OWNER_COUNT 9
+#define AFD_KEY_OWNER_COUNT (AFD_KEY_UNRESERVED_OWNER_COUNT + 1)
+#define AFD_KEY_SOCK_COUNT (AFD_KEY_OWNER_COUNT + 1)
+
+static HANDLE g_afd_key_captured[AFD_KEY_SOCK_COUNT];
+static int g_afd_key_capture_count;
+static int g_afd_key_capture_invalid;
+
+static NTSTATUS NTAPI afd_key_submit_stub(
+    HANDLE file_handle, HANDLE event, PIO_APC_ROUTINE apc_routine,
+    PVOID apc_context, PIO_STATUS_BLOCK io_status_block, ULONG ioctl,
+    PVOID input_buffer, ULONG input_length, PVOID output_buffer,
+    ULONG output_length)
+{
+    AFD_POLL_INFO *info = (AFD_POLL_INFO *)input_buffer;
+
+    (void)file_handle;
+    (void)event;
+    (void)apc_routine;
+    (void)apc_context;
+    (void)io_status_block;
+    (void)output_buffer;
+    (void)output_length;
+
+    if (ioctl != IOCTL_AFD_POLL || info == NULL ||
+        input_length < sizeof(*info) || info->NumberOfHandles != 1 ||
+        g_afd_key_capture_count >= AFD_KEY_SOCK_COUNT) {
+        g_afd_key_capture_invalid = 1;
+    } else {
+        g_afd_key_captured[g_afd_key_capture_count] =
+            info->Handles[0].Handle;
+    }
+    g_afd_key_capture_count++;
+
+    /* The optional reservation bookkeeping must preserve the status/error
+     * state left by the actual submit call, including when its fault hook
+     * suppresses CreateEventW. */
+    ep_set_errno(ERANGE);
+    SetLastError(ERROR_BUSY);
+    return STATUS_PENDING;
+}
+
+static int afd_key_owner_valid(const ep_sock_t *sock, HANDLE key)
+{
+    return sock->afd_poll_key_owned != 0 &&
+           sock->afd_poll_target == key &&
+           sock->afd_poll_key_reservation == NULL &&
+           atomic_load_explicit(&sock->poll_status,
+                                memory_order_relaxed) == EP_POLL_PENDING;
+}
+
+static int afd_key_released(const ep_sock_t *sock)
+{
+    return sock->afd_poll_key_owned == 0 &&
+           sock->afd_poll_target == NULL &&
+           sock->afd_poll_key_reservation == NULL &&
+           sock->afd_poll_key_next == NULL;
+}
+
+static int test_afd_key_fallback(void)
+{
+    ep_port_t port;
+    ep_sock_t socks[AFD_KEY_SOCK_COUNT];
+    SOCKET socket_fd = INVALID_SOCKET;
+    PNtDeviceIoControlFile original_submit = NULL;
+    DWORD baseline_handles = 0;
+    DWORD handles_after = 0;
+    int stub_installed = 0;
+    int result = -1;
+    const uint32_t failed_old_mask = UINT32_C(0x5a5a);
+
+    memset(&port, 0, sizeof(port));
+    memset(socks, 0, sizeof(socks));
+    memset(g_afd_key_captured, 0, sizeof(g_afd_key_captured));
+    port.afd = (HANDLE)(uintptr_t)1;
+    ep_fault_reset();
+    if (ep_global_init() != 0)
+        goto cleanup;
+
+    socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_fd == INVALID_SOCKET)
+        goto cleanup;
+    for (size_t i = 0; i < AFD_KEY_SOCK_COUNT; i++)
+        submit_sock_init(&socks[i], &port, socket_fd, 0);
+    socks[AFD_KEY_OWNER_COUNT].submitted_afd_events = failed_old_mask;
+
+    original_submit = g_ntdll.NtDeviceIoControlFile;
+    g_ntdll.NtDeviceIoControlFile = afd_key_submit_stub;
+    stub_installed = 1;
+    g_afd_key_capture_count = 0;
+    g_afd_key_capture_invalid = 0;
+
+    if (ep_afd_poll_submit(&socks[0], AFD_POLL_RECEIVE, NULL) != 0 ||
+        g_afd_key_capture_count != 1 || g_afd_key_capture_invalid ||
+        !afd_key_owner_valid(&socks[0], g_afd_key_captured[0])) {
+        goto cleanup;
+    }
+    if (!GetProcessHandleCount(GetCurrentProcess(), &baseline_handles))
+        goto cleanup;
+
+    /* Leave nine duplicate target slots deliberately unreserved.  Every new
+     * claim must walk all stale active keys and still capture a distinct one.
+     * The submit stub's errno proves the reservation fault remains optional
+     * bookkeeping rather than leaking its injected error. */
+    for (size_t i = 1; i < AFD_KEY_OWNER_COUNT; i++) {
+        ep_fault_reset();
+        if (ep_fault_configure(EP_FAULT_AFD_KEY_RESERVATION,
+                               1, EACCES) != 0) {
+            goto cleanup;
+        }
+        errno = 0;
+        if (ep_afd_poll_submit(&socks[i], AFD_POLL_RECEIVE, NULL) != 0 ||
+            errno != ERANGE ||
+            ep_fault_hits(EP_FAULT_AFD_KEY_RESERVATION) != 1 ||
+            g_afd_key_capture_count != (int)i + 1 ||
+            g_afd_key_capture_invalid ||
+            !afd_key_owner_valid(&socks[i], g_afd_key_captured[i])) {
+            goto cleanup;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (g_afd_key_captured[j] == g_afd_key_captured[i])
+                goto cleanup;
+        }
+    }
+
+    if (!GetProcessHandleCount(GetCurrentProcess(), &handles_after) ||
+        handles_after != baseline_handles) {
+        goto cleanup;
+    }
+
+    /* Nine collisions make the scratch array grow from eight to sixteen.
+     * Fail that second growth: the current duplicate and all eight retained
+     * duplicates must close, the candidate must remain wholly unowned, and
+     * the established owners must remain unchanged. */
+    ep_fault_reset();
+    if (ep_fault_configure(EP_FAULT_AFD_KEY_COLLISION_GROW,
+                           2, ENOSPC) != 0) {
+        goto cleanup;
+    }
+    errno = 0;
+    if (ep_afd_poll_submit(&socks[AFD_KEY_OWNER_COUNT],
+                           AFD_POLL_SEND, NULL) != -1 ||
+        errno != ENOSPC ||
+        ep_fault_hits(EP_FAULT_AFD_KEY_COLLISION_GROW) != 2 ||
+        g_afd_key_capture_count != AFD_KEY_OWNER_COUNT ||
+        atomic_load_explicit(&socks[AFD_KEY_OWNER_COUNT].poll_status,
+                             memory_order_relaxed) != EP_POLL_IDLE ||
+        socks[AFD_KEY_OWNER_COUNT].submitted_afd_events != failed_old_mask ||
+        !afd_key_released(&socks[AFD_KEY_OWNER_COUNT])) {
+        goto cleanup;
+    }
+    if (!GetProcessHandleCount(GetCurrentProcess(), &handles_after) ||
+        handles_after != baseline_handles) {
+        goto cleanup;
+    }
+    for (size_t i = 0; i < AFD_KEY_OWNER_COUNT; i++) {
+        if (!afd_key_owner_valid(&socks[i], g_afd_key_captured[i]))
+            goto cleanup;
+    }
+
+    /* A clean retry must walk the still-owned keys and capture one more
+     * distinct target, demonstrating that failure inserted no dangling key
+     * and removed none of the preceding owners. */
+    ep_fault_reset();
+    if (ep_fault_configure(EP_FAULT_AFD_KEY_RESERVATION,
+                           1, EACCES) != 0) {
+        goto cleanup;
+    }
+    errno = 0;
+    if (ep_afd_poll_submit(&socks[AFD_KEY_OWNER_COUNT],
+                           AFD_POLL_SEND, NULL) != 0 ||
+        errno != ERANGE ||
+        ep_fault_hits(EP_FAULT_AFD_KEY_RESERVATION) != 1 ||
+        g_afd_key_capture_count != AFD_KEY_SOCK_COUNT ||
+        g_afd_key_capture_invalid ||
+        !afd_key_owner_valid(&socks[AFD_KEY_OWNER_COUNT],
+                             g_afd_key_captured[AFD_KEY_OWNER_COUNT])) {
+        goto cleanup;
+    }
+    for (size_t i = 0; i < AFD_KEY_OWNER_COUNT; i++) {
+        if (g_afd_key_captured[i] ==
+            g_afd_key_captured[AFD_KEY_OWNER_COUNT]) {
+            goto cleanup;
+        }
+    }
+    if (!GetProcessHandleCount(GetCurrentProcess(), &handles_after) ||
+        handles_after != baseline_handles) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (stub_installed)
+        g_ntdll.NtDeviceIoControlFile = original_submit;
+    ep_fault_reset();
+    for (size_t i = 0; i < AFD_KEY_SOCK_COUNT; i++) {
+        ep_afd_poll_key_release(&socks[i]);
+        if (!afd_key_released(&socks[i]))
+            result = -1;
+        free(socks[i].afd_info);
+    }
+    if (socket_fd != INVALID_SOCKET) {
+        if (baseline_handles != 0 &&
+            (!GetProcessHandleCount(GetCurrentProcess(), &handles_after) ||
+             handles_after != baseline_handles)) {
+            result = -1;
+        }
+        (void)closesocket(socket_fd);
+    }
     return result;
 }
 
@@ -1686,6 +1900,7 @@ static const fault_test_case_t g_tests[] = {
     { "provider-base", test_provider_base },
     { "afd-open", test_afd_open },
     { "afd-submit", test_afd_submit },
+    { "afd-key-fallback", test_afd_key_fallback },
     { "afd-cancel", test_afd_cancel },
     { "endpoint-identity", test_endpoint_identity },
     { "endpoint-policy", test_endpoint_policy },
@@ -1751,7 +1966,8 @@ int main(int argc, char **argv)
 
     fprintf(stderr,
             "usage: %s [all|framework|pool-init|pool-grow|provider-base|"
-            "afd-open|afd-submit|afd-cancel|endpoint-identity|"
+            "afd-open|afd-submit|afd-key-fallback|afd-cancel|"
+            "endpoint-identity|"
             "endpoint-policy|endpoint-closed-token-loss|iocp-create|"
             "iocp-post|iocp-dequeue|"
             "aux-closed-iocp|aux-post|aux-post-immediate|ready-node-alloc|"

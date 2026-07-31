@@ -281,6 +281,34 @@ The API, large-wait, and pool tests passed five repeats, and ASan/UBSan passed
 4/4. Because the production and test changes are POSIX-selected, the unchanged
 strict Windows lane was rebuilt and its full 164/164 CTest suite passed.
 
+The later July 31, 2026 same-socket fanout qualification used Windows
+10.0.19044 with MSYS2 MinGW GCC 15.2 and
+`-O2 -Wall -Wextra -Wpedantic -Werror`. Best-effort combined, static-only,
+shared-only, strict combined, and strict shared-only passed 169/169, 167/167,
+97/97, 169/169, and 97/97 CTest entries. Synchronized combined and shared-only
+passed 165/169 and 93/97, with only the four expected native-reuse identity
+skips required by their DEL-before-close contract. Every applicable focused
+subset passed three repeats in all seven lanes: 65/65 selections per repeat in
+the combined, static, strict, and synchronized builds, and 48/48 in each
+shared-only build. The optimized fanout modes also passed 160/160 standalone
+executions: 20 each for mixed-exclusive, ordinary-multi, and prearmed
+readiness, plus 50 each for state and fault coverage. Linux/WSL GCC 14.2
+strict native and forced-fallback Release passed 5/5 each, the API, large-wait,
+and pool executables passed five repeats, and ASan/UBSan passed 4/4.
+
+A sequential three-run `bench_windows --production` comparison on the same
+Windows host used an Intel i5-8300H, 31.9 GiB RAM, MinGW GCC 15.2, CMake 4.3.1,
+best-effort static Release builds with
+`-O3 -DNDEBUG -std=c11 -Wall -Wextra -Wpedantic -Werror`, and commit `1153930`
+as the baseline. Median p50 changed by +10.8% for artificial ADD+MOD+DEL
+control churn, +3.3% for
+oneshot round trips, +5.0% for one-ready waits, +0.6% for 16-ready waits, and
++0.7% for 64-ready waits; oneshot rearm remained 1.5 microseconds. Registration
+scaling through 50,000 sockets was broadly neutral. The 512-ready median
+measured -6.9%, but that row was too variable to interpret. These local
+loopback measurements expose a real control-path cost for key arbitration and
+do not establish a portable performance limit.
+
 Windows socket lifetime is now an explicit CMake policy:
 `WEPOLL_EX_SOCKET_LIFETIME_MODE=best-effort|strict|synchronized`.
 Best-effort remains the default, strict rejects providers without stable WFP
@@ -398,12 +426,26 @@ Windows `EPOLLET` and ADD-time `EPOLLEXCLUSIVE` are no longer rejected.
 Socket edge-triggered delivery latches observed interest bits from AFD level
 snapshots and suppresses redelivery until those bits clear and reassert; empty
 edge observations use throttled deferred re-sampling. Exclusive registrations
-submit AFD polls with `Exclusive=TRUE`; a process-wide claim filter tracks
-read, write, and terminal readiness independently, filters only conflicting
-classes from mixed snapshots, and releases a class after pending submission or
-an inactive directional sample proves it quiescent. Every MOD of an exclusive
-registration returns `EINVAL`, even when the MOD mask omits
-`EPOLLEXCLUSIVE`.
+submit non-exclusive AFD polls so they cannot cancel ordinary peers. A
+process-wide active target-key index also assigns distinct numeric HANDLE
+values to simultaneous AFD requests, preventing non-exclusive polls on the
+same provider socket from collapsing to one completion. Collisions use a
+provider-handle duplicate only through submission and normally reserve its
+numeric slot with a non-socket event until completion, preserving native
+`closesocket()` and peer FIN behavior. A failed duplicate `CloseHandle` is not
+retried by numeric value because HANDLE reuse could target an unrelated object;
+the logical index remains authoritative and a possibly live duplicate is
+deliberately leaked. A separate process-wide claim filter
+tracks read, write, and terminal readiness independently, admits one local
+exclusive owner while every ordinary local instance wakes, filters only
+conflicting classes from other exclusive mixed snapshots, and releases a class
+after pending submission or an inactive directional sample proves it
+quiescent. Every MOD of an exclusive registration returns `EINVAL`, even when
+the MOD mask omits `EPOLLEXCLUSIVE`. The claim and active-target indexes
+coordinate only registrations within one process and one loaded wepoll-ex
+image. Separately linked static copies, distinct loaded DLL images, unrelated
+raw AFD users, and separate processes maintain independent state and do not
+coordinate.
 
 The exclusive claim filter now stores each owner's readiness-class bitset in
 an intrusive registration node indexed through process-wide hash buckets. This
@@ -538,9 +580,10 @@ unqualified. AFD is undocumented, and `_WIN32_WINNT=0x0602` remains the
 Windows 8-or-later compile/runtime assumption.
 Windows now accepts `EPOLLET` and ADD-time `EPOLLEXCLUSIVE`. Socket edge
 delivery is an observed-bit filter over AFD level reports rather than a kernel
-edge queue, and exclusive wake uniqueness relies on AFD exclusive-poll
-cancellation plus a readiness-class-granular process-wide claim index among
-wepoll-ex instances. Non-null
+edge queue. Distinct process-local AFD target keys let every ordinary local
+instance receive matching readiness, while exclusive wake uniqueness relies on
+a readiness-class-granular process-wide claim index among wepoll-ex instances.
+Non-null
 Windows signal-mask pointers are accepted and ignored, `EPOLLWAKEUP` is a
 no-op, and high-resolution `epoll_pwait2*` deadlines remain subject to Windows
 scheduler latency and a transparent millisecond fallback. `EPOLLEXCLUSIVE`

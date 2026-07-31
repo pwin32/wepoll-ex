@@ -392,9 +392,10 @@ temporary fallback signal mask before unwinding.
   suppressed and parks that bit; completion immediately rearms the remaining
   terminal interests even for ET, avoiding a persistent IOCP receive loop.
   MOD and ONESHOT rearm clear the parked state and perform a fresh scan, with
-  full submit-failure rollback. The internal receive submission disables
-  native AFD exclusivity so it cannot cancel another registration's legitimate
-  read poll; process-local terminal claims still arbitrate error delivery.
+  full submit-failure rollback. Like every public AFD poll, the internal
+  receive submission is non-exclusive so it cannot cancel another
+  registration's legitimate read poll; process-local terminal claims still
+  arbitrate exclusive error delivery.
   IPv4/IPv6 connected-UDP ICMP
   probes require repeated LT `EPOLLERR`, then `recv() == WSAECONNRESET`, when
   `SIO_UDP_CONNRESET`, the provider, and host firewall expose the condition.
@@ -415,18 +416,42 @@ temporary fallback signal mask before unwinding.
   ADD. It may be combined with `EPOLLET`, but not with `EPOLLONESHOT`,
   `EPOLLRDHUP`, or unsupported event bits. Every MOD of a registration added
   exclusive fails with `EINVAL`, even if the MOD mask omits `EPOLLEXCLUSIVE`.
-  AFD requests normally use `Exclusive=TRUE`; the temporary hidden receive
-  probe for readless UDP is submitted non-exclusive so an ordinary datagram
-  cannot cancel a peer read poll. This temporarily weakens cross-process native
-  exclusivity for a mixed readless request. A process-wide claim filter tracks
-  read, write, and terminal readiness classes independently and removes only
-  the conflicting classes from mixed snapshots. A covering AFD submission that
-  returns `STATUS_PENDING`, or a zero-time sample proving one direction
-  inactive, releases the corresponding class claims. Each live registration
-  embeds one intrusive claim node whose class bitset is indexed through fixed
-  hash buckets. Claim capacity therefore grows with registrations and the
-  delivery path does not allocate or fail open, while one process-wide mutex
-  serializes cross-port ownership changes.
+  Every AFD request is submitted non-exclusive because native AFD exclusivity
+  cancels ordinary peer polls, contrary to Linux's mixed-registration rule.
+  Non-exclusive requests can still interfere when their single AFD handle
+  entry contains the same numeric process HANDLE value. An intrusive active
+  target-key index therefore gives each outstanding wepoll-ex request a
+  distinct numeric key. An uncontended request uses the provider base handle
+  directly. On collision, submission retains colliding duplicates while it
+  allocates a distinct provider-handle value, inserts that value before the
+  IOCTL, and closes the duplicate after the kernel captures it. For a pending
+  request it normally replaces the freed numeric slot with a non-socket event
+  until completion; the logical hash index remains the correctness authority
+  if that optional reservation loses an allocation race or is unavailable.
+  An anomalous duplicate `CloseHandle` failure is never retried by numeric
+  value because HANDLE reuse could target an unrelated object; the logical
+  index remains active and a possibly live duplicate is deliberately leaked.
+  Completion, including cancellation, removes the key exactly once before
+  rearm or reclamation. This avoids retaining the endpoint, so native
+  `closesocket()` still produces local-close completion and peer FIN.
+
+  Distinct target keys let every ordinary local epoll instance receive
+  matching readiness. A separate process-wide claim filter tracks read,
+  write, and terminal readiness classes independently, admits at least one
+  local exclusive instance, and removes only conflicting classes from other
+  exclusive mixed snapshots. A covering AFD submission that returns
+  `STATUS_PENDING`, or a zero-time sample proving one direction inactive,
+  releases the corresponding class claims. Each live registration embeds one
+  intrusive claim node whose class bitset is indexed through fixed hash
+  buckets. Capacity therefore grows with registrations and delivery does not
+  allocate or fail open, while process-wide locks serialize target ownership
+  and exclusive claims without holding them across kernel submission. Neither
+  index crosses process boundaries or coordinates unrelated raw AFD users, so
+  separate processes may each receive an exclusive wake for the same socket.
+  The claim and active-target indexes coordinate only registrations within one
+  process and one loaded wepoll-ex image. Separately linked static copies,
+  distinct loaded DLL images, unrelated raw AFD users, and separate processes
+  maintain independent state and do not coordinate.
 - The nginx adapter leaves `ngx_event_actions.notify` unset. nginx 1.31.3
   rejects `--with-threads` on Win32 and its thread-pool sources are POSIX-only,
   so thread-pool integration is outside this prototype's supported boundary.

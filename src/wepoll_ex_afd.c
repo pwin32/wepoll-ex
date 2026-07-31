@@ -16,6 +16,7 @@
  */
 #include "wepoll_ex_internal.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -25,6 +26,279 @@
 #  include <windows.h>
 #  include <winternl.h>
 #endif
+
+#ifdef _WIN32
+/* AFD poll requests can interfere when their single handle entry contains
+ * the same numeric HANDLE value, including across independently opened AFD
+ * control handles.  Keep one active owner for every target value in this
+ * process.  Callers enter from port code while holding fd_table_lock, so the
+ * only permitted nesting order is port fd_table_lock -> this lock. */
+#define EP_AFD_POLL_KEY_BUCKETS 256u
+
+static SRWLOCK g_afd_poll_key_lock = SRWLOCK_INIT;
+static ep_sock_t *g_afd_poll_key_buckets[EP_AFD_POLL_KEY_BUCKETS];
+
+static size_t ep_afd_poll_key_bucket(HANDLE target)
+{
+    uintptr_t value = (uintptr_t)target;
+
+    /* Kernel handles are aligned.  Fold those otherwise-unused low bits back
+     * into the mask so adjacent allocated handle values spread across the
+     * power-of-two table. */
+    value ^= value >> 4;
+    value ^= value >> 12;
+    return (size_t)(value & (EP_AFD_POLL_KEY_BUCKETS - 1u));
+}
+
+static int ep_afd_poll_key_is_active_locked(HANDLE target)
+{
+    size_t bucket = ep_afd_poll_key_bucket(target);
+
+    for (ep_sock_t *active = g_afd_poll_key_buckets[bucket];
+         active != NULL;
+         active = active->afd_poll_key_next) {
+        assert(active->afd_poll_key_owned != 0);
+        if (active->afd_poll_target == target)
+            return 1;
+    }
+    return 0;
+}
+
+typedef struct ep_afd_error_state {
+    int error;
+    int wsa_error;
+    DWORD last_error;
+} ep_afd_error_state_t;
+
+static ep_afd_error_state_t ep_afd_error_state_save(void)
+{
+    ep_afd_error_state_t state;
+
+    state.error = ep_last_err();
+    state.wsa_error = WSAGetLastError();
+    state.last_error = GetLastError();
+    return state;
+}
+
+static void ep_afd_error_state_restore(ep_afd_error_state_t state)
+{
+    ep_set_errno(state.error);
+    WSASetLastError(state.wsa_error);
+    SetLastError(state.last_error);
+}
+
+static HANDLE ep_afd_poll_key_release_locked(ep_sock_t *sock)
+{
+    ep_sock_t **link;
+    HANDLE reservation;
+
+    if (sock->afd_poll_key_owned == 0) {
+        assert(sock->afd_poll_key_next == NULL);
+        assert(sock->afd_poll_key_reservation == NULL);
+        return NULL;
+    }
+
+    link = &g_afd_poll_key_buckets[
+        ep_afd_poll_key_bucket(sock->afd_poll_target)];
+    while (*link != NULL && *link != sock)
+        link = &(*link)->afd_poll_key_next;
+    assert(*link == sock);
+    if (*link == sock)
+        *link = sock->afd_poll_key_next;
+
+    reservation = sock->afd_poll_key_reservation;
+    sock->afd_poll_target = NULL;
+    sock->afd_poll_key_reservation = NULL;
+    sock->afd_poll_key_next = NULL;
+    sock->afd_poll_key_owned = 0;
+    return reservation;
+}
+
+static void ep_afd_poll_key_insert_locked(ep_sock_t *sock, HANDLE target)
+{
+    size_t bucket = ep_afd_poll_key_bucket(target);
+
+    assert(sock->afd_poll_key_owned == 0);
+    assert(sock->afd_poll_key_next == NULL);
+    assert(sock->afd_poll_key_reservation == NULL);
+    assert(!ep_afd_poll_key_is_active_locked(target));
+    sock->afd_poll_target = target;
+    sock->afd_poll_key_reservation = NULL;
+    sock->afd_poll_key_next = g_afd_poll_key_buckets[bucket];
+    sock->afd_poll_key_owned = 1;
+    g_afd_poll_key_buckets[bucket] = sock;
+}
+
+static int ep_afd_poll_key_claim(ep_sock_t *sock, HANDLE base_target,
+                                 int *duplicated_out)
+{
+    HANDLE *collisions = NULL;
+    size_t collision_count = 0;
+    size_t collision_capacity = 0;
+    int error = 0;
+    DWORD win_error = ERROR_SUCCESS;
+
+    assert(sock->afd_poll_key_owned == 0);
+    assert(sock->afd_poll_key_next == NULL);
+    assert(sock->afd_poll_key_reservation == NULL);
+
+    AcquireSRWLockExclusive(&g_afd_poll_key_lock);
+    if (!ep_afd_poll_key_is_active_locked(base_target)) {
+        ep_afd_poll_key_insert_locked(sock, base_target);
+        ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
+        *duplicated_out = 0;
+        return 0;
+    }
+    ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
+
+    {
+        HANDLE process = GetCurrentProcess();
+
+        for (;;) {
+            HANDLE duplicate = NULL;
+
+            if (!DuplicateHandle(process,
+                                 base_target,
+                                 process,
+                                 &duplicate,
+                                 0,
+                                 FALSE,
+                                 DUPLICATE_SAME_ACCESS)) {
+                win_error = GetLastError();
+                error = ep_winerr_to_errno(win_error);
+                break;
+            }
+
+            AcquireSRWLockExclusive(&g_afd_poll_key_lock);
+            if (!ep_afd_poll_key_is_active_locked(duplicate)) {
+                ep_afd_poll_key_insert_locked(sock, duplicate);
+                ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
+                *duplicated_out = 1;
+                break;
+            }
+            ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
+
+            /* An active key normally has a live base or reservation handle,
+             * making a numeric collision impossible.  Reservation can fail,
+             * however, so retain every colliding duplicate until a distinct
+             * value is allocated instead of repeatedly recycling one slot. */
+            if (collision_count == collision_capacity) {
+                size_t new_capacity = collision_capacity == 0
+                                          ? 8
+                                          : collision_capacity * 2;
+                HANDLE *new_collisions;
+
+                if (new_capacity < collision_capacity ||
+                    new_capacity > SIZE_MAX / sizeof(*collisions)) {
+                    (void)CloseHandle(duplicate);
+                    error = ENOMEM;
+                    break;
+                }
+                if (ep_fault_hit(EP_FAULT_AFD_KEY_COLLISION_GROW) != 0) {
+                    error = ep_last_err();
+                    (void)CloseHandle(duplicate);
+                    break;
+                }
+                new_collisions = (HANDLE *)realloc(
+                    collisions, new_capacity * sizeof(*collisions));
+                if (new_collisions == NULL) {
+                    (void)CloseHandle(duplicate);
+                    error = ENOMEM;
+                    break;
+                }
+                collisions = new_collisions;
+                collision_capacity = new_capacity;
+            }
+            collisions[collision_count++] = duplicate;
+        }
+    }
+
+    for (size_t i = 0; i < collision_count; i++)
+        (void)CloseHandle(collisions[i]);
+    free(collisions);
+
+    if (error != 0) {
+        ep_set_errno(error);
+        if (win_error != ERROR_SUCCESS) {
+            WSASetLastError((int)win_error);
+            SetLastError(win_error);
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static void ep_afd_poll_duplicate_finish(ep_sock_t *sock, int reserve_slot)
+{
+    ep_afd_error_state_t error_state = ep_afd_error_state_save();
+    HANDLE target = sock->afd_poll_target;
+    HANDLE reservation = NULL;
+
+    assert(sock->afd_poll_key_owned != 0);
+    assert(sock->afd_poll_key_reservation == NULL);
+
+    /* NtDeviceIoControlFile has captured the duplicated target for the
+     * pending IRP.  Drop the duplicate and, for a pending request, immediately
+     * try to occupy the same process handle-table slot.  Never retry a failed
+     * close by numeric value: HANDLE reuse means a later lookup could name and
+     * eventually close an unrelated object.  The logical active-key index is
+     * sufficient if the close or optional reservation fails. */
+    if (CloseHandle(target) != 0 && reserve_slot &&
+        ep_fault_hit(EP_FAULT_AFD_KEY_RESERVATION) == 0) {
+        reservation = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (reservation != target && reservation != NULL) {
+            (void)CloseHandle(reservation);
+            reservation = NULL;
+        }
+    }
+
+    if (reservation != NULL) {
+        AcquireSRWLockExclusive(&g_afd_poll_key_lock);
+        assert(sock->afd_poll_key_owned != 0);
+        assert(sock->afd_poll_target == target);
+        assert(sock->afd_poll_key_reservation == NULL);
+        sock->afd_poll_key_reservation = reservation;
+        ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
+    }
+
+    /* CloseHandle/CreateEventW are bookkeeping only after AFD has accepted
+     * the request.  Do not leak their incidental error state into a successful
+     * epoll operation or overwrite the submit fault/status chosen by caller. */
+    ep_afd_error_state_restore(error_state);
+}
+
+static void ep_afd_poll_duplicate_abandon(ep_sock_t *sock)
+{
+    ep_afd_poll_duplicate_finish(sock, 0);
+    ep_afd_poll_key_release(sock);
+}
+#endif
+
+void ep_afd_poll_key_release(ep_sock_t *sock)
+{
+#ifdef _WIN32
+    HANDLE reservation;
+
+    if (sock == NULL)
+        return;
+
+    AcquireSRWLockExclusive(&g_afd_poll_key_lock);
+    reservation = ep_afd_poll_key_release_locked(sock);
+    ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
+
+    /* Detach under the registry lock, then close outside it.  A live handle
+     * prevents numeric reuse on its own, so no kernel call needs to serialize
+     * unrelated AFD submissions. */
+    if (reservation != NULL) {
+        ep_afd_error_state_t error_state = ep_afd_error_state_save();
+
+        (void)CloseHandle(reservation);
+        ep_afd_error_state_restore(error_state);
+    }
+#else
+    (void)sock;
+#endif
+}
 
 /* --------------------------------------------------------------------- */
 /* Open the AFD device.  wepoll opens a single handle per port and uses */
@@ -405,6 +679,7 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
 #ifdef _WIN32
     NTSTATUS status;
     uint32_t old_submitted_afd_events;
+    int target_is_duplicate = 0;
 
     if (pending_out != NULL) {
         *pending_out = 0;
@@ -448,20 +723,24 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
     memset(info, 0, sizeof(*info));
     info->Timeout.QuadPart  = INT64_MAX;
     info->NumberOfHandles   = 1;
-    /* Exclusive AFD polls cancel peer non-exclusive/exclusive requests for
-     * the same provider handle, approximating Linux EPOLLEXCLUSIVE wake
-     * uniqueness among wepoll-ex instances watching the same socket.  A
-     * readless UDP receive bit is internal error qualification, however: an
-     * ordinary datagram must not let that hidden interest cancel a peer's
-     * legitimate read poll. */
-    info->Exclusive =
-        (sock->user_flags & EPOLLEXCLUSIVE) != 0 &&
-        !(sock->socket_protocol == EP_SOCKET_PROTOCOL_UDP &&
-          (sock->user_events & (EPOLLIN | EPOLLRDNORM)) == 0 &&
-          (afd_events & AFD_POLL_RECEIVE) != 0)
-            ? TRUE : FALSE;
-    info->Handles[0].Handle = (HANDLE)sock->base_socket;
+    /* AFD native exclusivity cancels peer polls for the provider handle,
+     * including ordinary registrations.  Linux mixed EPOLLEXCLUSIVE
+     * semantics instead wake every ordinary epoll instance plus at least one
+     * exclusive instance.  Keep every kernel request non-exclusive and use
+     * the process-wide readiness-class claim filter to arbitrate only the
+     * user-visible exclusive deliveries. */
+    info->Exclusive = FALSE;
     info->Handles[0].Events = afd_events;
+
+    /* Insert the live target before entering the kernel.  The caller holds
+     * fd_table_lock, so a same-socket completion cannot release ownership
+     * until duplicate close/reservation bookkeeping below has finished. */
+    if (ep_afd_poll_key_claim(sock,
+                             (HANDLE)sock->base_socket,
+                             &target_is_duplicate) != 0) {
+        return -1;
+    }
+    info->Handles[0].Handle = sock->afd_poll_target;
 
     memset(&sock->io_status_block, 0, sizeof(sock->io_status_block));
     sock->io_status_block.Status = STATUS_PENDING;
@@ -474,8 +753,16 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
     atomic_store(&sock->poll_status, EP_POLL_PENDING);
 
     if (ep_fault_hit(EP_FAULT_AFD_SUBMIT) != 0) {
+        int saved_errno = ep_last_err();
+
         atomic_store(&sock->poll_status, EP_POLL_IDLE);
         sock->submitted_afd_events = old_submitted_afd_events;
+        if (target_is_duplicate) {
+            ep_afd_poll_duplicate_abandon(sock);
+        } else {
+            ep_afd_poll_key_release(sock);
+        }
+        ep_set_errno(saved_errno);
         return -1;
     }
 
@@ -490,15 +777,31 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
         sizeof(*info),                  /* InputBufferLength */
         info,                           /* OutputBuffer (same) */
         sizeof(*info));                 /* OutputBufferLength */
-
     /* STATUS_PENDING means the request was queued.  Any other success
      * code means it already completed (e.g. socket already readable),
      * which we treat as a normal completion via the IOCP path. */
     if (status != STATUS_SUCCESS && status != STATUS_PENDING) {
+        int status_errno = ep_status_to_errno(status);
+
         atomic_store(&sock->poll_status, EP_POLL_IDLE);
         sock->submitted_afd_events = old_submitted_afd_events;
-        ep_set_errno(ep_status_to_errno(status));
+        if (target_is_duplicate) {
+            ep_afd_poll_duplicate_abandon(sock);
+        } else {
+            ep_afd_poll_key_release(sock);
+        }
+        ep_set_errno(status_errno);
         return -1;
+    }
+    if (status == STATUS_PENDING) {
+        if (target_is_duplicate)
+            ep_afd_poll_duplicate_finish(sock, 1);
+    } else {
+        if (target_is_duplicate) {
+            ep_afd_poll_duplicate_abandon(sock);
+        } else {
+            ep_afd_poll_key_release(sock);
+        }
     }
     /* A pending poll means the provider is not currently matching the
      * requested level.  Clear the edge latch so a later assert can form a

@@ -253,7 +253,8 @@ else()
                 waitable-queued-rearm
                 aux-post-close-lease
                 pipe-invalid-et
-                large-wait)
+                large-wait
+                exclusive-mixed-submit)
             string(REPLACE "-" "_" _state_name "${_state_mode}")
             add_test(NAME wepoll_ex_windows_state_${_state_name}
                 COMMAND test_wepoll_ex_windows_state ${_state_mode})
@@ -364,6 +365,9 @@ else()
             exclusive-mod
             exclusive-wake
             exclusive-et
+            exclusive-mixed
+            ordinary-multi
+            ordinary-prearmed
             exclusive-disjoint
             exclusive-scale
             exclusive-invalid
@@ -374,7 +378,10 @@ else()
             COMMAND test_wepoll_ex_windows_edge ${_edge_mode})
         set_tests_properties(wepoll_ex_windows_edge_${_edge_name}
             PROPERTIES TIMEOUT 20)
-        if(_edge_mode STREQUAL "exclusive-scale")
+        if(_edge_mode STREQUAL "exclusive-scale" OR
+           _edge_mode STREQUAL "exclusive-mixed" OR
+           _edge_mode STREQUAL "ordinary-multi" OR
+           _edge_mode STREQUAL "ordinary-prearmed")
             set_tests_properties(wepoll_ex_windows_edge_${_edge_name}
                 PROPERTIES TIMEOUT 60)
         endif()
@@ -498,6 +505,7 @@ else()
                 pool-grow
                 afd-open
                 afd-submit
+                afd-key-fallback
                 afd-cancel
                 endpoint-identity
                 endpoint-policy
