@@ -233,7 +233,8 @@ WEPOLL_EX_API int  epoll_ctl_ctx(int epfd, int op, epoll_fd_t fd,
 
 /* epoll_wait that returns extended events.  POSIX waits use a stable
  * duplicate of the tracked epoll descriptor so wepoll_close() can wake a
- * blocked extended wait and make it fail with EBADF. */
+ * blocked extended wait and make it fail with EBADF. Legal maxevents values
+ * are Linux-UAPI bounds, not proportional internal allocation requests. */
 WEPOLL_EX_API int  epoll_wait_ex(int epfd, struct epoll_event_ex *events,
                                  int maxevents, int timeout);
 

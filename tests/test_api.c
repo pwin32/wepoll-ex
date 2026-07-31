@@ -113,6 +113,131 @@ static void test_invalid_args(void)
     wepoll_close(fd);
 }
 
+static int test_epoll_maxevents(void)
+{
+    return INT_MAX / (int)sizeof(struct epoll_event);
+}
+
+static void test_wait_maxevents_bounds(void)
+{
+    struct epoll_event event;
+    struct epoll_event_ex output;
+    struct epoll_event_ex *large_output = NULL;
+    struct timespec zero = { 0, 0 };
+    struct timespec invalid = { 0, 1000000000L };
+    int pair[2] = { -1, -1 };
+    int epfd = -1;
+    int limit = test_epoll_maxevents();
+    int over_limit = limit + 1;
+    int result;
+
+    TEST("extended waits enforce Linux maxevents and bounded batches");
+    epfd = epoll_create_ex(0, 0);
+    if (epfd < 0) {
+        FAIL("epoll_create_ex");
+        return;
+    }
+
+    errno = 0;
+    result = epoll_wait_ex(epfd, NULL, 0, 0);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("zero maxevents must precede NULL events");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_wait_ex(epfd, NULL, over_limit, 0);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("over-limit maxevents must precede NULL events");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_wait_ex(epfd, NULL, 1, 0);
+    if (result != -1 || errno != EFAULT) {
+        FAIL("valid maxevents with NULL events must be EFAULT");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_wait_ex(epfd, &output, over_limit, 0);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("epoll_wait_ex over-limit rejection");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_wait_ex(epfd, &output, limit, 0);
+    if (result != 0) {
+        FAIL("epoll_wait_ex exact limit should be safe on empty epfd");
+        goto cleanup;
+    }
+
+    errno = 0;
+    result = epoll_pwait2_ex(epfd, NULL, 1, &invalid, NULL);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("invalid timespec must precede the NULL events check");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_pwait2_ex(epfd, NULL, over_limit, &zero, NULL);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("pwait2_ex over-limit rejection");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_pwait2_ex(epfd, NULL, 1, &zero, NULL);
+    if (result != -1 || errno != EFAULT) {
+        FAIL("pwait2_ex valid maxevents with NULL events");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_pwait2_ex(epfd, &output, limit, &zero, NULL);
+    if (result != 0) {
+        FAIL("pwait2_ex exact limit should be safe on empty epfd");
+        goto cleanup;
+    }
+
+    large_output = calloc(4097, sizeof(*large_output));
+    if (large_output == NULL) {
+        FAIL("4097-event output allocation");
+        goto cleanup;
+    }
+    result = epoll_wait_ex(epfd, large_output, 4097, 0);
+    if (result != 0) {
+        FAIL("4097-event epoll_wait_ex request");
+        goto cleanup;
+    }
+    result = epoll_pwait2_ex(epfd, large_output, 4097, &zero, NULL);
+    if (result != 0) {
+        FAIL("4097-event epoll_pwait2_ex request");
+        goto cleanup;
+    }
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        FAIL("socketpair for large wait request");
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = UINT64_C(0x4d41584556454e54);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair[0], &event) != 0 ||
+        write(pair[1], "x", 1) != 1) {
+        FAIL("prepare 4097-event ready wait");
+        goto cleanup;
+    }
+    result = epoll_wait_ex(epfd, large_output, 4097, 1000);
+    if (result != 1 || (large_output[0].events & EPOLLIN) == 0 ||
+        large_output[0].data.u64 != event.data.u64) {
+        FAIL("4097-event wait did not return readiness");
+        goto cleanup;
+    }
+
+    PASS();
+
+cleanup:
+    free(large_output);
+    if (pair[0] >= 0) close(pair[0]);
+    if (pair[1] >= 0) close(pair[1]);
+    if (epfd >= 0) wepoll_close(epfd);
+}
+
 /* --------------------------------------------------------------------- */
 /* Add / wait / del cycle.                                          */
 /* --------------------------------------------------------------------- */
@@ -2436,6 +2561,7 @@ int main(void)
 
     test_create_close();
     test_invalid_args();
+    test_wait_maxevents_bounds();
     test_basic_event();
     test_double_add();
     test_del_noent();

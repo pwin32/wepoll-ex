@@ -94,7 +94,14 @@ the nginx-embedded source build independent of a generated CMake header.
    coarse path without changing the public result. Timer resolution does not
    guarantee scheduler wake latency. Long finite waits are accepted and use
    bounded IOCP chunks rather than overflowing a `DWORD` timeout. Integer
-   `epoll_wait` and `epoll_pwait` retain their millisecond contract. Durations
+   `epoll_wait` and `epoll_pwait` retain their millisecond contract. Public
+   waits with a valid epoll descriptor validate the Linux UAPI `maxevents`
+   ceiling before the output pointer; `epoll_pwait2*` validates its timespec
+   first. The qualified x86-64 Windows
+   ABI uses Linux's packed 12-byte event-record ceiling (178,956,970), while
+   POSIX extension waits derive the ceiling from the host `epoll_event`.
+   One Windows wait returns at most 4096 events, so the caller's upper bound
+   does not force a proportional allocation. Durations
    too large for the internal 100-nanosecond representation bypass the precise
    timer and retain the longer millisecond/chunked deadline.
    Level-triggered registrations are armed again on a later wait; oneshot
@@ -168,7 +175,9 @@ with one reused numeric fd are retained separately; MOD/DEL use an `fstat`
 fingerprint and return `EOPNOTSUPP` when that fingerprint is ambiguous.
 `epoll_fd_count()` counts only registrations owned by the extension; a native
 `epoll_ctl()` registration enters that view after an extension MOD. Extended
-waits use a 32-event stack buffer and allocate only for larger batches.
+waits use a 32-event stack buffer and allocate only for larger internal
+batches. One POSIX extension wait returns at most 4096 events regardless of a
+larger legal public `maxevents` value.
 `epoll_ctl_batch` is sequential and not transactional. `epoll_pwait2_ex`
 uses native `epoll_pwait2` when the libc symbol is present and the kernel
 supports it. A build-time absence, runtime `ENOSYS`, or

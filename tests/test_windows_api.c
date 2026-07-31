@@ -324,6 +324,199 @@ static void test_invalid_args(void)
     PASS();
 }
 
+static void test_wait_maxevents_bounds(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    struct epoll_event output;
+    struct epoll_event_ex extended;
+    struct epoll_event *large_output = NULL;
+    struct epoll_event_ex *large_extended = NULL;
+    struct timespec zero = { 0, 0 };
+    struct timespec invalid = { 0, 1000000000L };
+    int epfd = -1;
+#if defined(__i386__) || defined(_M_IX86) || \
+    defined(__x86_64__) || defined(__amd64__) || \
+    defined(_M_X64) || defined(_M_AMD64)
+    int limit = INT_MAX / 12; /* packed x86/x86-64 Linux UAPI size */
+#else
+    int limit = INT_MAX / (int)sizeof(struct epoll_event);
+#endif
+    int over_limit = limit + 1;
+    int result;
+
+    TEST("wait APIs enforce Linux maxevents and bounded batches");
+    tcp_pair_init(&pair);
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        return;
+    }
+
+    errno = 0;
+    result = epoll_wait(epfd, NULL, 0, 0);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("epoll_wait zero maxevents must precede NULL events");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_wait(epfd, NULL, over_limit, 0);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("epoll_wait over-limit must precede NULL events");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_wait(epfd, &output, 1, 0);
+    if (result != 0) {
+        FAIL("epoll_wait empty instance");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_wait(epfd, NULL, 1, 0);
+    if (result != -1 || errno != EFAULT) {
+        FAIL("epoll_wait valid maxevents with NULL events");
+        goto cleanup;
+    }
+    result = epoll_wait(epfd, &output, limit, 0);
+    if (result != 0) {
+        FAIL("epoll_wait exact limit should be safe");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_pwait(epfd, NULL, over_limit, 0, NULL);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("epoll_pwait over-limit rejection");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_pwait(epfd, &output, limit, 0, NULL);
+    if (result != 0) {
+        FAIL("epoll_pwait exact limit should be safe");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_pwait2(epfd, NULL, 1, &invalid, NULL);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("epoll_pwait2 invalid timespec must precede NULL events");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_pwait2(epfd, NULL, over_limit, &zero, NULL);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("epoll_pwait2 over-limit rejection");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_pwait2(epfd, NULL, 1, &zero, NULL);
+    if (result != -1 || errno != EFAULT) {
+        FAIL("epoll_pwait2 valid maxevents with NULL events");
+        goto cleanup;
+    }
+    result = epoll_pwait2(epfd, &output, limit, &zero, NULL);
+    if (result != 0) {
+        FAIL("epoll_pwait2 exact limit should be safe");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_wait_ex(epfd, NULL, over_limit, 0);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("epoll_wait_ex over-limit rejection");
+        goto cleanup;
+    }
+    result = epoll_wait_ex(epfd, &extended, limit, 0);
+    if (result != 0) {
+        FAIL("epoll_wait_ex exact limit should be safe");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_pwait2_ex(epfd, NULL, 1, &invalid, NULL);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("epoll_pwait2_ex invalid timespec must precede NULL events");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_pwait2_ex(epfd, NULL, over_limit, &zero, NULL);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("epoll_pwait2_ex over-limit rejection");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_pwait2_ex(epfd, NULL, 1, &zero, NULL);
+    if (result != -1 || errno != EFAULT) {
+        FAIL("epoll_pwait2_ex valid maxevents with NULL events");
+        goto cleanup;
+    }
+    result = epoll_pwait2_ex(epfd, &extended, limit, &zero, NULL);
+    if (result != 0) {
+        FAIL("epoll_pwait2_ex exact limit should be safe");
+        goto cleanup;
+    }
+    errno = 0;
+    result = epoll_drain(epfd, NULL, over_limit);
+    if (result != -1 || errno != EINVAL) {
+        FAIL("epoll_drain over-limit rejection");
+        goto cleanup;
+    }
+    result = epoll_drain(epfd, &output, limit);
+    if (result != 0) {
+        FAIL("epoll_drain exact limit should be safe");
+        goto cleanup;
+    }
+
+    large_output = (struct epoll_event *)calloc(4097,
+                                                 sizeof(*large_output));
+    large_extended = (struct epoll_event_ex *)calloc(4097,
+                                                       sizeof(*large_extended));
+    if (large_output == NULL || large_extended == NULL) {
+        FAIL("4097-event output allocation");
+        goto cleanup;
+    }
+    result = epoll_wait(epfd, large_output, 4097, 0);
+    if (result != 0) {
+        FAIL("4097-event epoll_wait request");
+        goto cleanup;
+    }
+    result = epoll_wait_ex(epfd, large_extended, 4097, 0);
+    if (result != 0) {
+        FAIL("4097-event epoll_wait_ex request");
+        goto cleanup;
+    }
+
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("make_tcp_pair for large wait request");
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = UINT64_C(0x4d41584556454e54);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0 ||
+        send_byte(pair.client) != 0) {
+        FAIL("prepare 4097-event ready wait");
+        goto cleanup;
+    }
+    result = epoll_wait(epfd, large_output, 4097, 1000);
+    if (result != 1 || (large_output[0].events & EPOLLIN) == 0 ||
+        large_output[0].data.u64 != event.data.u64 ||
+        recv_byte(pair.server) != 0 || send_byte(pair.client) != 0) {
+        FAIL("4097-event basic wait did not return readiness");
+        goto cleanup;
+    }
+    result = epoll_wait_ex(epfd, large_extended, 4097, 1000);
+    if (result != 1 || (large_extended[0].events & EPOLLIN) == 0 ||
+        large_extended[0].data.u64 != event.data.u64) {
+        FAIL("4097-event extended wait did not return readiness");
+        goto cleanup;
+    }
+
+    PASS();
+
+cleanup:
+    free(large_output);
+    free(large_extended);
+    if (epfd >= 0) wepoll_close(epfd);
+    tcp_pair_close(&pair);
+}
+
 static int ctl_errno_is(int epfd, int op, epoll_fd_t fd,
                         struct epoll_event *event, int expected)
 {
@@ -1485,6 +1678,7 @@ int main(void)
     test_create_close();
     test_operational_stats();
     test_invalid_args();
+    test_wait_maxevents_bounds();
     test_ctl_target_errors();
     test_basic_io();
     test_write_ready();

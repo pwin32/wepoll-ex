@@ -92,6 +92,17 @@ helpers, socket-lifetime policy and statistics queries, and `wepoll_close`.
 `epoll_ctl_batch` applies operations in order and best-effort rolls back ADDs;
 it is not transactional.
 
+With a valid epoll descriptor, wait entry points reject `maxevents <= 0` and
+values above the Linux UAPI ceiling before checking the output pointer. On the
+qualified x86-64 Windows
+target that ceiling is 178,956,970, derived from Linux's packed 12-byte
+`epoll_event` transfer record; Linux extended waits derive it from the host
+UAPI structure. A legal large value is only a return-count upper bound: one
+Windows wait or POSIX extension wait returns at most 4096 events, so exact-
+limit empty or lightly ready waits do not allocate storage proportional to the
+caller-supplied value. `epoll_pwait2*` validates a non-null timespec before the
+count and output pointer, matching Linux's syscall order.
+
 The standard `epoll_create(size)` requires a positive argument but ignores its
 value, matching modern Linux. `epoll_create_ex(size, flags)` retains the size
 only as an extension hint: Windows caps the positive hint value at 4096, while

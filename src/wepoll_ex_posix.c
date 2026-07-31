@@ -842,14 +842,18 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
                          int use_timespec,
                          const sigset_t *sigmask)
 {
+    int batch_events;
+
+    if (maxevents <= 0 || maxevents > WEPOLL_EPOLL_MAX_EVENTS) {
+        errno = EINVAL;
+        return -1;
+    }
     if (!events) {
         errno = EFAULT;
         return -1;
     }
-    if (maxevents <= 0) {
-        errno = EINVAL;
-        return -1;
-    }
+    batch_events = maxevents < WEPOLL_WAIT_BATCH_EVENTS
+        ? maxevents : WEPOLL_WAIT_BATCH_EVENTS;
 
     /* Hold a metadata-port reference across the native wait.  The wait uses
      * the stable duplicate, not the caller's integer descriptor, so
@@ -866,13 +870,8 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
     struct epoll_event stack_events[POSIX_WAIT_STACK_EVENTS];
     struct epoll_event *kevs = stack_events;
     int heap_events = 0;
-    if ((size_t)maxevents > POSIX_WAIT_STACK_EVENTS) {
-        if ((size_t)maxevents > SIZE_MAX / sizeof(*kevs)) {
-            port_release(p);
-            errno = EOVERFLOW;
-            return -1;
-        }
-        kevs = malloc((size_t)maxevents * sizeof(*kevs));
+    if ((size_t)batch_events > POSIX_WAIT_STACK_EVENTS) {
+        kevs = malloc((size_t)batch_events * sizeof(*kevs));
         if (!kevs) {
             port_release(p);
             errno = ENOMEM;
@@ -887,7 +886,7 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
     };
     int n;
     pthread_cleanup_push(posix_wait_cancel_cleanup, &cleanup);
-    n = posix_native_wait(wait_epfd, kevs, maxevents, timeout_ms,
+    n = posix_native_wait(wait_epfd, kevs, batch_events, timeout_ms,
                           timeout, use_timespec, sigmask);
     pthread_cleanup_pop(0);
     if (n < 0) {
@@ -1002,14 +1001,6 @@ WEPOLL_EX_API int epoll_pwait2_ex(int epfd, struct epoll_event_ex *events,
                                   const struct timespec *timeout,
                                   const sigset_t *sigmask)
 {
-    if (!events) {
-        errno = EFAULT;
-        return -1;
-    }
-    if (maxevents <= 0) {
-        errno = EINVAL;
-        return -1;
-    }
     if (validate_timespec_timeout(timeout) != 0) return -1;
     return posix_wait_ex(epfd, events, maxevents, 0, timeout, 1, sigmask);
 }

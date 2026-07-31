@@ -193,6 +193,26 @@ also skipped the four native-reuse identity cases required by its
 DEL-before-close contract. IPv6 reset LT/ET/ONESHOT and application-owned IOCP
 isolation passed in every applicable lane.
 
+Wait-count validation now follows the Linux UAPI contract instead of treating
+`maxevents` as an allocation request. Windows core and extension waits reject
+values above the qualified x86-64 Linux ceiling of 178,956,970, derived from
+the packed 12-byte Linux event record; POSIX extension waits derive the same
+formula from the host UAPI type. For a valid epoll descriptor, invalid counts
+precede null output pointers, while `epoll_pwait2*` validates its timespec
+first. One Windows or POSIX
+extension wait returns at most 4096 events, avoiding multi-gigabyte basic-
+event conversion buffers and POSIX extension allocations.
+Regressions cover exact-limit empty waits, limit-plus-one rejection, errno
+precedence, 4097-event empty and ready requests, and every Windows wait entry
+point including `epoll_drain()`.
+
+The July 31, 2026 qualification reran strict POSIX native/fallback and
+ASan/UBSan coverage plus all seven MinGW lifetime/linkage lanes. Their full
+CTest suites passed 153/154, 151/152, 87/88, 153/154, 87/88, 149/154, and
+83/88 tests respectively; the remaining cases were the established UDP
+capability skip and synchronized-mode native-reuse skips. Every applicable
+focused Windows test also passed three consecutive repetitions.
+
 Windows socket lifetime is now an explicit CMake policy:
 `WEPOLL_EX_SOCKET_LIFETIME_MODE=best-effort|strict|synchronized`.
 Best-effort remains the default, strict rejects providers without stable WFP
