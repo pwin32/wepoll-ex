@@ -48,7 +48,8 @@ cmake -S "$repo_dir" -B "$release_dir" -G "$generator" \
     -DWEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK=OFF
 cmake --build "$release_dir" --parallel "$jobs"
 ctest --test-dir "$release_dir" --output-on-failure
-"$script_dir/repeat-ctest.sh" "$release_dir" "$repeat_count" 'wepoll_ex_(api|pool_mpsc)$'
+"$script_dir/repeat-ctest.sh" "$release_dir" "$repeat_count" \
+    'wepoll_ex_(api|pool_mpsc|posix_large_wait)$'
 
 fallback_dir=$build_root/pwait2-fallback
 cmake -S "$repo_dir" -B "$fallback_dir" -G "$generator" \

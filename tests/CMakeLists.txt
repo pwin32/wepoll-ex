@@ -5,6 +5,16 @@ if(WEPOLL_EX_PLATFORM_POSIX)
     add_test(NAME wepoll_ex_api COMMAND test_wepoll_ex)
     set_tests_properties(wepoll_ex_api PROPERTIES TIMEOUT 30)
 
+    add_executable(test_wepoll_ex_posix_large_wait
+        test_posix_large_wait.c)
+    target_link_libraries(test_wepoll_ex_posix_large_wait PRIVATE
+        wepoll_ex::wepoll_ex)
+
+    add_test(NAME wepoll_ex_posix_large_wait
+        COMMAND test_wepoll_ex_posix_large_wait)
+    set_tests_properties(wepoll_ex_posix_large_wait PROPERTIES
+        TIMEOUT 60 SKIP_RETURN_CODE 77)
+
     if(WEPOLL_EX_BUILD_STATIC)
         add_executable(test_wepoll_ex_pool test_pool.c)
         target_include_directories(test_wepoll_ex_pool PRIVATE

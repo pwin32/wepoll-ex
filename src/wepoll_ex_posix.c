@@ -75,8 +75,18 @@ typedef struct posix_port {
 
 #define POSIX_PORT_MAP_SIZE  1024
 #define POSIX_WAKE_TOKEN     UINT64_C(0x5745504f4c4c4558)
-#define POSIX_WAIT_STACK_EVENTS  32
-#define POSIX_WAIT_BATCH_EVENTS  4096
+
+/* Native events are written into the packed prefix of the wider caller
+ * array, then expanded from back to front.  The size/alignment relationship
+ * keeps the native destination valid and guarantees that each wider write
+ * starts after every packed source record that is still needed. */
+_Static_assert(sizeof(struct epoll_event_ex) >=
+                   sizeof(struct epoll_event),
+               "epoll_event_ex must not be smaller than epoll_event");
+_Static_assert(_Alignof(struct epoll_event_ex) >=
+                   _Alignof(struct epoll_event),
+               "epoll_event_ex must satisfy epoll_event alignment");
+
 static pthread_mutex_t g_posix_lock = PTHREAD_MUTEX_INITIALIZER;
 static posix_port_t   *g_posix_map[POSIX_PORT_MAP_SIZE];
 
@@ -799,23 +809,21 @@ static int posix_timespec_wait_fallback(int epfd, struct epoll_event *events,
 }
 
 typedef struct posix_wait_cleanup {
-    posix_port_t       *port;
-    struct epoll_event *heap_events;
+    posix_port_t *port;
 } posix_wait_cleanup_t;
 
 /* epoll_wait and epoll_pwait are pthread cancellation points on Linux.  A
- * cancelled extended wait must release both its metadata-port reference and
- * its optional heap buffer, otherwise a later wepoll_close() waits forever
- * for a reference that no thread can release. */
+ * cancelled extended wait must release its metadata-port reference,
+ * otherwise a later wepoll_close() waits forever for a reference that no
+ * thread can release. */
 static void posix_wait_cancel_cleanup(void *arg)
 {
     posix_wait_cleanup_t *cleanup = arg;
 
-    free(cleanup->heap_events);
     port_release(cleanup->port);
 }
 
-static int posix_native_wait(int epfd, struct epoll_event *events,
+static int posix_native_wait(int epfd, void *events,
                              int maxevents, int timeout_ms,
                              const struct timespec *timeout,
                              int use_timespec, const sigset_t *sigmask)
@@ -843,8 +851,6 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
                          int use_timespec,
                          const sigset_t *sigmask)
 {
-    int batch_events;
-
     if (maxevents <= 0 || maxevents > WEPOLL_EPOLL_EX_MAX_EVENTS) {
         errno = EINVAL;
         return -1;
@@ -853,8 +859,6 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
         errno = EFAULT;
         return -1;
     }
-    batch_events = maxevents < POSIX_WAIT_BATCH_EVENTS
-        ? maxevents : POSIX_WAIT_BATCH_EVENTS;
 
     /* Hold a metadata-port reference across the native wait.  The wait uses
      * the stable duplicate, not the caller's integer descriptor, so
@@ -868,32 +872,16 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
     int wait_epfd = p->control_epfd;
     pthread_mutex_unlock(&p->lock);
 
-    struct epoll_event stack_events[POSIX_WAIT_STACK_EVENTS];
-    struct epoll_event *kevs = stack_events;
-    int heap_events = 0;
-    if ((size_t)batch_events > POSIX_WAIT_STACK_EVENTS) {
-        kevs = malloc((size_t)batch_events * sizeof(*kevs));
-        if (!kevs) {
-            port_release(p);
-            errno = ENOMEM;
-            return -1;
-        }
-        heap_events = 1;
-    }
-
-    posix_wait_cleanup_t cleanup = {
-        .port = p,
-        .heap_events = heap_events ? kevs : NULL
-    };
+    unsigned char *native_events = (unsigned char *)(void *)events;
+    posix_wait_cleanup_t cleanup = { .port = p };
     int n;
     pthread_cleanup_push(posix_wait_cancel_cleanup, &cleanup);
-    n = posix_native_wait(wait_epfd, kevs, batch_events, timeout_ms,
+    n = posix_native_wait(wait_epfd, native_events, maxevents, timeout_ms,
                           timeout, use_timespec, sigmask);
     pthread_cleanup_pop(0);
     if (n < 0) {
         int saved_errno = errno;
         if (port_is_closing(p)) saved_errno = EBADF;
-        if (heap_events) free(kevs);
         port_release(p);
         errno = saved_errno;
         return -1;
@@ -902,7 +890,6 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
     /* A close wake is an internal event and must never be exposed as a user
      * readiness event.  Return EBADF consistently with the Windows backend. */
     if (port_is_closing(p)) {
-        if (heap_events) free(kevs);
         port_release(p);
         errno = EBADF;
         return -1;
@@ -917,38 +904,48 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
 
     pthread_mutex_lock(&p->lock);
     int metadata_stable = p->metadata_generation == metadata_generation;
-    for (int i = 0; i < n; i++) {
-        events[i].events = kevs[i].events;
-        events[i].data = kevs[i].data;
-        events[i].flags = 0;
-        events[i].timestamp = now_ns;
-        events[i].user_ctx = NULL;
+    for (int i = n; i-- > 0;) {
+        struct epoll_event native_event;
+        struct epoll_event_ex expanded_event;
+
+        /* Copy the packed source before writing its wider destination.  In
+         * descending order, destination i begins at i * sizeof(ex), which is
+         * at or after the end of every lower-index source record still
+         * needed.  Byte-wise copies avoid accessing the same storage through
+         * incompatible struct lvalues. */
+        memcpy(&native_event,
+               native_events + (size_t)i * sizeof(native_event),
+               sizeof(native_event));
+        memset(&expanded_event, 0, sizeof(expanded_event));
+        expanded_event.events = native_event.events;
+        expanded_event.data = native_event.data;
+        expanded_event.timestamp = now_ns;
 
         if (metadata_stable) {
             posix_sock_snapshot_t snapshot = {0};
-            if (node_snapshot_by_data_locked(p, kevs[i].data, &snapshot)) {
-                events[i].user_ctx = snapshot.user_ctx;
+            if (node_snapshot_by_data_locked(p, native_event.data,
+                                             &snapshot)) {
+                expanded_event.user_ctx = snapshot.user_ctx;
                 if (snapshot.event.events & EPOLLET) {
-                    events[i].flags |= WEPOLL_FLAG_ET_DELIVERED |
-                                       WEPOLL_FLAG_EDGE_ARMED;
+                    expanded_event.flags |= WEPOLL_FLAG_ET_DELIVERED |
+                                            WEPOLL_FLAG_EDGE_ARMED;
                 }
                 if (snapshot.event.events & EPOLLONESHOT) {
-                    events[i].flags |= WEPOLL_FLAG_ONESHOT_FIRED;
+                    expanded_event.flags |= WEPOLL_FLAG_ONESHOT_FIRED;
                 }
             }
         }
+        memcpy(&events[i], &expanded_event, sizeof(expanded_event));
     }
     pthread_mutex_unlock(&p->lock);
 
     /* If close raced with metadata decoration, suppress the batch rather than
      * returning an event after the close linearization point. */
     if (port_is_closing(p)) {
-        if (heap_events) free(kevs);
         port_release(p);
         errno = EBADF;
         return -1;
     }
-    if (heap_events) free(kevs);
     port_release(p);
     return n;
 }

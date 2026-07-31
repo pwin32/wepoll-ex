@@ -199,9 +199,10 @@ values above the qualified x86-64 Linux ceiling of 178,956,970, derived from
 the packed 12-byte Linux event record; POSIX extension waits derive the same
 formula from the host UAPI type. For a valid epoll descriptor, invalid counts
 precede null output pointers, while `epoll_pwait2*` validates its timespec
-first. One Windows or POSIX
-extension wait returns at most 4096 events, avoiding multi-gigabyte basic-
-event conversion buffers and POSIX extension allocations.
+first. Legal large wait counts do not cause proportional internal conversion
+allocation. Windows and POSIX extension waits can return beyond 4096; each
+backend writes into caller-provided storage and bounds the result by the public
+`maxevents` value.
 Regressions cover exact-limit empty waits, limit-plus-one rejection, errno
 precedence, 4097-event empty and ready requests, and every Windows wait entry
 point including `epoll_drain()`.
@@ -265,11 +266,20 @@ is bounded by elapsed work and dequeue count for every timeout mode, so an
 active completion stream may produce a partial result. MOD and
 `epoll_rearm()` of an already selected registration defer their replacement
 generation until the next wait, preventing duplicate generations in one
-logical result. POSIX extension waits
-remain capped at 4096 per call because repeated native waits expose only opaque
-`epoll_data` and cannot reliably deduplicate registrations. Extended waits
-also reject a count whose `epoll_event_ex` array size would overflow `SIZE_MAX`;
-this only tightens the standard Linux-record ceiling on 32-bit targets.
+logical result. POSIX extension waits now pass the wider caller array to one
+native wait as packed `epoll_event` storage, then expand returned records
+backward in place. This removes the former 4096-result ceiling without a
+proportional scratch allocation or repeated native waits that would need to
+deduplicate opaque `epoll_data`. Extended waits also reject a count whose
+`epoll_event_ex` array size would overflow `SIZE_MAX`; this only tightens the
+standard Linux-record ceiling on 32-bit targets.
+
+The subsequent July 31, 2026 POSIX large-wait qualification passed strict
+native and forced-`epoll_pwait2`-fallback suites 5/5 each, including guarded
+4,097-ready-event batches with unique data, context, ET, and ONESHOT metadata.
+The API, large-wait, and pool tests passed five repeats, and ASan/UBSan passed
+4/4. Because the production and test changes are POSIX-selected, the unchanged
+strict Windows lane was rebuilt and its full 164/164 CTest suite passed.
 
 Windows socket lifetime is now an explicit CMake policy:
 `WEPOLL_EX_SOCKET_LIFETIME_MODE=best-effort|strict|synchronized`.
@@ -482,16 +492,17 @@ DEL/ADD reuse, provider fallback, concurrent controls, a 513-packet internal
 burst, and an injected early timeout.
 
 Small waits avoid allocation: Windows basic waits use a 64-event stack buffer,
-and Linux extended waits use 32 events before falling back to the heap. The
-Linux context lookup uses a reverse data index, while Windows consumes only its
-rearm and fired-oneshot worklists. Under the synchronized socket lifetime
-contract, Windows also reuses the base provider handle captured at ADD instead
-of resolving it for every rearm; best-effort and strict builds continue to
-re-resolve it. `bench_wait_scaling` measures empty and one-ready Linux extended
-waits as registration count grows. `bench_latency` now validates all I/O,
-fails incomplete runs, and reports percentiles. The new Windows CSV benchmark
-covers registration scaling through 50,000 sockets, ready batches, oneshot
-rearm, and armed control churn.
+while Linux extended waits use caller storage for their packed native prefix
+and backward in-place expansion at every size. The Linux context lookup uses a
+reverse data index, while Windows consumes only its rearm and fired-oneshot
+worklists. Under the synchronized socket lifetime contract, Windows also
+reuses the base provider handle captured at ADD instead of resolving it for
+every rearm; best-effort and strict builds continue to re-resolve it.
+`bench_wait_scaling` measures empty and one-ready Linux extended waits as
+registration count grows. `bench_latency` now validates all I/O, fails
+incomplete runs, and reports percentiles. The new Windows CSV benchmark covers
+registration scaling through 50,000 sockets, ready batches, oneshot rearm, and
+armed control churn.
 
 Deterministic fail-at-N hooks now cover pool allocation/growth, AFD open,
 submit and cancel, endpoint identity/policy, provider resolution, IOCP create,

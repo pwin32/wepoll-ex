@@ -117,6 +117,12 @@ the nginx-embedded source build independent of a generated CMake header.
    deferred-rearm worklist for the next wait. Durations too large for the
    internal 100-nanosecond representation bypass the precise timer and retain
    the longer millisecond/chunked deadline.
+   POSIX extension waits pass the caller array to one native wait as packed
+   `epoll_event` storage, then copy returned records backward into their wider
+   `epoll_event_ex` slots. This permits legal result counts beyond 4096 without
+   proportional scratch allocation or repeated readiness syscalls. The
+   fallback may still split very long timeout durations, but returns as soon as
+   one native chunk reports readiness.
    Level-triggered registrations are armed again on a later wait; oneshot
    registrations require MOD or `epoll_rearm()`. Failures discovered during
    completion processing or deferred rearming are latched and wake the wait
@@ -193,9 +199,11 @@ with one reused numeric fd are retained separately; MOD/DEL use an `fstat`
 fingerprint and return `EOPNOTSUPP` when that fingerprint is ambiguous.
 `epoll_fd_count()` counts only registrations owned by the extension; a native
 `epoll_ctl()` registration enters that view after an extension MOD. Extended
-waits use a 32-event stack buffer and allocate only for larger internal
-batches. One POSIX extension wait returns at most 4096 events regardless of a
-larger legal public `maxevents` value.
+waits write native packed records into the prefix of the caller's
+`epoll_event_ex` array and expand them backward in place after the syscall.
+Descending expansion preserves unread packed records, avoids incompatible
+struct aliasing, requires no proportional internal allocation, and lets one
+native wait return any legal public `maxevents` count.
 `epoll_ctl_batch` is sequential and not transactional. `epoll_pwait2_ex`
 uses native `epoll_pwait2` when the libc symbol is present and the kernel
 supports it. A build-time absence, runtime `ENOSYS`, or
@@ -209,8 +217,8 @@ This preserves thread-directed delivery, but a process-directed signal may be
 routed to another eligible thread during the userspace inter-chunk bridge; a
 multi-syscall fallback cannot make that whole logical wait kernel-atomic.
 The forced mode has a dedicated strict preset and qualification build.
-Pthread cancellation cleanup releases the optional heap event buffer and
-metadata reference before unwinding.
+Pthread cancellation cleanup releases the metadata reference and restores any
+temporary fallback signal mask before unwinding.
 
 ## Supported semantics and boundaries
 

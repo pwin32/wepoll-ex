@@ -78,10 +78,11 @@ syscalls and restores the caller's original mask on return or cancellation.
 As with any userspace multi-syscall fallback, a process-directed signal may be
 routed to another eligible thread during the inter-chunk bridge; thread-
 directed delivery to the waiting thread remains protected.
-Cancellation cleanup also releases wait buffers and metadata references, so
-cancelling a blocked thread cannot strand a later `wepoll_close()`. The shared
-pool/queue code is compiled here for unit tests; it does not make the Linux
-wrapper a Windows-engine implementation.
+Cancellation cleanup releases metadata references and restores any temporary
+signal-mask bridge state, so cancelling a blocked thread cannot strand a later
+`wepoll_close()` or alter the caller's mask. The shared pool/queue code is
+compiled here for unit tests; it does not make the Linux wrapper a
+Windows-engine implementation.
 
 ### Public extensions
 
@@ -109,9 +110,12 @@ fewer events than the supplied upper bound rather than monopolize the waiter
 while completions keep arriving. MOD and `epoll_rearm()` of an already selected
 registration defer their replacement generation to the next wait, which
 prevents that registration from appearing twice in the same logical result.
-POSIX extension waits retain a 4096-event
-per-call ceiling because chunking native waits cannot safely distinguish two
-registrations that share opaque `epoll_data`. `epoll_pwait2*` validates a
+POSIX extension waits issue one native wait directly into the packed prefix of
+the caller's wider array, then expand the returned records backward in place.
+They can therefore fill beyond 4096 without proportional conversion storage or
+repeated native waits that would need to deduplicate opaque `epoll_data`.
+Long-duration fallback chunking applies only to the timeout; the first native
+chunk that reports readiness returns that batch. `epoll_pwait2*` validates a
 non-null timespec before the count and output pointer, matching Linux's syscall
 order.
 

@@ -9,6 +9,7 @@
  * epoll — so the tests double as portability checks for code that
  * uses wepoll-ex as a portable epoll shim.
  */
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include "wepoll_ex.h"
@@ -24,6 +25,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
 #include <signal.h>
@@ -118,11 +120,29 @@ static int test_epoll_maxevents(void)
     return INT_MAX / (int)sizeof(struct epoll_event);
 }
 
+static struct epoll_event_ex *test_map_extended_events(int count,
+                                                       size_t *mapped_size)
+{
+    size_t size = (size_t)count * sizeof(struct epoll_event_ex);
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#if defined(MAP_NORESERVE)
+    flags |= MAP_NORESERVE;
+#endif
+
+    void *mapping = mmap(NULL, size, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (mapping == MAP_FAILED) return NULL;
+
+    *mapped_size = size;
+    return mapping;
+}
+
 static void test_wait_maxevents_bounds(void)
 {
     struct epoll_event event;
     struct epoll_event_ex output;
+    struct epoll_event_ex *limit_output = NULL;
     struct epoll_event_ex *large_output = NULL;
+    size_t limit_output_size = 0;
     struct timespec zero = { 0, 0 };
     struct timespec invalid = { 0, 1000000000L };
     int pair[2] = { -1, -1 };
@@ -132,9 +152,10 @@ static void test_wait_maxevents_bounds(void)
             (size_t)limit
         ? (int)(SIZE_MAX / sizeof(struct epoll_event_ex)) : limit;
     int extended_over_limit = extended_limit + 1;
+    int exact_limit_skipped = 0;
     int result;
 
-    TEST("extended waits enforce Linux maxevents and bounded batches");
+    TEST("extended waits enforce Linux maxevents bounds");
     epfd = epoll_create_ex(0, 0);
     if (epfd < 0) {
         FAIL("epoll_create_ex");
@@ -165,11 +186,17 @@ static void test_wait_maxevents_bounds(void)
         FAIL("epoll_wait_ex over-limit rejection");
         goto cleanup;
     }
-    errno = 0;
-    result = epoll_wait_ex(epfd, &output, extended_limit, 0);
-    if (result != 0) {
-        FAIL("epoll_wait_ex exact limit should be safe on empty epfd");
-        goto cleanup;
+    limit_output = test_map_extended_events(extended_limit,
+                                            &limit_output_size);
+    if (limit_output == NULL) {
+        exact_limit_skipped = 1;
+    } else {
+        errno = 0;
+        result = epoll_wait_ex(epfd, limit_output, extended_limit, 0);
+        if (result != 0) {
+            FAIL("epoll_wait_ex exact limit should be safe on empty epfd");
+            goto cleanup;
+        }
     }
 
     errno = 0;
@@ -191,12 +218,14 @@ static void test_wait_maxevents_bounds(void)
         FAIL("pwait2_ex valid maxevents with NULL events");
         goto cleanup;
     }
-    errno = 0;
-    result = epoll_pwait2_ex(epfd, &output, extended_limit,
-                             &zero, NULL);
-    if (result != 0) {
-        FAIL("pwait2_ex exact limit should be safe on empty epfd");
-        goto cleanup;
+    if (limit_output != NULL) {
+        errno = 0;
+        result = epoll_pwait2_ex(epfd, limit_output, extended_limit,
+                                 &zero, NULL);
+        if (result != 0) {
+            FAIL("pwait2_ex exact limit should be safe on empty epfd");
+            goto cleanup;
+        }
     }
 
     large_output = calloc(4097, sizeof(*large_output));
@@ -234,9 +263,15 @@ static void test_wait_maxevents_bounds(void)
         goto cleanup;
     }
 
+    if (exact_limit_skipped) {
+        printf("(exact-limit mapping unavailable) ");
+    }
     PASS();
 
 cleanup:
+    if (limit_output != NULL) {
+        munmap(limit_output, limit_output_size);
+    }
     free(large_output);
     if (pair[0] >= 0) close(pair[0]);
     if (pair[1] >= 0) close(pair[1]);
@@ -499,8 +534,7 @@ static void test_user_ctx(void)
 
     if (write(pair[1], "x", 1) != 1) { FAIL("write"); goto cleanup; }
 
-    /* A larger batch exercises the native-event heap fallback while other
-     * API tests cover the small stack-buffer path. */
+    /* Exercise metadata expansion into a multi-record caller buffer. */
     epoll_event_ex out[64];
     int n = epoll_wait_ex(epfd, out, 64, 100);
     if (n != 1) { FAIL("expected 1 event"); goto cleanup; }
@@ -575,7 +609,7 @@ static void test_create_ex_and_timeout_validation(void)
     if (n != 0) { FAIL("epoll_pwait2_ex zero timeout"); goto timeout_cleanup; }
     epoll_event_ex large_output[64];
     n = epoll_wait_ex(epfd, large_output, 64, 0);
-    if (n != 0) { FAIL("epoll_wait_ex heap-buffer fallback"); goto timeout_cleanup; }
+    if (n != 0) { FAIL("epoll_wait_ex larger output buffer"); goto timeout_cleanup; }
     PASS();
 
     TEST("sub-millisecond extended wait is accepted and bounded");
@@ -1602,10 +1636,9 @@ static void *cancel_wait_thread(void *opaque)
         return context;
     }
 
-    /* Create the metadata port before publishing readiness, then use a batch
-     * larger than the internal stack buffer so cancellation must release both
-     * the port reference and a heap allocation.  The long masked wait also
-     * drives the forced multi-chunk fallback and its signal-mask cleanup. */
+    /* Create the metadata port before publishing readiness.  Cancelling the
+     * long masked wait must release its port reference and restore the caller
+     * mask; a forced fallback also exercises the multi-chunk signal bridge. */
     (void)epoll_pwait2_ex(context->epfd, events, 64, &zero, NULL);
     pthread_cleanup_push(cancel_wait_mask_cleanup, context);
     atomic_store_explicit(&context->started, 1, memory_order_release);
