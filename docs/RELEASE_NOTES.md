@@ -498,21 +498,29 @@ refresh is translated in place so a large ready set does not move through the
 completion FIFO one epoch at a time. Exact
 TCP registrations also merge requested read, write, and non-inline priority
 levels that race within the current wait using a zero-time public-socket
-`select()` sample before LT/ET/ONESHOT filtering. Terminal error/HUP snapshots
-and unknown protocol metadata retain the conservative AFD result.
+`select()` sample before LT/ET/ONESHOT filtering. A read-ready exact TCP
+registration now additionally queries version-zero `SIO_TCP_INFO` when RDHUP
+was requested but absent from that AFD packet. CLOSE-WAIT, CLOSING, LAST-ACK,
+and TIME-WAIT merge `EPOLLRDHUP` without consuming data, including when a peer
+FIN sits behind an unread stream byte. The optional control is available on
+the base provider from Windows 10 version 1703; older/custom providers cache
+it unavailable and retain the conservative AFD snapshot. Terminal error/HUP
+snapshots and unknown protocol metadata retain the conservative AFD result.
 
-The August 1, 2026 eager-socket-ADD and racing-MOD qualification used Windows
-10.0.19044, MSYS2 MinGW GCC 15.2, and
-`-O2 -Wall -Wextra -Wpedantic -Werror`. The seven lanes completed 177 combined
-best-effort (176 passed/1 skip), 175 static-only (174/1), 99 shared-only
-(98/1), 177 strict combined (176/1), 99 strict shared-only (98/1), 177
-synchronized combined (172/5), and 99 synchronized shared-only (94/5) CTest
+The August 1, 2026 eager-socket-ADD, racing-MOD, and current-RDHUP
+qualification used Windows 10.0.19044, MSYS2 MinGW GCC 15.2, and
+`-O2 -Wall -Wextra -Wpedantic -Werror`. The seven lanes completed 179 combined
+best-effort (178 passed/1 skip), 177 static-only (176/1), 99 shared-only
+(98/1), 179 strict combined (178/1), 99 strict shared-only (98/1), 179
+synchronized combined (174/5), and 99 synchronized shared-only (94/5) CTest
 entries. The general skip was the host-dependent
 UDP/ICMP probe; synchronized lanes also skipped the four native-reuse identity
 cases covered by their DEL-before-close contract. Three repeats of every
-applicable focused lane passed: 88 tests in combined/static/strict/synchronized
+applicable focused lane passed: 90 tests in combined/static/strict/synchronized
 builds and 53 tests in shared/strict-shared/synchronized-shared builds. This
-included the deterministic cancellation-losing same-wait MOD expansion. The
+included the deterministic cancellation-losing same-wait MOD expansion plus
+injected and live `SIO_TCP_INFO` RDHUP merges; both new TCP modes also passed
+100 standalone repetitions. The
 mixed normal/urgent LT regression permits the requested normal subset while
 the urgent byte is still in transport, but requires the exact combined level
 to converge within the deadline and then persist on a second wait. Linux native
@@ -628,6 +636,8 @@ descriptors cannot be nested, socket `EPOLLRDBAND` and `EPOLLWRBAND` interests
 are accepted but inert, `EPOLLMSG` is not emitted, `SO_OOBINLINE` collapses
 priority into ordinary readability, UDP receive-side errors have the
 synchronous/layered-provider and parked receive-head caveats described above,
+same-wait RDHUP merging behind an earlier nonterminal AFD class requires
+`SIO_TCP_INFO` support,
 unknown provider protocol metadata retains a conservative abort
 mapping, and pipe writable readiness can remain advisory
 when native local information is unavailable or access is denied. Pure

@@ -44,6 +44,18 @@
 #define EP_PIPE_SERVER_END          1U
 #define EP_STATUS_INVALID_HANDLE    UINT32_C(0xC0000008)
 
+/* SIO_TCP_INFO and TCPSTATE were added to the public SDK after the project's
+ * Windows 8 compile floor.  Keep private version-zero definitions so newer
+ * systems/providers can supply current connection state without raising the
+ * library's minimum target. */
+#define EP_SIO_TCP_INFO _WSAIORW(IOC_VENDOR, 39)
+#define EP_TCP_INFO_VERSION_0 0UL
+#define EP_TCP_STATE_CLOSE_WAIT 7UL
+#define EP_TCP_STATE_CLOSING    8UL
+#define EP_TCP_STATE_LAST_ACK   9UL
+#define EP_TCP_STATE_TIME_WAIT 10UL
+#define EP_TCP_INFO_BUFFER_SIZE 256U
+
 static _Atomic uint64_t g_quarantined_ports;
 
 #ifdef _WIN32
@@ -835,11 +847,89 @@ static int ep_socket_select_priority_ready(SOCKET fd)
     return result > 0 && FD_ISSET(fd, &descriptors);
 }
 
+static int ep_socket_tcp_info_unavailable(int error)
+{
+    return error == WSAEINVAL || error == WSAENOPROTOOPT ||
+        error == WSAEOPNOTSUPP;
+}
+
+static int ep_socket_tcp_state_query_locked(ep_sock_t *sock,
+                                            ULONG *state_out)
+{
+    union {
+        ULONGLONG alignment;
+        unsigned char bytes[EP_TCP_INFO_BUFFER_SIZE];
+    } info;
+    struct sockaddr_storage peer;
+    ULONG version = EP_TCP_INFO_VERSION_0;
+    ULONG state = 0;
+    DWORD bytes = 0;
+    int peer_length = (int)sizeof(peer);
+    int saved_errno = ep_last_err();
+    int saved_wsa_error = WSAGetLastError();
+    DWORD saved_last_error = GetLastError();
+    int result = 0;
+
+    if (sock == NULL || state_out == NULL ||
+        sock->socket_protocol != EP_SOCKET_PROTOCOL_TCP ||
+        sock->tcp_info_capability == EP_SOCKET_TCP_INFO_UNAVAILABLE) {
+        goto done;
+    }
+
+    /* Do not classify listeners or transitional connect sockets as lacking
+     * the optional control code; a later established endpoint may support it. */
+    if (getpeername(sock->fd, (struct sockaddr *)&peer, &peer_length) ==
+            SOCKET_ERROR) {
+        goto done;
+    }
+
+    memset(&info, 0, sizeof(info));
+    if (WSAIoctl(sock->fd, EP_SIO_TCP_INFO,
+                 &version, (DWORD)sizeof(version),
+                 info.bytes, (DWORD)sizeof(info.bytes),
+                 &bytes, NULL, NULL) == SOCKET_ERROR) {
+        int error = WSAGetLastError();
+
+        if (ep_socket_tcp_info_unavailable(error)) {
+            sock->tcp_info_capability = EP_SOCKET_TCP_INFO_UNAVAILABLE;
+        }
+        goto done;
+    }
+    if (bytes < sizeof(state)) {
+        goto done;
+    }
+
+    memcpy(&state, info.bytes, sizeof(state));
+    sock->tcp_info_capability = EP_SOCKET_TCP_INFO_AVAILABLE;
+    *state_out = state;
+    result = 1;
+
+done:
+    WSASetLastError(saved_wsa_error);
+    SetLastError(saved_last_error);
+    ep_set_errno(saved_errno);
+    return result;
+}
+
+static int ep_socket_tcp_state_has_remote_fin(ULONG state)
+{
+    switch (state) {
+    case EP_TCP_STATE_CLOSE_WAIT:
+    case EP_TCP_STATE_CLOSING:
+    case EP_TCP_STATE_LAST_ACK:
+    case EP_TCP_STATE_TIME_WAIT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static void ep_socket_merge_current_levels(ep_sock_t *sock,
                                            uint32_t *delivered)
 {
     uint32_t read_interest;
     uint32_t write_interest;
+    int read_ready = -1;
 
     if (sock->socket_protocol != EP_SOCKET_PROTOCOL_TCP ||
         (*delivered & (EPOLLERR | EPOLLHUP)) != 0) {
@@ -852,9 +942,24 @@ static void ep_socket_merge_current_levels(ep_sock_t *sock,
      * is processed.  select() observes the public provider socket without
      * consuming data; unknown protocols retain the conservative AFD snapshot. */
     read_interest = sock->user_events & (EPOLLIN | EPOLLRDNORM);
-    if ((read_interest & ~*delivered) != 0 &&
-        ep_socket_select_ready(sock->fd, 0) > 0) {
+    if ((read_interest & ~*delivered) != 0 ||
+        ((sock->user_events & EPOLLRDHUP) != 0 &&
+         (*delivered & EPOLLRDHUP) == 0)) {
+        read_ready = ep_socket_select_ready(sock->fd, 0);
+    }
+    if ((read_interest & ~*delivered) != 0 && read_ready > 0) {
         *delivered |= read_interest;
+    }
+
+    if ((sock->user_events & EPOLLRDHUP) != 0 &&
+        (*delivered & EPOLLRDHUP) == 0 && read_ready > 0 &&
+        sock->port->tcp_state_query != NULL) {
+        ULONG state = 0;
+
+        if (sock->port->tcp_state_query(sock, &state) > 0 &&
+            ep_socket_tcp_state_has_remote_fin(state)) {
+            *delivered |= EPOLLRDHUP;
+        }
     }
 
     write_interest = sock->user_events & (EPOLLOUT | EPOLLWRNORM);
@@ -3709,6 +3814,7 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     port->get_queued_completion_status_ex = GetQueuedCompletionStatusEx;
     port->post_queued_completion_status = PostQueuedCompletionStatus;
     port->udp_probe_read = ep_udp_probe_read_locked;
+    port->tcp_state_query = ep_socket_tcp_state_query_locked;
     {
         HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
 

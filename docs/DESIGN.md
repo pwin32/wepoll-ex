@@ -89,8 +89,13 @@ the nginx-embedded source build independent of a generated CMake header.
    also snapshot the first matching class during the current wait, exact TCP
    registrations merge missing requested read, write, and non-inline priority
    levels with zero-time Winsock `select()` before event filtering and
-   LT/ET/ONESHOT latching. Error/HUP snapshots and unknown protocol metadata
-   retain the conservative AFD mask.
+   LT/ET/ONESHOT latching. A read-ready exact TCP registration with requested
+   RDHUP also queries optional version-zero `SIO_TCP_INFO`; CLOSE-WAIT,
+   CLOSING, LAST-ACK, and TIME-WAIT prove that the peer FIN is current even
+   when unread data hides EOF from a non-consuming byte probe. The query is
+   available from Windows 10 version 1703 in the base provider and is cached
+   unavailable per registration on older/custom providers. Error/HUP snapshots
+   and unknown protocol metadata retain the conservative AFD mask.
 4. Socket IOCP completions translate both the AFD per-handle `Events` bits and
    its `Status`; a negative per-handle status contributes `EPOLLERR` even when
    the event bitset is empty. Ready nodes snapshot the data, context, socket
@@ -379,7 +384,13 @@ temporary fallback signal mask before unwinding.
   requested readable/writable aliases plus unrequested `EPOLLERR | EPOLLHUP`.
   A negative AFD per-handle status reports unrequested `EPOLLERR`
   independently of the event bits. Missing or ambiguous provider protocol
-  metadata retains the conservative abort mapping with HUP.
+  metadata retains the conservative abort mapping with HUP. When
+  `SIO_TCP_INFO` is available, current CLOSE-WAIT/CLOSING/LAST-ACK/TIME-WAIT
+  state merges a requested `EPOLLRDHUP` that raced behind an earlier AFD
+  writable/readable snapshot, including when ordinary unread data remains in
+  front of the FIN. Older/custom providers retain the conservative AFD
+  snapshot; LT/ET rearm can observe the later disconnect, while ONESHOT needs
+  the normal MOD rearm after a partial first-class delivery.
 - TCP urgent-data readiness is qualified for LT persistence until
   `recv(MSG_OOB)`, observed ET suppression and re-edge, ONESHOT MOD rearm, and
   MOD filtering/data replacement. Exact-event regressions verify that urgent
@@ -554,7 +565,8 @@ Release also passed 4/4. Coverage includes exact preview package compatibility,
 ELF SONAME and Linux/MinGW export surfaces; socket alias, urgent-data,
 status/error, ET/exclusive read, write, mixed-class, and stale-snapshot
 transitions; cancellation-losing same-wait MOD expansion refresh; mixed
-normal/urgent LT convergence and persistence; direction-aware pipe adapters;
+normal/urgent LT convergence and persistence; live unread-data TCP FIN state
+and same-wait RDHUP merging; direction-aware pipe adapters;
 waitable terminal ET and
 pending/queued MOD races; consumptive notification counts; auxiliary-disarm
 fault recovery and preserved consumptive retries; immediate auxiliary

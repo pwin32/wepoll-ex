@@ -944,8 +944,22 @@ static volatile LONG expansion_refresh_submit_calls;
 static volatile LONG expansion_refresh_invalid;
 static ULONG expansion_refresh_masks[2];
 
+static ep_port_t *tcp_current_port;
+static ep_sock_t *tcp_current_expected_sock;
+static volatile LONG tcp_current_submit_calls;
+static volatile LONG tcp_current_submit_invalid;
+static volatile LONG tcp_current_query_calls;
+static volatile LONG tcp_current_query_mismatch;
+static ULONG tcp_current_submit_mask;
+static ULONG tcp_current_query_state;
+
 #define TEST_FILE_PIPE_LOCAL_INFORMATION_CLASS 24U
 #define TEST_STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
+#define TEST_TCP_STATE_ESTABLISHED 4UL
+#define TEST_TCP_STATE_CLOSE_WAIT  7UL
+#define TEST_TCP_STATE_CLOSING     8UL
+#define TEST_TCP_STATE_LAST_ACK    9UL
+#define TEST_TCP_STATE_TIME_WAIT  10UL
 
 typedef enum pipe_query_injection {
     PIPE_QUERY_INJECT_UNKNOWN_FAILURE = 1,
@@ -1089,6 +1103,50 @@ static NTSTATUS NTAPI expansion_refresh_submit_stub(
     io_status_block->Status = STATUS_SUCCESS;
     io_status_block->Information = sizeof(*info);
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS NTAPI tcp_current_submit_stub(
+    HANDLE file_handle,
+    HANDLE event,
+    PIO_APC_ROUTINE apc_routine,
+    PVOID apc_context,
+    PIO_STATUS_BLOCK io_status_block,
+    ULONG io_control_code,
+    PVOID input_buffer,
+    ULONG input_buffer_length,
+    PVOID output_buffer,
+    ULONG output_buffer_length)
+{
+    AFD_POLL_INFO *info = (AFD_POLL_INFO *)output_buffer;
+    LONG call = InterlockedIncrement(&tcp_current_submit_calls);
+
+    (void)event;
+    (void)apc_routine;
+    if (tcp_current_port == NULL || file_handle != tcp_current_port->afd ||
+        apc_context != io_status_block || io_status_block == NULL ||
+        io_control_code != IOCTL_AFD_POLL || input_buffer != output_buffer ||
+        info == NULL || input_buffer_length < sizeof(*info) ||
+        output_buffer_length < sizeof(*info) ||
+        info->NumberOfHandles != 1 || call != 1) {
+        InterlockedIncrement(&tcp_current_submit_invalid);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    tcp_current_submit_mask = info->Handles[0].Events;
+    io_status_block->Status = STATUS_PENDING;
+    io_status_block->Information = 0;
+    return STATUS_PENDING;
+}
+
+static int tcp_current_state_query_stub(ep_sock_t *sock, ULONG *state_out)
+{
+    InterlockedIncrement(&tcp_current_query_calls);
+    if (sock != tcp_current_expected_sock || state_out == NULL) {
+        InterlockedIncrement(&tcp_current_query_mismatch);
+        return 0;
+    }
+    *state_out = tcp_current_query_state;
+    return 1;
 }
 
 static NTSTATUS NTAPI submit_failure_stub(
@@ -3390,6 +3448,218 @@ cleanup:
     return result;
 }
 
+static int run_tcp_current_rdhup_case(ULONG tcp_state,
+                                      uint32_t expected_events,
+                                      int half_close_peer,
+                                      int live_query)
+{
+    static const uint64_t value = UINT64_C(0xd1d2d3d4d5d6d7d8);
+    const uint32_t user_events =
+        EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT;
+    state_fixture_t fixture;
+    PNtDeviceIoControlFile original_submit = NULL;
+    ep_tcp_state_query_fn original_query = NULL;
+    ep_sock_t *sock = NULL;
+    epoll_event_ex event;
+    fd_set read_set;
+    struct timeval timeout;
+    ULONG live_state = 0;
+    u_long available = 0;
+    ULONGLONG deadline;
+    int context;
+    int registered = 0;
+    int submit_installed = 0;
+    int pending;
+    int state_ok;
+    int result = -1;
+
+    if (fixture_open(&fixture) != 0) return -1;
+
+    tcp_current_port = fixture.port;
+    tcp_current_expected_sock = NULL;
+    tcp_current_query_state = tcp_state;
+    tcp_current_submit_mask = 0;
+    InterlockedExchange(&tcp_current_submit_calls, 0);
+    InterlockedExchange(&tcp_current_submit_invalid, 0);
+    InterlockedExchange(&tcp_current_query_calls, 0);
+    InterlockedExchange(&tcp_current_query_mismatch, 0);
+    original_submit = g_ntdll.NtDeviceIoControlFile;
+    original_query = fixture.port->tcp_state_query;
+    g_ntdll.NtDeviceIoControlFile = tcp_current_submit_stub;
+    if (!live_query) {
+        fixture.port->tcp_state_query = tcp_current_state_query_stub;
+    }
+    submit_installed = 1;
+    atomic_store_explicit(&fixture.port->active_wait_epoch, 1,
+                          memory_order_release);
+    atomic_store_explicit(&fixture.port->waiter_active, 1,
+                          memory_order_release);
+
+    if (register_events(&fixture, user_events, EPOLLONESHOT,
+                        value, &context) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    sock = fixture_sock(&fixture);
+    tcp_current_expected_sock = sock;
+    if (sock == NULL) goto cleanup;
+
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok =
+        InterlockedCompareExchange(&tcp_current_submit_calls, 0, 0) == 1 &&
+        InterlockedCompareExchange(&tcp_current_submit_invalid, 0, 0) == 0 &&
+        tcp_current_submit_mask == ep_epoll_to_afd_events(user_events) &&
+        sock->submitted_wait_epoch == 1 &&
+        sock->submitted_afd_events ==
+            ep_epoll_to_afd_events(user_events) &&
+        fixture.port->pending_poll_count == 1 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING;
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok || send_byte(fixture.client) != 0 ||
+        (half_close_peer &&
+         shutdown(fixture.client, SD_SEND) == SOCKET_ERROR)) {
+        goto cleanup;
+    }
+
+    FD_ZERO(&read_set);
+    FD_SET(fixture.server, &read_set);
+    timeout.tv_sec = 2;
+    timeout.tv_usec = 0;
+    if (select(0, &read_set, NULL, NULL, &timeout) != 1 ||
+        !FD_ISSET(fixture.server, &read_set)) {
+        goto cleanup;
+    }
+    if (live_query) {
+        int remote_fin = 0;
+
+        deadline = GetTickCount64() + 2000;
+        do {
+            if (original_query != NULL &&
+                original_query(sock, &live_state) > 0 &&
+                (live_state == TEST_TCP_STATE_CLOSE_WAIT ||
+                 live_state == TEST_TCP_STATE_CLOSING ||
+                 live_state == TEST_TCP_STATE_LAST_ACK ||
+                 live_state == TEST_TCP_STATE_TIME_WAIT)) {
+                remote_fin = 1;
+                break;
+            }
+            if (sock->tcp_info_capability ==
+                    EP_SOCKET_TCP_INFO_UNAVAILABLE) {
+                result = 77;
+                goto cleanup;
+            }
+            Sleep(1);
+        } while (GetTickCount64() < deadline);
+        if (!remote_fin ||
+            ioctlsocket(fixture.server, FIONREAD, &available) == SOCKET_ERROR ||
+            available == 0) {
+            goto cleanup;
+        }
+    }
+
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    sock->afd_info->NumberOfHandles = 1;
+    sock->afd_info->Handles[0].Events = AFD_POLL_SEND;
+    sock->afd_info->Handles[0].Status = STATUS_SUCCESS;
+    sock->io_status_block.Status = STATUS_SUCCESS;
+    sock->io_status_block.Information = sizeof(*sock->afd_info);
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+
+    ep_sock_handle_completion(sock, 0, STATUS_SUCCESS);
+
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok =
+        (live_query ||
+         (InterlockedCompareExchange(&tcp_current_query_calls, 0, 0) == 1 &&
+          InterlockedCompareExchange(
+              &tcp_current_query_mismatch, 0, 0) == 0)) &&
+        sock->pending_events == expected_events &&
+        sock->user_data.u64 == value && sock->user_ctx == &context &&
+        !sock->needs_rearm && sock->oneshot_fired &&
+        fixture.port->pending_poll_count == 0 &&
+        fixture.port->needs_rearm_count == 0 &&
+        fixture.port->oneshot_fired_count == 1 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_READY &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 1 &&
+        atomic_load_explicit(&fixture.port->ready_queue.queued,
+                             memory_order_relaxed) == 1 &&
+        sock->afd_poll_key_owned == 0 && sock->afd_poll_target == NULL &&
+        sock->afd_poll_key_reservation == NULL &&
+        ep_port_worklists_valid_locked(fixture.port);
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok) goto cleanup;
+
+    g_ntdll.NtDeviceIoControlFile = original_submit;
+    submit_installed = 0;
+    fixture.port->tcp_state_query = original_query;
+    atomic_store_explicit(&fixture.port->waiter_active, 0,
+                          memory_order_release);
+    atomic_store_explicit(&fixture.port->active_wait_epoch, 0,
+                          memory_order_release);
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(fixture.port, &event, 1, 0, NULL) != 1 ||
+        event.events != expected_events || event.data.u64 != value ||
+        event.user_ctx != &context ||
+        event.flags != WEPOLL_FLAG_ONESHOT_FIRED || event.timestamp == 0) {
+        goto cleanup;
+    }
+    if (ep_port_unregister(fixture.port, fixture.server) != 0) {
+        goto cleanup;
+    }
+    registered = 0;
+    result = 0;
+
+cleanup:
+    if (submit_installed) {
+        g_ntdll.NtDeviceIoControlFile = original_submit;
+    }
+    if (fixture.port != NULL) {
+        fixture.port->tcp_state_query = original_query;
+        atomic_store_explicit(&fixture.port->waiter_active, 0,
+                              memory_order_release);
+        atomic_store_explicit(&fixture.port->active_wait_epoch, 0,
+                              memory_order_release);
+        pending = registered && sock != NULL &&
+            atomic_load_explicit(&sock->poll_status,
+                                 memory_order_relaxed) != EP_POLL_IDLE;
+        if (registered) {
+            (void)ep_port_unregister(fixture.port, fixture.server);
+            registered = 0;
+        }
+        if (pending) {
+            sock->io_status_block.Status = STATUS_CANCELLED;
+            ep_sock_handle_completion(sock, 0, STATUS_CANCELLED);
+        }
+    }
+    tcp_current_port = NULL;
+    tcp_current_expected_sock = NULL;
+    fixture_close(&fixture);
+    return result;
+}
+
+static int test_tcp_current_rdhup(void)
+{
+    if (run_tcp_current_rdhup_case(
+            TEST_TCP_STATE_ESTABLISHED, EPOLLOUT, 0, 0) != 0 ||
+        run_tcp_current_rdhup_case(
+            TEST_TCP_STATE_CLOSE_WAIT,
+            EPOLLOUT | EPOLLRDHUP, 1, 0) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int test_tcp_info_runtime(void)
+{
+    return run_tcp_current_rdhup_case(
+        TEST_TCP_STATE_CLOSE_WAIT, EPOLLOUT | EPOLLRDHUP, 1, 1);
+}
+
 static int test_transitional_idle(void)
 {
     state_fixture_t fixture;
@@ -4525,6 +4795,10 @@ int main(int argc, char **argv)
         result = test_pending_expansion_cancelled_mod();
     } else if (strcmp(argv[1], "pending-expansion-ready-race") == 0) {
         result = test_pending_expansion_ready_race();
+    } else if (strcmp(argv[1], "tcp-current-rdhup") == 0) {
+        result = test_tcp_current_rdhup();
+    } else if (strcmp(argv[1], "tcp-info-runtime") == 0) {
+        result = test_tcp_info_runtime();
     } else if (strcmp(argv[1], "transitional-idle") == 0) {
         result = test_transitional_idle();
     } else if (strcmp(argv[1], "aux-posted-cancel") == 0) {
@@ -4546,6 +4820,9 @@ int main(int argc, char **argv)
     }
     (void)WSACleanup();
 
+    if (result == 77) {
+        return 77;
+    }
     if (result != 0) {
         fprintf(stderr, "state mode failed: %s (errno=%d)\n",
                 argc > 1 ? argv[1] : "missing", errno);
