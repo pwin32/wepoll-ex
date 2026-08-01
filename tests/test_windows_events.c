@@ -338,6 +338,32 @@ static int test_protocol_metadata(void)
         return -1;
     }
 
+    memset(&protocol_info, 0, sizeof(protocol_info));
+    protocol_info.iAddressFamily = AF_INET;
+    protocol_info.iSocketType = SOCK_STREAM;
+    protocol_info.iProtocol = IPPROTO_TCP;
+    protocol_info.iProtocolMaxOffset = 0;
+    if (check_protocol("TCP IPv4 metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       EP_SOCKET_PROTOCOL_TCP) != 0) {
+        return -1;
+    }
+    protocol_info.iAddressFamily = AF_INET6;
+    if (check_protocol("TCP IPv6 metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       EP_SOCKET_PROTOCOL_TCP) != 0) {
+        return -1;
+    }
+    protocol_info.iProtocolMaxOffset = 1;
+    if (check_protocol("TCP protocol range metadata",
+                       ep_socket_protocol_from_info(
+                           &protocol_info, (int)sizeof(protocol_info)),
+                       EP_SOCKET_PROTOCOL_UNKNOWN) != 0) {
+        return -1;
+    }
+
     puts("protocol metadata: OK");
     return 0;
 }
@@ -474,7 +500,6 @@ static int run_status_delivery_case(const char *name,
     ep_port_t *port = NULL;
     ep_sock_t *sock = NULL;
     epoll_data_t data;
-    epoll_event_ex ignored;
     epoll_event_ex output;
     PNtDeviceIoControlFile original_submit = NULL;
     SOCKET socket_fd = INVALID_SOCKET;
@@ -503,11 +528,6 @@ static int run_status_delivery_case(const char *name,
         goto cleanup;
     }
     registered = 1;
-    memset(&ignored, 0, sizeof(ignored));
-    if (ep_port_wait(port, &ignored, 1, 0, NULL) < 0) {
-        fprintf(stderr, "%s: deferred arm failed, errno=%d\n", name, errno);
-        goto cleanup;
-    }
     synthetic_pending = 1;
     g_ntdll.NtDeviceIoControlFile = original_submit;
     submit_stub_installed = 0;
@@ -528,6 +548,14 @@ static int run_status_delivery_case(const char *name,
     if (force_unknown_protocol) {
         sock->socket_protocol = EP_SOCKET_PROTOCOL_UNKNOWN;
     }
+    /* This mapping test injects the packet that the immediately following
+     * serialized wait is meant to process.  Stamp that wait's epoch so the
+     * production stale-snapshot refresh does not replace the synthetic AFD
+     * payload with a real provider poll. */
+    sock->submitted_wait_epoch = port->next_wait_epoch + 1;
+    if (sock->submitted_wait_epoch == 0) {
+        sock->submitted_wait_epoch = 1;
+    }
     sock->afd_info->NumberOfHandles = 1;
     sock->afd_info->Handles[0].Events = afd_events;
     sock->afd_info->Handles[0].Status = afd_status;
@@ -544,7 +572,11 @@ static int run_status_delivery_case(const char *name,
 
     memset(&output, 0, sizeof(output));
     wait_result = ep_port_wait(port, &output, 1, 1000, NULL);
-    completion_posted = 0;
+    if (wait_result == 1) {
+        /* The synthetic packet was necessarily dequeued, even when the
+         * payload assertion below fails. */
+        completion_posted = 0;
+    }
     if (wait_result != 1 || output.data.u64 != expected_data ||
         check_mask(name, output.events, expected) != 0) {
         fprintf(stderr,
@@ -600,7 +632,7 @@ static int test_status_delivery(void)
                                  EPOLLERR,
                                  UINT64_C(0x3002)) != 0 ||
         run_status_delivery_case("TCP abort", make_tcp_listener_socket,
-                                 EP_SOCKET_PROTOCOL_UNKNOWN, 0, EPOLLPRI,
+                                 EP_SOCKET_PROTOCOL_TCP, 0, EPOLLPRI,
                                  AFD_POLL_ABORT, STATUS_SUCCESS,
                                  EPOLLERR | EPOLLHUP,
                                  UINT64_C(0x3003)) != 0 ||

@@ -354,8 +354,14 @@ int ep_afd_open(HANDLE iocp, HANDLE *out)
         return -1;
     }
 
-    if (!SetFileCompletionNotificationModes(h,
-                                            FILE_SKIP_SET_EVENT_ON_HANDLE)) {
+    /* Immediate AFD polls are consumed synchronously by the port code.  Do
+     * not also enqueue an IOCP packet for STATUS_SUCCESS; pending requests
+     * still complete through IOCP normally.  This lets a stale queued poll be
+     * refreshed in place instead of moving every ready socket to the tail of
+     * a large completion backlog. */
+    if (!SetFileCompletionNotificationModes(
+            h, FILE_SKIP_SET_EVENT_ON_HANDLE |
+                   FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)) {
         ep_set_errno(ep_winerr_to_errno(GetLastError()));
         CloseHandle(h);
         return -1;
@@ -577,6 +583,13 @@ uint8_t ep_socket_protocol_from_info(const WSAPROTOCOL_INFOW *protocol_info,
         protocol_info->iProtocolMaxOffset == 0) {
         return EP_SOCKET_PROTOCOL_UDP;
     }
+    if ((protocol_info->iAddressFamily == AF_INET ||
+         protocol_info->iAddressFamily == AF_INET6) &&
+        protocol_info->iSocketType == SOCK_STREAM &&
+        protocol_info->iProtocol == IPPROTO_TCP &&
+        protocol_info->iProtocolMaxOffset == 0) {
+        return EP_SOCKET_PROTOCOL_TCP;
+    }
     return EP_SOCKET_PROTOCOL_UNKNOWN;
 }
 #endif
@@ -777,9 +790,9 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
         sizeof(*info),                  /* InputBufferLength */
         info,                           /* OutputBuffer (same) */
         sizeof(*info));                 /* OutputBufferLength */
-    /* STATUS_PENDING means the request was queued.  Any other success
-     * code means it already completed (e.g. socket already readable),
-     * which we treat as a normal completion via the IOCP path. */
+    /* STATUS_PENDING means the request was queued.  STATUS_SUCCESS means the
+     * output snapshot is complete now; FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
+     * guarantees that no IOCP packet owns the embedded status block. */
     if (status != STATUS_SUCCESS && status != STATUS_PENDING) {
         int status_errno = ep_status_to_errno(status);
 
@@ -797,6 +810,8 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
         if (target_is_duplicate)
             ep_afd_poll_duplicate_finish(sock, 1);
     } else {
+        sock->io_status_block.Status = STATUS_SUCCESS;
+        atomic_store(&sock->poll_status, EP_POLL_IDLE);
         if (target_is_duplicate) {
             ep_afd_poll_duplicate_abandon(sock);
         } else {

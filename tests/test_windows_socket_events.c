@@ -15,6 +15,7 @@
 #include <mswsock.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum test_result {
@@ -305,6 +306,28 @@ static int recv_oob(SOCKET socket_fd, char expected)
         ? 0 : -1;
 }
 
+static int wait_select_level(SOCKET socket_fd, int priority,
+                             const char *name)
+{
+    fd_set descriptors;
+    struct timeval timeout;
+    int selected;
+
+    FD_ZERO(&descriptors);
+    FD_SET(socket_fd, &descriptors);
+    timeout.tv_sec = 2;
+    timeout.tv_usec = 0;
+    selected = priority
+        ? select(0, NULL, NULL, &descriptors, &timeout)
+        : select(0, &descriptors, NULL, NULL, &timeout);
+    if (selected != 1 || !FD_ISSET(socket_fd, &descriptors)) {
+        fprintf(stderr, "%s: select=%d WSA=%d\n",
+                name, selected, WSAGetLastError());
+        return -1;
+    }
+    return 0;
+}
+
 static int enable_oob_inline(SOCKET socket_fd)
 {
     int enabled = 1;
@@ -426,6 +449,54 @@ cleanup:
     return result;
 }
 
+static int run_current_level_merge_case(uint32_t flags, uint64_t data,
+                                        const char *name)
+{
+    tcp_pair_t pair;
+    int epfd = -1;
+    int registered = 0;
+    int result = -1;
+
+    if (make_tcp_pair(&pair) != 0) {
+        return -1;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0 ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, pair.server,
+                   EPOLLIN | EPOLLOUT | flags, data) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+
+    /* The eager ADD normally completes first on the socket's already-true
+     * writable level.  Data arrives before the completion packet is drained,
+     * so delivery must merge current readability with that earlier snapshot. */
+    if (send_normal(pair.client, 'c') != 0 ||
+        wait_select_level(pair.server, 0, name) != 0 ||
+        wait_exact(epfd, 2000, data, EPOLLIN | EPOLLOUT, name) != 0) {
+        goto cleanup;
+    }
+    if ((flags & (EPOLLET | EPOLLONESHOT)) != 0 &&
+        wait_empty(epfd, 100, name) != 0) {
+        goto cleanup;
+    }
+    if (recv_normal(pair.server, 'c') != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, pair.server, 0, 0) != 0) {
+        result = -1;
+    }
+    if (epfd >= 0) {
+        (void)wepoll_close(epfd);
+    }
+    tcp_pair_close(&pair);
+    return result;
+}
+
 static int test_aliases(void)
 {
     if (run_read_alias_case(EPOLLRDNORM, EPOLLRDNORM,
@@ -440,7 +511,14 @@ static int test_aliases(void)
         run_write_alias_case(EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND,
                              EPOLLOUT | EPOLLWRNORM,
                              UINT64_C(0x4105), "write aliases") != 0 ||
-        test_write_band_mod() != 0) {
+        test_write_band_mod() != 0 ||
+        run_current_level_merge_case(
+            0, UINT64_C(0x4110), "current LT IN+OUT") != 0 ||
+        run_current_level_merge_case(
+            EPOLLET, UINT64_C(0x4111), "current ET IN+OUT") != 0 ||
+        run_current_level_merge_case(
+            EPOLLONESHOT, UINT64_C(0x4112),
+            "current ONESHOT IN+OUT") != 0) {
         return -1;
     }
     puts("aliases: OK");
@@ -448,7 +526,8 @@ static int test_aliases(void)
 }
 
 static int run_oob_lt_case(uint32_t interest, uint32_t expected,
-                           uint64_t data, const char *name)
+                           uint64_t data, const char *name,
+                           int urgent_first)
 {
     tcp_pair_t pair;
     int epfd = -1;
@@ -464,8 +543,12 @@ static int run_oob_lt_case(uint32_t interest, uint32_t expected,
         goto cleanup;
     }
     registered = 1;
-    if (send_normal(pair.client, 'n') != 0 ||
-        send_oob(pair.client, '!') != 0) {
+    if ((!urgent_first &&
+         (send_normal(pair.client, 'n') != 0 ||
+          send_oob(pair.client, '!') != 0)) ||
+        (urgent_first &&
+         (send_oob(pair.client, '!') != 0 ||
+          send_normal(pair.client, 'n') != 0))) {
         goto cleanup;
     }
     if ((expected != 0 &&
@@ -500,13 +583,15 @@ cleanup:
 static int test_oob_lt(void)
 {
     if (run_oob_lt_case(EPOLLPRI, EPOLLPRI, UINT64_C(0x4201),
-                        "PRI LT") != 0 ||
+                        "PRI LT", 0) != 0 ||
         run_oob_lt_case(EPOLLRDBAND, 0, UINT64_C(0x4202),
-                        "RDBAND LT") != 0 ||
+                        "RDBAND LT", 0) != 0 ||
         run_oob_lt_case(EPOLLPRI | EPOLLRDBAND, EPOLLPRI,
-                        UINT64_C(0x4204), "PRI+RDBAND LT") != 0 ||
+                        UINT64_C(0x4204), "PRI+RDBAND LT", 0) != 0 ||
         run_oob_lt_case(EPOLLIN | EPOLLPRI, EPOLLIN | EPOLLPRI,
-                        UINT64_C(0x4203), "IN+PRI LT") != 0) {
+                        UINT64_C(0x4203), "IN+PRI LT", 0) != 0 ||
+        run_oob_lt_case(EPOLLIN | EPOLLPRI, EPOLLIN | EPOLLPRI,
+                        UINT64_C(0x4205), "PRI+IN LT reverse", 1) != 0) {
         return -1;
     }
     puts("oob-lt: OK");
@@ -947,6 +1032,294 @@ static int queue_udp_datagram(const udp_fixture_t *fixture,
         return -1;
     }
     return 0;
+}
+
+static int run_prewait_udp_case(uint32_t flags, uint64_t data,
+                                const char *name)
+{
+    static const char payload[] = { 'e', 'p', 'o', 'c', 'h' };
+    udp_fixture_t fixture;
+    char received[sizeof(payload)];
+    int epfd = -1;
+    int registered = 0;
+    int setup;
+    int result = TEST_FAILED;
+
+    setup = make_udp_fixture(&fixture, AF_INET);
+    if (setup != TEST_OK) {
+        return setup;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0 ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, fixture.receiver,
+                   EPOLLIN | EPOLLOUT | flags, data) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (queue_udp_datagram(&fixture, payload, (int)sizeof(payload), name) !=
+            0 ||
+        wait_select_level(fixture.receiver, 0, name) != 0 ||
+        wait_exact(epfd, 2000, data, EPOLLIN | EPOLLOUT, name) != 0 ||
+        ((flags & (EPOLLET | EPOLLONESHOT)) != 0 &&
+         wait_empty(epfd, 100, name) != 0)) {
+        goto cleanup;
+    }
+    memset(received, 0, sizeof(received));
+    if (recv(fixture.receiver, received, (int)sizeof(received), 0) !=
+            (int)sizeof(received) ||
+        memcmp(received, payload, sizeof(payload)) != 0) {
+        fprintf(stderr, "%s: datagram changed or consumed, WSA=%d\n",
+                name, WSAGetLastError());
+        goto cleanup;
+    }
+    result = TEST_OK;
+
+cleanup:
+    if (registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, fixture.receiver, 0, 0) != 0) {
+        result = TEST_FAILED;
+    }
+    if (epfd >= 0) {
+        (void)wepoll_close(epfd);
+    }
+    udp_fixture_close(&fixture);
+    return result;
+}
+
+static int run_prewait_fin_case(uint32_t flags, uint64_t data,
+                                const char *name)
+{
+    tcp_pair_t pair;
+    char byte;
+    int epfd = -1;
+    int registered = 0;
+    int result = TEST_FAILED;
+
+    if (make_tcp_pair(&pair) != 0) {
+        return TEST_FAILED;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0 ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, pair.server,
+                   EPOLLOUT | EPOLLRDHUP | flags, data) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (shutdown(pair.client, SD_SEND) == SOCKET_ERROR ||
+        wait_select_level(pair.server, 0, name) != 0 ||
+        wait_exact(epfd, 2000, data, EPOLLOUT | EPOLLRDHUP, name) != 0 ||
+        ((flags & (EPOLLET | EPOLLONESHOT)) != 0 &&
+         wait_empty(epfd, 100, name) != 0) ||
+        recv(pair.server, &byte, 1, 0) != 0) {
+        goto cleanup;
+    }
+    result = TEST_OK;
+
+cleanup:
+    if (registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, pair.server, 0, 0) != 0) {
+        result = TEST_FAILED;
+    }
+    if (epfd >= 0) {
+        (void)wepoll_close(epfd);
+    }
+    tcp_pair_close(&pair);
+    return result;
+}
+
+static int run_prewait_reset_case(void)
+{
+    static const uint64_t data = UINT64_C(0x505245525354);
+    tcp_pair_t pair;
+    struct epoll_event output;
+    struct linger reset = { 1, 0 };
+    char byte;
+    int epfd = -1;
+    int registered = 0;
+    int result = TEST_FAILED;
+
+    if (make_tcp_pair(&pair) != 0) {
+        return TEST_FAILED;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0 ||
+        setsockopt(pair.client, SOL_SOCKET, SO_LINGER,
+                   (const char *)&reset, (int)sizeof(reset)) == SOCKET_ERROR ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, pair.server,
+                   EPOLLOUT | EPOLLONESHOT, data) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    closesocket(pair.client);
+    pair.client = INVALID_SOCKET;
+    if (wait_select_level(pair.server, 0, "prewait reset") != 0) {
+        goto cleanup;
+    }
+    memset(&output, 0, sizeof(output));
+    if (epoll_wait(epfd, &output, 1, 2000) != 1 ||
+        output.data.u64 != data ||
+        (output.events & (EPOLLERR | EPOLLHUP)) !=
+            (EPOLLERR | EPOLLHUP) ||
+        (output.events & ~(EPOLLOUT | EPOLLERR | EPOLLHUP)) != 0 ||
+        wait_empty(epfd, 100, "prewait reset ONESHOT") != 0 ||
+        recv(pair.server, &byte, 1, 0) != SOCKET_ERROR ||
+        WSAGetLastError() != WSAECONNRESET) {
+        fprintf(stderr,
+                "prewait reset: data=0x%llx events=0x%08lx WSA=%d\n",
+                (unsigned long long)output.data.u64,
+                (unsigned long)output.events, WSAGetLastError());
+        goto cleanup;
+    }
+    result = TEST_OK;
+
+cleanup:
+    if (registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, pair.server, 0, 0) != 0) {
+        result = TEST_FAILED;
+    }
+    if (epfd >= 0) {
+        (void)wepoll_close(epfd);
+    }
+    tcp_pair_close(&pair);
+    return result;
+}
+
+static int run_prewait_oob_case(uint32_t flags, uint64_t data,
+                                const char *name)
+{
+    tcp_pair_t pair;
+    int epfd = -1;
+    int registered = 0;
+    int result = TEST_FAILED;
+
+    if (make_tcp_pair(&pair) != 0) {
+        return TEST_FAILED;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0 ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, pair.server,
+                   EPOLLOUT | EPOLLPRI | flags, data) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (send_oob(pair.client, '!') != 0 ||
+        wait_select_level(pair.server, 1, name) != 0 ||
+        wait_exact(epfd, 2000, data, EPOLLOUT | EPOLLPRI, name) != 0 ||
+        ((flags & (EPOLLET | EPOLLONESHOT)) != 0 &&
+         wait_empty(epfd, 100, name) != 0) ||
+        recv_oob(pair.server, '!') != 0) {
+        goto cleanup;
+    }
+    result = TEST_OK;
+
+cleanup:
+    if (registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, pair.server, 0, 0) != 0) {
+        result = TEST_FAILED;
+    }
+    if (epfd >= 0) {
+        (void)wepoll_close(epfd);
+    }
+    tcp_pair_close(&pair);
+    return result;
+}
+
+static int test_prewait_refresh(void)
+{
+    if (run_prewait_udp_case(0, UINT64_C(0x50525544504c),
+                             "prewait UDP LT") != TEST_OK ||
+        run_prewait_udp_case(EPOLLET, UINT64_C(0x505255445045),
+                             "prewait UDP ET") != TEST_OK ||
+        run_prewait_udp_case(EPOLLONESHOT, UINT64_C(0x50525544504f),
+                             "prewait UDP ONESHOT") != TEST_OK ||
+        run_prewait_fin_case(EPOLLET, UINT64_C(0x505246494e45),
+                             "prewait FIN ET") != TEST_OK ||
+        run_prewait_fin_case(EPOLLONESHOT, UINT64_C(0x505246494e4f),
+                             "prewait FIN ONESHOT") != TEST_OK ||
+        run_prewait_reset_case() != TEST_OK ||
+        run_prewait_oob_case(0, UINT64_C(0x50524f4f424c),
+                             "prewait OOB LT") != TEST_OK ||
+        run_prewait_oob_case(EPOLLET, UINT64_C(0x50524f4f4245),
+                             "prewait OOB ET") != TEST_OK ||
+        run_prewait_oob_case(EPOLLONESHOT, UINT64_C(0x50524f4f424f),
+                             "prewait OOB ONESHOT") != TEST_OK) {
+        return TEST_FAILED;
+    }
+    puts("prewait-refresh: OK");
+    return TEST_OK;
+}
+
+static int test_prewait_scale(void)
+{
+    enum { SOCKET_COUNT = 1024 };
+    SOCKET *sockets = NULL;
+    struct epoll_event output;
+    int epfd = -1;
+    int added = 0;
+    int result = TEST_FAILED;
+
+    sockets = (SOCKET *)calloc(SOCKET_COUNT, sizeof(*sockets));
+    if (sockets == NULL) {
+        return TEST_FAILED;
+    }
+    for (int i = 0; i < SOCKET_COUNT; i++) {
+        sockets[i] = INVALID_SOCKET;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        goto cleanup;
+    }
+    for (int i = 0; i < SOCKET_COUNT; i++) {
+        sockets[i] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sockets[i] == INVALID_SOCKET ||
+            ctl_socket(epfd, EPOLL_CTL_ADD, sockets[i], EPOLLOUT,
+                       (uint64_t)i + 1) != 0) {
+            fprintf(stderr,
+                    "prewait scale: ADD %d/%d failed, errno=%d WSA=%d\n",
+                    i, SOCKET_COUNT, errno, WSAGetLastError());
+            goto cleanup;
+        }
+        added++;
+    }
+
+    /* More registrations than one IOCP dequeue batch makes a tail-refresh
+     * epoch treadmill deterministic: a correct implementation must still
+     * return an already-writable socket from the very first timeout-zero
+     * wait, without cycling every old packet behind the backlog. */
+    memset(&output, 0, sizeof(output));
+    if (epoll_wait(epfd, &output, 1, 0) != 1 ||
+        output.data.u64 == 0 || output.data.u64 > SOCKET_COUNT ||
+        output.events != EPOLLOUT) {
+        fprintf(stderr,
+                "prewait scale: wait data=0x%llx events=0x%08lx "
+                "errno=%d WSA=%d\n",
+                (unsigned long long)output.data.u64,
+                (unsigned long)output.events, errno, WSAGetLastError());
+        goto cleanup;
+    }
+    result = TEST_OK;
+
+cleanup:
+    if (epfd >= 0) {
+        for (int i = 0; i < added; i++) {
+            if (ctl_socket(epfd, EPOLL_CTL_DEL, sockets[i], 0, 0) != 0) {
+                result = TEST_FAILED;
+            }
+        }
+        if (wepoll_close(epfd) != 0) {
+            result = TEST_FAILED;
+        }
+    }
+    for (int i = 0; i < SOCKET_COUNT; i++) {
+        if (sockets[i] != INVALID_SOCKET) {
+            closesocket(sockets[i]);
+        }
+    }
+    free(sockets);
+    if (result == TEST_OK) {
+        puts("prewait-scale: OK");
+    }
+    return result;
 }
 
 static int expect_udp_datagram(const udp_fixture_t *fixture,
@@ -1505,6 +1878,12 @@ static int run_mode(const char *mode)
     if (strcmp(mode, "udp-readless-data") == 0) {
         return test_udp_readless_data();
     }
+    if (strcmp(mode, "prewait-refresh") == 0) {
+        return test_prewait_refresh();
+    }
+    if (strcmp(mode, "prewait-scale") == 0) {
+        return test_prewait_scale();
+    }
     if (strcmp(mode, "udp-error") == 0) {
         return test_udp_error(AF_INET, NULL, EPOLLIN, 0, mode);
     }
@@ -1542,7 +1921,8 @@ static int run_mode(const char *mode)
             "usage: test_windows_socket_events "
             "[aliases|oob-lt|oob-et|oob-oneshot|oob-mod|"
             "oob-inline-lt|oob-inline-et|udp-v4|udp-v6|"
-            "udp-readless-data|udp-error|udp-error-v6|"
+            "udp-readless-data|prewait-refresh|prewait-scale|"
+            "udp-error|udp-error-v6|"
             "udp-error-v6-et|udp-error-v6-oneshot|udp-error-v6-zero|"
             "udp-error-v6-err|udp-error-v6-readless-et|"
             "udp-error-v6-readless-oneshot|udp-error-v6-out-et|"

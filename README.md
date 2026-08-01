@@ -27,12 +27,28 @@ validation checklist.
 `src/wepoll_ex_api.c` exposes the public integer `epfd` API and maps each id to
 an internal `ep_port_t`. `src/wepoll_ex_port.c` owns an IOCP handle, AFD poll
 state, a growable socket table, intrusive rearm/fired-oneshot worklists, and a
-ready queue. Stable registrations defer their `AFD_POLL` until a waiter arms
-the port; an already-active waiter and an unconnected transitional stream arm
-immediately. A pending MOD whose mask is already covered keeps the request;
-an expansion cancels once and rearms with the latest metadata. Wait work is
+ready queue. Socket ADD submits its first `AFD_POLL` before returning, so an
+initial submission failure is reported synchronously and readiness can be
+retained before the first wait. Waitable and pipe ADD remain lazy when no
+waiter is active, avoiding notification consumption and timer polling. A
+pending socket MOD whose mask is already covered keeps the request; an
+expansion cancels once and rearms with the latest metadata. Wait work is
 proportional to queued rearm and oneshot-probe work rather than all
-registrations.
+registrations. An idle socket whose poll remains pending owns an AFD IRP;
+simultaneous registrations of one socket across epoll ports may also hold
+temporary duplicate/reservation HANDLEs. An immediately satisfied idle poll
+is consumed synchronously, discarded, and left on the rearm queue so the first
+wait samples the then-current level without retaining an idle IOCP packet.
+
+An eager AFD request can complete on the first ready class before another
+class becomes ready. The AFD control handle suppresses native IOCP packets for
+synchronous success. Completions queued during an idle interval or an earlier
+serialized wait epoch are refreshed before delivery; an immediately satisfied
+refresh is translated in place rather than moved behind the completion
+backlog. When the cached provider metadata is an exact TCP match, completion
+handling also non-destructively merges requested read, write, and non-inline
+priority levels that race within the current wait. Terminal error/HUP
+snapshots and unknown protocols retain the original conservative AFD result.
 
 Internal failures after a successful control call are latched for the wait
 path. Already-queued readiness is delivered before the deferred error; a later
@@ -423,8 +439,10 @@ ready batches, oneshot rearming, and armed control churn:
 ```
 
 The production profile creates 50,001 UDP sockets but binds only the first 512.
-Its 50k point measures registration scaling, not a 50k armed-ready workload,
-and the benchmark intentionally has no pass/fail latency thresholds.
+Its 50k point now measures armed-idle AFD ADD and cancellation-initiation
+scaling, not 50,000 ready sockets. Final port close drains the resulting
+completion burst outside the per-operation samples. The benchmark
+intentionally has no pass/fail latency thresholds.
 
 Linux qualification covers API contracts, close/wait/cancellation races,
 native `epoll_pwait2` where libc and the kernel provide it, plus a separately
@@ -433,8 +451,8 @@ the pool, and package consumption. The MinGW suite covers TCP/UDP IPv4 and
 IPv6 readiness; exact ordinary, priority, and inert band-event masks; LT, ET,
 ONESHOT, and MOD transitions; per-handle AFD status errors; reset and
 refused-connect terminal flags; provider-handle fallback; multi-epfd waits;
-deferred ADD failure; IOCP
-batch draining; timeout deadlines; fail-at-N injection; bounded
+synchronous socket ADD failure; IOCP batch draining; timeout deadlines;
+fail-at-N injection; bounded
 close/quarantine cleanup; randomized lifecycle stress; and package consumers.
 MinGW final binaries select the static winpthreads archive, and CTest rejects
 an accidental `libwinpthread-1.dll` dependency. Record the exact command,

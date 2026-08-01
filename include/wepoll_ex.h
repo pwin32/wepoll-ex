@@ -242,8 +242,9 @@ WEPOLL_EX_API int  epoll_create_ex(int size, int flags);
  * returned batch; a shared opaque data value also cannot be decorated.
  * MOD/DEL on reused fd numbers return EOPNOTSUPP when the current fstat
  * fingerprint cannot identify one metadata registration unambiguously. On
- * Windows, a stable ADD made with no active waiter may defer an AFD submission
- * error until the first wait attempts to arm the registration. */
+ * Windows, socket ADD submits its initial AFD poll before returning and reports
+ * submission errors synchronously; waitable and pipe ADD remain lazy when no
+ * waiter is active. */
 WEPOLL_EX_API int  epoll_ctl_ctx(int epfd, int op, epoll_fd_t fd,
                                  struct epoll_event *ev, void *user_ctx);
 

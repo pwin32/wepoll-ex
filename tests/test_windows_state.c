@@ -901,21 +901,11 @@ static int register_events(state_fixture_t *fixture, uint32_t events,
                            uint32_t flags, uint64_t value, void *context)
 {
     epoll_data_t data;
-    epoll_event_ex ignored;
-    int result;
 
     memset(&data, 0, sizeof(data));
     data.u64 = value;
-    result = ep_port_register(fixture->port, fixture->server,
-                              events, flags, data, context);
-    if (result != 0)
-        return result;
-
-    /* Public registrations intentionally defer AFD submission until a wait
-     * path is active.  These internal state tests need a pending request
-     * before they inject or inspect completions, so arm it explicitly. */
-    memset(&ignored, 0, sizeof(ignored));
-    return ep_port_wait(fixture->port, &ignored, 1, 0, NULL) < 0 ? -1 : 0;
+    return ep_port_register(fixture->port, fixture->server,
+                            events, flags, data, context);
 }
 
 static int register_oneshot(state_fixture_t *fixture, uint64_t value,
@@ -1061,6 +1051,116 @@ static NTSTATUS NTAPI submit_failure_stub(
     (void)output_buffer;
     (void)output_buffer_length;
     return STATUS_ACCESS_DENIED;
+}
+
+typedef struct immediate_success_wait_context {
+    ep_port_t *port;
+    epoll_event_ex event;
+    int wait_result;
+    int wait_error;
+} immediate_success_wait_context_t;
+
+static ep_port_t *immediate_success_port;
+static PGetQueuedCompletionStatusEx immediate_success_dequeue_delegate;
+static HANDLE immediate_success_wait_entered;
+static HANDLE immediate_success_packet_dequeued;
+static PVOID volatile immediate_success_expected_overlapped;
+static volatile LONG immediate_success_submit_calls;
+static volatile LONG immediate_success_invalid;
+
+static BOOL WINAPI immediate_success_dequeue_stub(
+    HANDLE completion_port,
+    OVERLAPPED_ENTRY *entries,
+    ULONG count,
+    PULONG removed,
+    DWORD milliseconds,
+    BOOL alertable)
+{
+    BOOL ok;
+    DWORD error;
+    PVOID expected;
+
+    if (immediate_success_port != NULL &&
+        completion_port == immediate_success_port->iocp) {
+        (void)SetEvent(immediate_success_wait_entered);
+    }
+    ok = immediate_success_dequeue_delegate(
+        completion_port, entries, count, removed, milliseconds, alertable);
+    error = GetLastError();
+    expected = InterlockedCompareExchangePointer(
+        &immediate_success_expected_overlapped, NULL, NULL);
+    if (ok && entries != NULL && removed != NULL &&
+        immediate_success_port != NULL &&
+        completion_port == immediate_success_port->iocp &&
+        expected != NULL) {
+        ULONG limit = *removed < count ? *removed : count;
+
+        for (ULONG i = 0; i < limit; i++) {
+            if (entries[i].lpOverlapped == (LPOVERLAPPED)expected) {
+                (void)InterlockedCompareExchangePointer(
+                    &immediate_success_expected_overlapped,
+                    NULL, expected);
+                (void)SetEvent(immediate_success_packet_dequeued);
+                break;
+            }
+        }
+    }
+    SetLastError(error);
+    return ok;
+}
+
+static NTSTATUS NTAPI immediate_success_submit_stub(
+    HANDLE file_handle,
+    HANDLE event,
+    PIO_APC_ROUTINE apc_routine,
+    PVOID apc_context,
+    PIO_STATUS_BLOCK io_status_block,
+    ULONG io_control_code,
+    PVOID input_buffer,
+    ULONG input_buffer_length,
+    PVOID output_buffer,
+    ULONG output_buffer_length)
+{
+    AFD_POLL_INFO *info = (AFD_POLL_INFO *)output_buffer;
+
+    InterlockedIncrement(&immediate_success_submit_calls);
+    (void)event;
+    (void)apc_routine;
+    if (immediate_success_port == NULL ||
+        file_handle != immediate_success_port->afd ||
+        apc_context != io_status_block || io_status_block == NULL ||
+        io_control_code != IOCTL_AFD_POLL || input_buffer != output_buffer ||
+        info == NULL || input_buffer_length < sizeof(*info) ||
+        output_buffer_length < sizeof(*info) ||
+        info->NumberOfHandles != 1) {
+        InterlockedIncrement(&immediate_success_invalid);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    info->NumberOfHandles = 1;
+    info->Handles[0].Events = AFD_POLL_RECEIVE;
+    info->Handles[0].Status = STATUS_SUCCESS;
+    io_status_block->Status = STATUS_SUCCESS;
+    io_status_block->Information = sizeof(*info);
+    (void)InterlockedExchangePointer(
+        &immediate_success_expected_overlapped, io_status_block);
+    /* The AFD handle suppresses a native IOCP packet for synchronous success.
+     * Production must publish exactly one replacement after this stub
+     * returns and after its pending accounting is visible. */
+    return STATUS_SUCCESS;
+}
+
+static DWORD WINAPI immediate_success_wait_thread(void *parameter)
+{
+    immediate_success_wait_context_t *context =
+        (immediate_success_wait_context_t *)parameter;
+
+    memset(&context->event, 0, sizeof(context->event));
+    errno = 0;
+    context->wait_result = ep_port_wait(
+        context->port, &context->event, 1, 5000, NULL);
+    context->wait_error = errno;
+    return 0;
 }
 
 #define UDP_SUBMIT_CAPTURE_LIMIT 4
@@ -1376,7 +1476,6 @@ static int test_exclusive_mixed_submit(void)
     ep_port_t *exclusive_ports[2] = {NULL, NULL};
     ep_sock_t *socks[3] = {NULL, NULL, NULL};
     epoll_data_t data;
-    epoll_event_ex ignored;
     PNtDeviceIoControlFile original_submit = NULL;
     int contexts[3] = {0, 0, 0};
     int submit_replaced = 0;
@@ -1396,9 +1495,6 @@ static int test_exclusive_mixed_submit(void)
     if (ep_port_register(fixture.port, fixture.server, EPOLLIN, 0,
                          data, &contexts[0]) != 0)
         goto cleanup;
-    memset(&ignored, 0, sizeof(ignored));
-    if (ep_port_wait(fixture.port, &ignored, 1, 0, NULL) != 0)
-        goto cleanup;
 
     for (i = 0; i < 2; i++) {
         data.u64 = UINT64_C(0x6d697865645f6578) + (uint64_t)i;
@@ -1407,9 +1503,6 @@ static int test_exclusive_mixed_submit(void)
                              EPOLLIN | EPOLLEXCLUSIVE | EPOLLET,
                              EPOLLEXCLUSIVE | EPOLLET, data,
                              &contexts[i + 1]) != 0)
-            goto cleanup;
-        memset(&ignored, 0, sizeof(ignored));
-        if (ep_port_wait(exclusive_ports[i], &ignored, 1, 0, NULL) != 0)
             goto cleanup;
     }
 
@@ -1660,23 +1753,21 @@ static int run_udp_readless_error_trigger_case(uint32_t flags)
         udp_submit_result = STATUS_SUCCESS;
         memset(&event, 0, sizeof(event));
         if (ep_port_wait(test_case.fixture.port, &event, 1, 0, NULL) != 0 ||
-            InterlockedCompareExchange(&udp_submit_calls, 0, 0) != 2 ||
-            udp_state_complete(&test_case, AFD_POLL_RECEIVE,
-                               STATUS_SUCCESS, STATUS_SUCCESS) != 0) {
+            InterlockedCompareExchange(&udp_submit_calls, 0, 0) != 2) {
             ep_set_errno(EIO);
             goto cleanup;
         }
         pthread_mutex_lock(&test_case.fixture.port->fd_table_lock);
         state_ok = sock->udp_readless_receive_parked == 0 &&
-            sock->observed_events == EPOLLERR && sock->et_holdoff != 0 &&
-            sock->needs_rearm != 0 &&
-            test_case.fixture.port->needs_rearm_count == 1 &&
+            sock->observed_events == 0 && sock->et_holdoff == 0 &&
+            sock->needs_rearm == 0 &&
+            test_case.fixture.port->needs_rearm_count == 0 &&
             sock->pending_events == 0 &&
             atomic_load_explicit(&sock->ready_queued,
                                  memory_order_relaxed) == 0 &&
             atomic_load_explicit(&sock->poll_status,
                                  memory_order_relaxed) == EP_POLL_IDLE &&
-            InterlockedCompareExchange(&udp_probe_calls, 0, 0) == 2 &&
+            InterlockedCompareExchange(&udp_probe_calls, 0, 0) == 1 &&
             ep_port_worklists_valid_locked(test_case.fixture.port);
         pthread_mutex_unlock(&test_case.fixture.port->fd_table_lock);
         if (!state_ok) {
@@ -2337,19 +2428,16 @@ cleanup:
     return result;
 }
 
-static int test_deferred_add_failure(void)
+static int test_socket_add_submit_failure(void)
 {
     static const uint64_t value = UINT64_C(0x6164646661696c31);
     state_fixture_t fixture;
     PNtDeviceIoControlFile original_submit = NULL;
-    ep_sock_t *sock;
     epoll_data_t data;
-    epoll_event_ex output;
     int context;
     int submit_stub_installed = 0;
     int register_result;
-    int wait_result;
-    int wait_error;
+    int register_error;
     int state_ok;
     int result = -1;
 
@@ -2363,33 +2451,37 @@ static int test_deferred_add_failure(void)
     g_ntdll.NtDeviceIoControlFile = counted_submit_stub;
     submit_stub_installed = 1;
 
+    errno = 0;
     register_result = ep_port_register(
         fixture.port, fixture.server, EPOLLIN | EPOLLONESHOT,
         EPOLLONESHOT, data, &context);
-    memset(&output, 0, sizeof(output));
-    errno = 0;
-    wait_result = ep_port_wait(fixture.port, &output, 1, 0, NULL);
-    wait_error = errno;
+    register_error = errno;
 
     g_ntdll.NtDeviceIoControlFile = original_submit;
     submit_stub_installed = 0;
-    sock = fixture_sock(&fixture);
-    if (sock == NULL) goto cleanup;
 
     pthread_mutex_lock(&fixture.port->fd_table_lock);
-    state_ok = register_result == 0 && wait_result == -1 &&
-        wait_error == EACCES &&
+    state_ok = register_result == -1 && register_error == EACCES &&
         InterlockedCompareExchange(&counted_submit_calls, 0, 0) == 1 &&
-        fixture.port->fd_table_count == 1 &&
-        fixture.port->needs_rearm_count == 1 &&
-        fixture.port->rearm_head == sock &&
-        fixture.port->rearm_tail == sock &&
+        fixture.port->fd_table_count == 0 &&
+        fixture.port->sock_list_head == NULL &&
+        fixture.port->pending_poll_count == 0 &&
+        fixture.port->needs_rearm_count == 0 &&
+        fixture.port->oneshot_fired_count == 0 &&
+        fixture.port->rearm_head == NULL &&
+        fixture.port->rearm_tail == NULL &&
+        fixture.port->oneshot_head == NULL &&
+        fixture.port->oneshot_tail == NULL &&
+        atomic_load_explicit(&fixture.port->afd_info_pool.in_use,
+                             memory_order_relaxed) == 0 &&
         ep_port_worklists_valid_locked(fixture.port) &&
-        atomic_load_explicit(&sock->poll_status,
-                             memory_order_relaxed) == EP_POLL_IDLE;
+        atomic_load_explicit(&fixture.port->ready_queue.queued,
+                             memory_order_relaxed) == 0;
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
-    if (!state_ok || send_byte(fixture.client) != 0 ||
-        expect_one_oneshot(fixture.port, value, &context) != 0) {
+    if (!state_ok || ep_port_register(
+            fixture.port, fixture.server, EPOLLIN | EPOLLONESHOT,
+            EPOLLONESHOT, data, &context) != 0 ||
+        ep_port_unregister(fixture.port, fixture.server) != 0) {
         goto cleanup;
     }
     result = 0;
@@ -2398,6 +2490,289 @@ cleanup:
     if (submit_stub_installed)
         g_ntdll.NtDeviceIoControlFile = original_submit;
     fixture_close(&fixture);
+    return result;
+}
+
+static int test_socket_add_immediate_success(void)
+{
+    static const uint64_t value = UINT64_C(0x616464696d6d6564);
+    state_fixture_t fixture;
+    immediate_success_wait_context_t wait_context;
+    PNtDeviceIoControlFile original_submit = NULL;
+    ep_sock_t *sock;
+    epoll_data_t data;
+    HANDLE wait_thread = NULL;
+    DWORD wait_thread_status;
+    OVERLAPPED_ENTRY extra_entry;
+    ULONG extra_removed = 0;
+    DWORD extra_error;
+    BOOL extra_ok;
+    int context;
+    int dequeue_replaced = 0;
+    int submit_replaced = 0;
+    int register_result;
+    int state_ok;
+    int result = -1;
+
+    memset(&wait_context, 0, sizeof(wait_context));
+    if (fixture_open(&fixture) != 0) return -1;
+    immediate_success_wait_entered =
+        CreateEventW(NULL, TRUE, FALSE, NULL);
+    immediate_success_packet_dequeued =
+        CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (immediate_success_wait_entered == NULL ||
+        immediate_success_packet_dequeued == NULL) {
+        goto cleanup;
+    }
+
+    immediate_success_port = fixture.port;
+    immediate_success_dequeue_delegate =
+        fixture.port->get_queued_completion_status_ex;
+    fixture.port->get_queued_completion_status_ex =
+        immediate_success_dequeue_stub;
+    dequeue_replaced = 1;
+    original_submit = g_ntdll.NtDeviceIoControlFile;
+    InterlockedExchange(&immediate_success_submit_calls, 0);
+    InterlockedExchange(&immediate_success_invalid, 0);
+    (void)InterlockedExchangePointer(
+        &immediate_success_expected_overlapped, NULL);
+    g_ntdll.NtDeviceIoControlFile = immediate_success_submit_stub;
+    submit_replaced = 1;
+
+    wait_context.port = fixture.port;
+    wait_thread = CreateThread(
+        NULL, 0, immediate_success_wait_thread, &wait_context, 0, NULL);
+    if (wait_thread == NULL ||
+        WaitForSingleObject(immediate_success_wait_entered, 2000) !=
+            WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+
+    memset(&data, 0, sizeof(data));
+    data.u64 = value;
+    register_result = ep_port_register(
+        fixture.port, fixture.server, EPOLLIN | EPOLLONESHOT,
+        EPOLLONESHOT, data, &context);
+    g_ntdll.NtDeviceIoControlFile = original_submit;
+    submit_replaced = 0;
+    if (register_result != 0 ||
+        WaitForSingleObject(wait_thread, 5000) != WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+    fixture.port->get_queued_completion_status_ex =
+        immediate_success_dequeue_delegate;
+    dequeue_replaced = 0;
+
+    sock = fixture_sock(&fixture);
+    if (sock == NULL) goto cleanup;
+    memset(&extra_entry, 0, sizeof(extra_entry));
+    SetLastError(ERROR_SUCCESS);
+    extra_ok = fixture.port->get_queued_completion_status_ex(
+        fixture.port->iocp, &extra_entry, 1, &extra_removed, 0, FALSE);
+    extra_error = GetLastError();
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok =
+        InterlockedCompareExchange(&immediate_success_submit_calls, 0, 0) ==
+            1 &&
+        InterlockedCompareExchange(&immediate_success_invalid, 0, 0) == 0 &&
+        fixture.port->fd_table_count == 1 &&
+        fixture.port->pending_poll_count == 0 &&
+        fixture.port->async_error == 0 &&
+        fixture.port->needs_rearm_count == 0 &&
+        fixture.port->oneshot_fired_count == 1 &&
+        fixture.port->oneshot_head == sock &&
+        fixture.port->oneshot_tail == sock &&
+        atomic_load_explicit(&fixture.port->ready_queue.queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_REGISTERED &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        sock->oneshot_fired != 0 && sock->needs_rearm == 0 &&
+        sock->afd_poll_key_owned == 0 && sock->afd_poll_target == NULL &&
+        sock->afd_poll_key_reservation == NULL &&
+        !extra_ok && extra_error == WAIT_TIMEOUT &&
+        WaitForSingleObject(immediate_success_packet_dequeued, 0) ==
+            WAIT_OBJECT_0 &&
+        ep_port_worklists_valid_locked(fixture.port);
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok) {
+        fprintf(stderr,
+                "immediate state: calls=%ld invalid=%ld fd=%zu pending=%zu "
+                "async=%d rearm=%zu oneshot=%zu queued=%zu state=%lu "
+                "poll=%lu ready=%lu fired=%u needs=%u key=%u extra=%d/%lu/%lu "
+                "dequeued=%lu\n",
+                InterlockedCompareExchange(
+                    &immediate_success_submit_calls, 0, 0),
+                InterlockedCompareExchange(&immediate_success_invalid, 0, 0),
+                fixture.port->fd_table_count,
+                fixture.port->pending_poll_count, fixture.port->async_error,
+                fixture.port->needs_rearm_count,
+                fixture.port->oneshot_fired_count,
+                atomic_load_explicit(&fixture.port->ready_queue.queued,
+                                     memory_order_relaxed),
+                (unsigned long)atomic_load_explicit(
+                    &sock->state, memory_order_relaxed),
+                (unsigned long)atomic_load_explicit(
+                    &sock->poll_status, memory_order_relaxed),
+                (unsigned long)atomic_load_explicit(
+                    &sock->ready_queued, memory_order_relaxed),
+                (unsigned)sock->oneshot_fired, (unsigned)sock->needs_rearm,
+                (unsigned)sock->afd_poll_key_owned, extra_ok != FALSE,
+                (unsigned long)extra_removed, (unsigned long)extra_error,
+                (unsigned long)WaitForSingleObject(
+                    immediate_success_packet_dequeued, 0));
+    }
+    if (!state_ok || wait_context.wait_result != 1 ||
+        wait_context.event.events != EPOLLIN ||
+        wait_context.event.data.u64 != value ||
+        wait_context.event.user_ctx != &context ||
+        wait_context.event.flags != WEPOLL_FLAG_ONESHOT_FIRED ||
+        wait_context.event.timestamp == 0 ||
+        ep_port_unregister(fixture.port, fixture.server) != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (submit_replaced) {
+        g_ntdll.NtDeviceIoControlFile = original_submit;
+    }
+    if (wait_thread != NULL) {
+        wait_thread_status = WaitForSingleObject(wait_thread, 6000);
+        if (wait_thread_status != WAIT_OBJECT_0) {
+            if (fixture.port != NULL) ep_port_begin_close(fixture.port);
+            wait_thread_status = WaitForSingleObject(wait_thread, 2000);
+            result = -1;
+        }
+        if (wait_thread_status != WAIT_OBJECT_0) {
+            /* Do not tear down objects still reachable by the wedged waiter.
+             * This mode runs in its own process, which exits immediately after
+             * reporting the failure and reclaims the intentionally leaked
+             * test state safely. */
+            CloseHandle(wait_thread);
+            ep_set_errno(ETIMEDOUT);
+            return -1;
+        }
+    }
+    if (dequeue_replaced && fixture.port != NULL) {
+        fixture.port->get_queued_completion_status_ex =
+            immediate_success_dequeue_delegate;
+    }
+    if (wait_thread != NULL) CloseHandle(wait_thread);
+    immediate_success_port = NULL;
+    immediate_success_dequeue_delegate = NULL;
+    (void)InterlockedExchangePointer(
+        &immediate_success_expected_overlapped, NULL);
+    if (immediate_success_packet_dequeued != NULL) {
+        CloseHandle(immediate_success_packet_dequeued);
+        immediate_success_packet_dequeued = NULL;
+    }
+    if (immediate_success_wait_entered != NULL) {
+        CloseHandle(immediate_success_wait_entered);
+        immediate_success_wait_entered = NULL;
+    }
+    fixture_close(&fixture);
+    return result;
+}
+
+static int test_aux_add_lazy(void)
+{
+    static const char byte = 'a';
+    ep_port_t *port = NULL;
+    ep_sock_t *sock;
+    HANDLE semaphore = NULL;
+    HANDLE pipe_read = NULL;
+    HANDLE pipe_write = NULL;
+    epoll_data_t data;
+    DWORD available = 0;
+    DWORD transferred = 0;
+    int state_ok;
+    int result = -1;
+
+    semaphore = CreateSemaphoreW(NULL, 1, 1, NULL);
+    if (semaphore == NULL || ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x6175785f73656d31);
+    if (ep_port_register(port, (SOCKET)(uintptr_t)semaphore,
+                         EPOLLIN, 0, data, NULL) != 0) {
+        goto cleanup;
+    }
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    state_ok = sock != NULL && sock->next == NULL &&
+        sock->kind == EP_REG_WAITABLE && sock->needs_rearm != 0 &&
+        sock->wait_registration == NULL &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_REGISTERED &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->callback_active,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->completion_posted,
+                             memory_order_relaxed) == 0 &&
+        port->pending_poll_count == 0 && port->needs_rearm_count == 1 &&
+        port->rearm_head == sock && port->rearm_tail == sock &&
+        ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok ||
+        WaitForSingleObject(semaphore, 0) != WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+    {
+        ep_port_t *destroy_port = port;
+
+        port = NULL;
+        if (ep_port_destroy(destroy_port) != 0) goto cleanup;
+    }
+    CloseHandle(semaphore);
+    semaphore = NULL;
+
+    if (!CreatePipe(&pipe_read, &pipe_write, NULL, 0) ||
+        !WriteFile(pipe_write, &byte, 1, &transferred, NULL) ||
+        transferred != 1 || ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+    data.u64 = UINT64_C(0x6175785f70697031);
+    if (ep_port_register(port, (SOCKET)(uintptr_t)pipe_read,
+                         EPOLLIN, 0, data, NULL) != 0) {
+        goto cleanup;
+    }
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    state_ok = sock != NULL && sock->next == NULL &&
+        sock->kind == EP_REG_PIPE && sock->needs_rearm != 0 &&
+        sock->wait_registration == NULL && sock->pending_events == 0 &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_REGISTERED &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->completion_posted,
+                             memory_order_relaxed) == 0 &&
+        port->pending_poll_count == 0 && port->needs_rearm_count == 1 &&
+        port->rearm_head == sock && port->rearm_tail == sock &&
+        ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok || !PeekNamedPipe(pipe_read, NULL, 0, NULL,
+                                    &available, NULL) || available != 1) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (port != NULL) {
+        ep_port_t *destroy_port = port;
+
+        port = NULL;
+        if (ep_port_destroy(destroy_port) != 0) result = -1;
+    }
+    if (pipe_write != NULL) CloseHandle(pipe_write);
+    if (pipe_read != NULL) CloseHandle(pipe_read);
+    if (semaphore != NULL) CloseHandle(semaphore);
     return result;
 }
 
@@ -2776,6 +3151,7 @@ static int test_transitional_idle(void)
     epoll_data_t data;
     epoll_event_ex event;
     size_t fd_count;
+    LONG add_submit_calls;
     int context;
     int wait_result;
     int result = -1;
@@ -2798,6 +3174,8 @@ static int test_transitional_idle(void)
         g_ntdll.NtDeviceIoControlFile = original_submit;
         goto cleanup;
     }
+    add_submit_calls = InterlockedCompareExchange(
+        &counted_submit_calls, 0, 0);
     memset(&event, 0, sizeof(event));
     wait_result = ep_port_wait(fixture.port, &event, 1, 200, NULL);
     g_ntdll.NtDeviceIoControlFile = original_submit;
@@ -2806,10 +3184,9 @@ static int test_transitional_idle(void)
     fd_count = fixture.port->fd_table_count;
     pthread_mutex_unlock(&fixture.port->fd_table_lock);
 
-    /* One request is submitted either by ADD (hardened identity mode) or by
-     * the first wait (synchronized-lifetime mode).  More submissions mean a
-     * broad transitional mask is completing and re-arming in a hot loop. */
-    if (wait_result == 0 &&
+    /* Every lifetime mode submits the first request from ADD.  The following
+     * idle wait must reuse that request rather than arm a second one. */
+    if (add_submit_calls == 1 && wait_result == 0 &&
         InterlockedCompareExchange(&counted_submit_calls, 0, 0) == 1 &&
         fd_count == 1) {
         result = 0;
@@ -3884,8 +4261,12 @@ int main(int argc, char **argv)
         result = test_udp_readless_park();
     } else if (strcmp(argv[1], "udp-readless-rollback") == 0) {
         result = test_udp_readless_rollback();
-    } else if (strcmp(argv[1], "deferred-add-failure") == 0) {
-        result = test_deferred_add_failure();
+    } else if (strcmp(argv[1], "socket-add-submit-failure") == 0) {
+        result = test_socket_add_submit_failure();
+    } else if (strcmp(argv[1], "socket-add-immediate-success") == 0) {
+        result = test_socket_add_immediate_success();
+    } else if (strcmp(argv[1], "aux-add-lazy") == 0) {
+        result = test_aux_add_lazy();
     } else if (strcmp(argv[1], "failed-mod") == 0) {
         result = test_failed_mod_rollback();
     } else if (strcmp(argv[1], "failed-rearm") == 0) {

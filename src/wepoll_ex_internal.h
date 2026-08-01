@@ -338,12 +338,14 @@ typedef enum ep_reg_kind {
     EP_REG_PIPE = 2
 } ep_reg_kind_t;
 
-/* Only protocols whose Winsock metadata is an exact UDP/IP match receive
- * protocol-specific AFD event handling.  Every unsupported, malformed, or
- * unavailable protocol description remains conservative. */
+/* Exact UDP/IP metadata enables receive-error qualification; exact TCP/IP
+ * metadata enables non-consuming current-level merging at completion.
+ * Every unsupported, malformed, or unavailable description remains
+ * conservative. */
 typedef enum ep_socket_protocol {
     EP_SOCKET_PROTOCOL_UNKNOWN = 0,
-    EP_SOCKET_PROTOCOL_UDP = 1
+    EP_SOCKET_PROTOCOL_UDP = 1,
+    EP_SOCKET_PROTOCOL_TCP = 2
 } ep_socket_protocol_t;
 
 /* A one-byte direct AFD receive is only a safe readiness observation when the
@@ -427,6 +429,11 @@ struct ep_sock {
      * uses it to avoid cancelling a request whose mask already covers the
      * new interests. */
     uint32_t submitted_afd_events;
+    /* Serialized epoll_wait epoch in which the in-flight/last AFD request
+     * was submitted.  Zero means that no public waiter was active.  A
+     * completion from an older epoch is refreshed once before delivery so an
+     * eager idle poll cannot expose a stale first-ready-class snapshot. */
+    uint64_t submitted_wait_epoch;
     /* Edge-triggered latch: interest bits already reported to the user while
      * the corresponding level remains continuously true.  Cleared for bits
      * that drop out of the latest AFD level snapshot so a later re-assert
@@ -646,6 +653,12 @@ struct ep_port {
      * polls and waits for their IOCP completions before storage is freed. */
     pthread_mutex_t wait_lock;
     _Atomic int waiter_active;
+    /* The ready queue has a single serialized consumer.  Publish its current
+     * logical wait generation so socket submissions can be refreshed when an
+     * AFD request survives an idle interval or a waiter handoff.  Zero means
+     * no public wait is active; next_wait_epoch is protected by wait_lock. */
+    _Atomic uint64_t active_wait_epoch;
+    uint64_t next_wait_epoch;
     /* Set after a large wait has selected its first ready snapshot.  Control
      * operations then queue rearm work for the next wait instead of creating
      * a second generation that the same coalescing drain could return. */

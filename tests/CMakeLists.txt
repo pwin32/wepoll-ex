@@ -237,7 +237,9 @@ else()
         foreach(_state_mode IN ITEMS
                 queued-rearm
                 queued-mod
-                deferred-add-failure
+                socket-add-submit-failure
+                socket-add-immediate-success
+                aux-add-lazy
                 failed-mod
                 failed-rearm
                 pending-metadata-mod
@@ -322,6 +324,8 @@ else()
             udp-v4
             udp-v6
             udp-readless-data
+            prewait-refresh
+            prewait-scale
             udp-error
             udp-error-v6
             udp-error-v6-et
@@ -505,6 +509,8 @@ else()
                 pool-grow
                 afd-open
                 afd-submit
+                afd-submit-batch
+                afd-refresh-submit
                 afd-key-fallback
                 afd-cancel
                 endpoint-identity
@@ -513,6 +519,7 @@ else()
                 provider-base
                 iocp-create
                 iocp-post
+                iocp-post-immediate-socket
                 iocp-dequeue
                 aux-closed-iocp
                 aux-post

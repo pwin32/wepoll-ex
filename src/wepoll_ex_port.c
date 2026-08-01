@@ -802,6 +802,74 @@ static int ep_socket_select_ready(SOCKET fd, int writable)
     return result > 0 && FD_ISSET(fd, &descriptors);
 }
 
+static int ep_socket_select_priority_ready(SOCKET fd)
+{
+    struct sockaddr_storage peer;
+    fd_set descriptors;
+    struct timeval timeout;
+    int peer_length = (int)sizeof(peer);
+    int oob_inline = 0;
+    int option_length = (int)sizeof(oob_inline);
+    int result;
+
+    /* With SO_OOBINLINE, urgent data belongs to ordinary readability and
+     * Windows must not manufacture Linux's separate EPOLLPRI indication.
+     * Winsock also places a failed nonblocking connect in exceptfds, so only
+     * an established peer is eligible for priority synthesis. */
+    if (getpeername(fd, (struct sockaddr *)&peer, &peer_length) ==
+            SOCKET_ERROR ||
+        getsockopt(fd, SOL_SOCKET, SO_OOBINLINE,
+                   (char *)&oob_inline, &option_length) == SOCKET_ERROR ||
+        oob_inline != 0) {
+        return 0;
+    }
+
+    FD_ZERO(&descriptors);
+    FD_SET(fd, &descriptors);
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+    result = select(0, NULL, NULL, &descriptors, &timeout);
+    if (result == SOCKET_ERROR) {
+        return -1;
+    }
+    return result > 0 && FD_ISSET(fd, &descriptors);
+}
+
+static void ep_socket_merge_current_levels(ep_sock_t *sock,
+                                           uint32_t *delivered)
+{
+    uint32_t read_interest;
+    uint32_t write_interest;
+
+    if (sock->socket_protocol != EP_SOCKET_PROTOCOL_TCP ||
+        (*delivered & (EPOLLERR | EPOLLHUP)) != 0) {
+        return;
+    }
+
+    /* AFD snapshots the first matching class that completes an eagerly armed
+     * request.  Linux epoll re-polls a ready item while copying it to the user,
+     * so merge requested TCP levels that became ready before this IOCP packet
+     * is processed.  select() observes the public provider socket without
+     * consuming data; unknown protocols retain the conservative AFD snapshot. */
+    read_interest = sock->user_events & (EPOLLIN | EPOLLRDNORM);
+    if ((read_interest & ~*delivered) != 0 &&
+        ep_socket_select_ready(sock->fd, 0) > 0) {
+        *delivered |= read_interest;
+    }
+
+    write_interest = sock->user_events & (EPOLLOUT | EPOLLWRNORM);
+    if ((write_interest & ~*delivered) != 0 &&
+        ep_socket_select_ready(sock->fd, 1) > 0) {
+        *delivered |= write_interest;
+    }
+
+    if ((sock->user_events & EPOLLPRI) != 0 &&
+        (*delivered & EPOLLPRI) == 0 &&
+        ep_socket_select_priority_ready(sock->fd) > 0) {
+        *delivered |= EPOLLPRI;
+    }
+}
+
 typedef struct ep_file_mode_information {
     ULONG mode;
 } ep_file_mode_information_t;
@@ -2576,22 +2644,32 @@ static uint32_t ep_sock_afd_events_locked(ep_sock_t *sock,
 
 #ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 #define EP_SOCK_SUBMIT_LOCKED(sock, identity_validated) \
-    ep_sock_submit_locked(sock)
+    ep_sock_submit_locked((sock), NULL)
+#define EP_SOCK_SUBMIT_FOR_DELIVERY_LOCKED(sock, identity_validated, immediate) \
+    ep_sock_submit_locked((sock), (immediate))
 static int ep_sock_cancel_locked(ep_sock_t *sock);
-static int ep_sock_submit_locked(ep_sock_t *sock)
+static int ep_sock_submit_locked(ep_sock_t *sock, int *immediate_out)
 #else
 #define EP_SOCK_SUBMIT_LOCKED(sock, identity_validated) \
-    ep_sock_submit_locked((sock), (identity_validated))
+    ep_sock_submit_locked((sock), (identity_validated), NULL)
+#define EP_SOCK_SUBMIT_FOR_DELIVERY_LOCKED(sock, identity_validated, immediate) \
+    ep_sock_submit_locked((sock), (identity_validated), (immediate))
 static int ep_sock_cancel_locked(ep_sock_t *sock);
-static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
+static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated,
+                                 int *immediate_out)
 #endif
 {
     ep_port_t *port = sock->port;
+    uint64_t old_submitted_wait_epoch;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     ep_identity_check_t identity_check;
 #endif
     uint32_t poll_status =
         atomic_load_explicit(&sock->poll_status, memory_order_relaxed);
+
+    if (immediate_out != NULL) {
+        *immediate_out = 0;
+    }
 
     if (atomic_load_explicit(&port->closing, memory_order_acquire) ||
         atomic_load_explicit(&sock->delete_pending, memory_order_relaxed) ||
@@ -2802,7 +2880,11 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
     sock->et_holdoff = 0;
     uint32_t afd_events = ep_sock_afd_events_locked(sock, sock->user_events);
     int poll_pending = 0;
+    old_submitted_wait_epoch = sock->submitted_wait_epoch;
+    sock->submitted_wait_epoch = atomic_load_explicit(
+        &port->active_wait_epoch, memory_order_acquire);
     if (ep_afd_poll_submit(sock, afd_events, &poll_pending) != 0) {
+        sock->submitted_wait_epoch = old_submitted_wait_epoch;
         if (ep_last_err() == ENOTSOCK || ep_last_err() == EBADF) {
             ep_sock_drop_closed_locked(port, sock);
             ep_set_errno(ENOTSOCK);
@@ -2813,10 +2895,56 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated)
     if (poll_pending) {
         ep_exclusive_release_quiescent(sock, afd_events);
     }
+    if (!poll_pending) {
+        if (immediate_out != NULL) {
+            ep_sock_set_needs_rearm_locked(sock, 0);
+            atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                  memory_order_relaxed);
+            *immediate_out = 1;
+            return 0;
+        }
+        if (sock->submitted_wait_epoch == 0) {
+            /* ADD still exercised the real provider submission and key path,
+             * but no waiter exists to consume this snapshot.  Discard it and
+             * keep the registration on the rearm list so the next wait polls
+             * the then-current level without an idle immediate packet. */
+            atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                  memory_order_relaxed);
+            return 0;
+        }
+
+        /* The AFD handle suppresses the kernel's immediate-success packet.
+         * Recreate one only for an active wait's ordinary submission.  A
+         * stale completion refresh instead requests immediate_out above and
+         * translates the fresh snapshot in place. */
+        {
+            DWORD post_error = ERROR_SUCCESS;
+
+            ep_sock_set_needs_rearm_locked(sock, 0);
+            atomic_store_explicit(&sock->poll_status, EP_POLL_PENDING,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&sock->state, EP_SOCK_POLLING,
+                                  memory_order_relaxed);
+            port->pending_poll_count++;
+            if (!ep_port_post_iocp(
+                    port, 0, (LPOVERLAPPED)&sock->io_status_block,
+                    EP_FAULT_IOCP_POST, &post_error)) {
+                assert(port->pending_poll_count > 0);
+                port->pending_poll_count--;
+                atomic_store_explicit(&sock->poll_status, EP_POLL_IDLE,
+                                      memory_order_relaxed);
+                atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                      memory_order_relaxed);
+                ep_sock_set_needs_rearm_locked(sock, 1);
+                ep_port_fail_iocp_post(port, post_error);
+                ep_set_errno(ep_winerr_to_errno(post_error));
+                return -1;
+            }
+        }
+        return 0;
+    }
 
     ep_sock_set_needs_rearm_locked(sock, 0);
-    atomic_store_explicit(&sock->poll_status, EP_POLL_PENDING,
-                          memory_order_relaxed);
     atomic_store_explicit(&sock->state, EP_SOCK_POLLING,
                           memory_order_relaxed);
     port->pending_poll_count++;
@@ -3149,16 +3277,12 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
         return;
     }
 
-    if (status >= 0 && sock->afd_info != NULL &&
-        sock->afd_info->NumberOfHandles > 0) {
-        ULONG afd_events = sock->afd_info->Handles[0].Events;
-        int udp_identity_error = 0;
-        int udp_probe_error = 0;
-
+process_socket_snapshot:
+    if (sock->kind == EP_REG_SOCKET && status >= 0 &&
+        sock->afd_info != NULL && sock->afd_info->NumberOfHandles > 0) {
         if ((sock->afd_info->Handles[0].Events & AFD_POLL_LOCAL_CLOSE) != 0) {
-            /* The application closed this socket without EPOLL_CTL_DEL.
-             * There is no usable registration left to report; retire it now
-             * rather than trying to re-arm a stale numeric SOCKET later. */
+            /* Refreshing a stale eager snapshot must not turn native close
+             * into a fresh request against a reused numeric SOCKET. */
             ep_sock_drop_closed_locked(port, sock);
             pthread_mutex_unlock(&port->fd_table_lock);
             return;
@@ -3187,6 +3311,52 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
 #endif
         }
 #endif
+    }
+
+    if (sock->kind == EP_REG_SOCKET && status >= 0) {
+        uint64_t active_wait_epoch = atomic_load_explicit(
+            &port->active_wait_epoch, memory_order_acquire);
+
+        if (active_wait_epoch != 0 &&
+            sock->submitted_wait_epoch != active_wait_epoch) {
+            int immediate = 0;
+            int submit_result;
+
+            /* AFD settles a poll when the first requested class becomes
+             * ready.  An eager request can therefore leave an old SEND (or
+             * other partial) snapshot queued across an idle interval or
+             * serialized waiter handoff.  Linux re-polls a ready item while
+             * copying it to the caller.  Retire this packet's accounting and
+             * submit one current-epoch full poll before any ET/ONESHOT latch
+             * or ready node can consume the stale snapshot. */
+            atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                                  memory_order_relaxed);
+            ep_sock_set_needs_rearm_locked(sock, 1);
+            submit_result = EP_SOCK_SUBMIT_FOR_DELIVERY_LOCKED(
+                sock, 0, &immediate);
+            if (submit_result < 0) {
+                int error = ep_last_err();
+
+                ep_sock_set_needs_rearm_locked(sock, 1);
+                ep_port_record_async_error_locked(port, error);
+            }
+            if (submit_result == 0 && immediate) {
+                /* No IOCP packet owns the fresh output buffer.  Re-run close
+                 * and identity checks, then translate this current snapshot
+                 * during the same wait instead of queueing it behind the
+                 * stale backlog we just consumed. */
+                goto process_socket_snapshot;
+            }
+            pthread_mutex_unlock(&port->fd_table_lock);
+            return;
+        }
+    }
+
+    if (status >= 0 && sock->afd_info != NULL &&
+        sock->afd_info->NumberOfHandles > 0) {
+        ULONG afd_events = sock->afd_info->Handles[0].Events;
+        int udp_identity_error = 0;
+        int udp_probe_error = 0;
         if ((afd_events & AFD_POLL_RECEIVE) != 0 &&
             sock->afd_info->Handles[0].Status >= 0 &&
             sock->socket_protocol == EP_SOCKET_PROTOCOL_UDP) {
@@ -3267,6 +3437,8 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     } else if (status < 0) {
         delivered = EPOLLERR;
     }
+    if (sock->kind == EP_REG_SOCKET)
+        ep_socket_merge_current_levels(sock, &delivered);
     if (sock->kind == EP_REG_SOCKET &&
         (sock->user_flags & (EPOLLET | EPOLLEXCLUSIVE)) != 0) {
         int sample_all = (sock->user_flags & EPOLLEXCLUSIVE) != 0;
@@ -3581,6 +3753,7 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
 
     port->close_on_exec = (flags & EPOLL_CLOEXEC) != 0;
     atomic_init(&port->waiter_active, 0);
+    atomic_init(&port->active_wait_epoch, 0);
     atomic_init(&port->waiter_coalescing, 0);
     atomic_init(&port->closing, 0);
     atomic_init(&port->iocp_closed, 0);
@@ -4105,20 +4278,17 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
         ep_sock_set_needs_rearm_locked(sock, 1);
     }
 
-    /* When no waiter is blocked, defer the AFD request until the next wait.
-     * This coalesces registration changes and, critically, lets independent
-     * epoll instances arm the same socket from their own wait paths.  A port
-     * with an active waiter must arm immediately so future readiness can wake
-     * the already-blocked GetQueuedCompletionStatusEx call. */
+    /* Socket ADD synchronously submits its first AFD request so initial
+     * provider errors are reported by epoll_ctl rather than a later wait.
+     * Waitables and pipes remain lazy when no waiter is blocked: probing or
+     * arming them at ADD could consume notifications or start timer work
+     * before the application enters a wait. */
     if (!ep_waitable_is_dormant(sock) &&
-        ((atomic_load_explicit(&port->waiter_active,
+        (sock->kind == EP_REG_SOCKET ||
+         (atomic_load_explicit(&port->waiter_active,
                                memory_order_acquire) &&
           !atomic_load_explicit(&port->waiter_coalescing,
-                                memory_order_acquire))
-#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
-        || sock->endpoint_id_state == EP_SOCKET_ID_TRANSITIONAL
-#endif
-        )) {
+                                memory_order_acquire)))) {
         int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
         if (submit_result < 0) {
             ep_fd_table_remove(port, sock);
@@ -4886,6 +5056,13 @@ static int ep_port_wait_timeout_impl(ep_port_t *port, void *out,
     if (lock_result <= 0) {
         return lock_result == 0 ? 0 : -1;
     }
+    port->next_wait_epoch++;
+    if (port->next_wait_epoch == 0) {
+        port->next_wait_epoch = 1;
+    }
+    atomic_store_explicit(&port->active_wait_epoch,
+                          port->next_wait_epoch,
+                          memory_order_release);
     atomic_store_explicit(&port->waiter_active, 1, memory_order_release);
 
     /* An error deferred behind a previously returned ready batch wins at the
@@ -5216,6 +5393,8 @@ done:
     atomic_store_explicit(&port->waiter_coalescing, 0,
                           memory_order_release);
     atomic_store_explicit(&port->waiter_active, 0, memory_order_release);
+    atomic_store_explicit(&port->active_wait_epoch, 0,
+                          memory_order_release);
     pthread_mutex_unlock(&port->wait_lock);
     return result;
 }

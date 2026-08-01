@@ -475,17 +475,44 @@ of internal completion packets. Zero-timeout waits use a bounded internal
 completion drain so an initial cancellation burst cannot hide a queued
 readiness event or create an unbounded nonblocking loop.
 
-Stable Windows registrations now defer their first AFD request until a waiter
-arms the port. An active waiter and an unconnected transitional stream still
-arm immediately. This lets independent epoll instances watch the same socket
-without leaving idle AFD work behind. Pending MOD operations retain an
-in-flight request when its mask already covers the new interest and deliver
-the latest data/context; expansions cancel once and rearm. Transitional TCP
-requests use a broad pre-connect mask so MOD-before-connect preserves the AFD
-completion evidence used for endpoint-token adoption without creating an idle
-rearm loop. A stable ADD can now defer an AFD submission error until the first
-wait; active-waiter ADDs still report submission failures synchronously, with a
-regression covering the retained registration and subsequent recovery.
+Windows socket ADD now submits its first AFD request before returning. Initial
+submission and target-key acquisition failures therefore fail ADD
+synchronously, while a successful idle registration can retain readiness that
+occurs before the first wait. Pending MOD operations retain an in-flight
+request when its mask already covers the new interest and deliver the latest
+data/context; expansions cancel once and rearm. Transitional TCP requests keep
+their broad pre-connect mask so
+MOD-before-connect preserves the AFD completion evidence used for endpoint-
+token adoption. Waitable and pipe ADD remain lazy without an active waiter so
+registration does not consume notifications or begin timer polling. Idle
+socket registrations hold an AFD IRP while their polls remain pending; an
+immediately satisfied idle poll is consumed synchronously, discarded, and
+queued for a fresh first-wait submission. Simultaneous registrations of one
+socket across epoll ports may also hold duplicate/reservation HANDLEs. The AFD
+control handle suppresses native synchronous-success completion packets, and
+packets queued before the current serialized wait epoch are refreshed before
+delivery. An immediately satisfied refresh is translated in place so a large
+ready set does not move through the completion FIFO one epoch at a time. Exact
+TCP registrations also merge requested read, write, and non-inline priority
+levels that race within the current wait using a zero-time public-socket
+`select()` sample before LT/ET/ONESHOT filtering. Terminal error/HUP snapshots
+and unknown protocol metadata retain the conservative AFD result.
+
+The August 1, 2026 eager-socket-ADD qualification used Windows 10.0.19044,
+MSYS2 MinGW GCC 15.2, and `-O2 -Wall -Wextra -Wpedantic -Werror`. The seven
+lanes completed 176 combined best-effort (175 passed/1 skip), 174 static-only
+(173/1), 99 shared-only (98/1), 176 strict combined (175/1), 99 strict
+shared-only (98/1), 176 synchronized combined (171/5), and 99 synchronized
+shared-only (94/5) CTest entries. The general skip was the host-dependent
+UDP/ICMP probe; synchronized lanes also skipped the four native-reuse identity
+cases covered by their DEL-before-close contract. Three repeats of every
+applicable focused lane passed: 87 tests in combined/static/strict/synchronized
+builds and 53 tests in shared/strict-shared/synchronized-shared builds. Linux
+native and forced-fallback strict Release CTest passed 5/5 each, repeated
+API/large-wait/pool checks passed five times, and ASan/UBSan passed 4/4. The
+Windows production benchmark completed all 13 CSV rows through 50,000 sockets
+and 1,000 timed iterations (about 99.765 seconds elapsed); no performance
+threshold is claimed.
 
 Linux extended waits now hold a stable duplicate of the epoll descriptor.
 `wepoll_close()` wakes all blocked extended waiters, which fail with `EBADF`,

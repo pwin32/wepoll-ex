@@ -995,7 +995,7 @@ static void test_connect_failure(void)
 
     epfd = epoll_create1(0);
     memset(&event, 0, sizeof(event));
-    event.events = EPOLLOUT;
+    event.events = EPOLLOUT | EPOLLPRI;
     if (epfd < 0) {
         FAIL("create epoll for refused connect");
         closesocket(client);
@@ -1024,6 +1024,7 @@ static void test_connect_failure(void)
         epoll_wait(epfd, &output, 1, 5000) != 1 ||
         (output.events & (EPOLLOUT | EPOLLERR | EPOLLHUP)) !=
             (EPOLLOUT | EPOLLERR | EPOLLHUP) ||
+        (output.events & EPOLLPRI) != 0 ||
         getsockopt(client, SOL_SOCKET, SO_ERROR, (char *)&socket_error,
                    &socket_error_length) == SOCKET_ERROR ||
         (!immediate_refusal && socket_error != WSAECONNREFUSED) ||

@@ -31,7 +31,6 @@ static int make_pending_port(ep_port_t **port_out, SOCKET *socket_out)
     SOCKET socket_fd = INVALID_SOCKET;
     struct sockaddr_in address;
     epoll_data_t data;
-    epoll_event_ex ignored;
 
     *port_out = NULL;
     *socket_out = INVALID_SOCKET;
@@ -52,23 +51,26 @@ static int make_pending_port(ep_port_t **port_out, SOCKET *socket_out)
     if (ep_port_register(port, socket_fd, EPOLLIN, 0, data, NULL) != 0) {
         goto fail;
     }
-    memset(&ignored, 0, sizeof(ignored));
-    if (ep_port_wait(port, &ignored, 1, 0, NULL) < 0) {
-        goto fail;
-    }
 
     pthread_mutex_lock(&port->fd_table_lock);
-    size_t pending = port->pending_poll_count;
+    ep_sock_t *sock = find_registered_sock(port, socket_fd);
+    int armed = sock != NULL &&
+        atomic_load_explicit(&sock->state, memory_order_relaxed) ==
+            EP_SOCK_POLLING &&
+        atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
+            EP_POLL_PENDING &&
+        !sock->needs_rearm &&
+        port->pending_poll_count == 1;
     pthread_mutex_unlock(&port->fd_table_lock);
-    if (pending == 0) goto fail;
+    if (!armed) goto fail;
 
     *port_out = port;
     *socket_out = socket_fd;
     return 0;
 
 fail:
-    if (socket_fd != INVALID_SOCKET) closesocket(socket_fd);
     if (port != NULL) (void)ep_port_destroy(port);
+    if (socket_fd != INVALID_SOCKET) closesocket(socket_fd);
     return -1;
 }
 
@@ -115,6 +117,7 @@ static int test_cancel_failure(void)
     int error;
 
     if (make_pending_port(&port, &socket_fd) != 0) return -1;
+    /* No wait has run: close must cancel the request armed by ADD itself. */
     original_cancel = g_ntdll.NtCancelIoFileEx;
     g_ntdll.NtCancelIoFileEx = cancel_failure_stub;
     errno = 0;
@@ -158,11 +161,11 @@ static int test_del_cancel_failure(void)
     }
     if (make_pending_port(&port, &socket_fd) != 0) goto cleanup;
 
+    /* No wait has run: DEL must detach the request armed by ADD itself. */
     original_cancel = g_ntdll.NtCancelIoFileEx;
     g_ntdll.NtCancelIoFileEx = cancel_failure_stub;
     cancel_stub_installed = 1;
-    errno = 0;
-    if (ep_port_unregister(port, socket_fd) != 0 || errno != 0) {
+    if (ep_port_unregister(port, socket_fd) != 0) {
         goto cleanup;
     }
     g_ntdll.NtCancelIoFileEx = original_cancel;

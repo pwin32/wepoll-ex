@@ -155,7 +155,6 @@ static int test_internal_batch_then_readiness(void)
     tcp_pair_t pair;
     epoll_data_t data;
     epoll_event_ex output;
-    epoll_event_ex ignored;
     PNtDeviceIoControlFile original_submit = NULL;
     int submit_stub_installed = 0;
     int completion_posted = 0;
@@ -184,11 +183,6 @@ static int test_internal_batch_then_readiness(void)
                 errno, WSAGetLastError());
         goto cleanup;
     }
-    memset(&ignored, 0, sizeof(ignored));
-    if (ep_port_wait(port, &ignored, 1, 0, NULL) < 0) {
-        fprintf(stderr, "batch: deferred registration arm failed\n");
-        goto cleanup;
-    }
     g_ntdll.NtDeviceIoControlFile = original_submit;
     submit_stub_installed = 0;
 
@@ -196,6 +190,15 @@ static int test_internal_batch_then_readiness(void)
     if (sock == NULL) {
         fprintf(stderr, "batch: registered socket was not discoverable\n");
         goto cleanup;
+    }
+
+    /* The synthetic packet below models a completion selected by the next
+     * public wait, rather than an idle ADD packet.  Stamp it with that wait's
+     * epoch so the stale-eager-snapshot refresh does not replace the fixture
+     * payload with a real provider request. */
+    sock->submitted_wait_epoch = port->next_wait_epoch + 1;
+    if (sock->submitted_wait_epoch == 0) {
+        sock->submitted_wait_epoch = 1;
     }
 
     /* NULL OVERLAPPED packets are the stable internal/wakeup completion form
@@ -225,6 +228,11 @@ static int test_internal_batch_then_readiness(void)
 
     memset(&output, 0, sizeof(output));
     wait_result = ep_port_wait(port, &output, 1, 0, NULL);
+    if (wait_result == 1) {
+        /* Do not issue a cleanup wait (and potentially a real rearm) after
+         * the synthetic readiness packet has already been consumed. */
+        completion_posted = 0;
+    }
     if (wait_result != 1 || output.data.u64 != expected_data ||
         (output.events & EPOLLIN) == 0) {
         fprintf(stderr,

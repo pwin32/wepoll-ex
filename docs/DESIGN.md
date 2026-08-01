@@ -59,19 +59,34 @@ the nginx-embedded source build independent of a generated CMake header.
    validation. DEL does not inspect its event pointer.
 3. `EPOLL_CTL_ADD` validates a Winsock socket, resolves its base provider
    handle, records an optional WFP ALE endpoint token for stable native-handle
-   reuse detection, stores the requested data and context, and assigns a
-   generation. Stable registrations defer the first asynchronous `AFD_POLL`
-   until a waiter arms the port; an active waiter and an unconnected
-   transitional stream submit immediately. Provider resolution first uses
+   reuse detection, stores the requested data and context, assigns a
+   generation, and submits the first asynchronous `AFD_POLL` before returning.
+   Initial socket submission failures therefore fail ADD synchronously, and a
+   successful idle registration retains readiness that occurs before the first
+   wait. Waitable and pipe registrations remain lazy without an active waiter
+   so ADD does not consume a notification or begin timer polling. An idle
+   socket owns an AFD IRP while its poll remains pending; an immediately
+   satisfied idle poll is consumed synchronously, discarded, and left queued
+   for a fresh first-wait submission. Same-socket registrations across epoll
+   ports may also own temporary duplicate/reservation HANDLEs. Provider
+   resolution first uses
    `SIO_BASE_HANDLE`, then walks distinct `SIO_BSP_HANDLE_SELECT`,
    `SIO_BSP_HANDLE_POLL`, and generic `SIO_BSP_HANDLE` results with cycle and
    depth guards. A pending MOD keeps a covering request and replaces its
-   delivery snapshot; only a mask expansion cancels and rearms it. Therefore,
-   an AFD submission error for an idle stable ADD is reported by the first
-   wait that tries to arm it; an ADD made while a waiter is active still
-   reports the error synchronously. Best-effort mode accepts a provider that
+   delivery snapshot; only a mask expansion cancels and rearms it. Best-effort
+   mode accepts a provider that
    cannot expose an endpoint token, strict mode rejects it with
    `EOPNOTSUPP`, and synchronized mode omits token queries entirely.
+   The AFD control handle suppresses native completion packets for synchronous
+   success. Each serialized public wait publishes an epoch; a socket packet
+   queued during an idle interval or an earlier wait epoch is refreshed before
+   delivery, and an immediately satisfied refresh is translated in place to
+   avoid a large ready-set FIFO treadmill. Because an eager AFD request can
+   also snapshot the first matching class during the current wait, exact TCP
+   registrations merge missing requested read, write, and non-inline priority
+   levels with zero-time Winsock `select()` before event filtering and
+   LT/ET/ONESHOT latching. Error/HUP snapshots and unknown protocol metadata
+   retain the conservative AFD mask.
 4. Socket IOCP completions translate both the AFD per-handle `Events` bits and
    its `Status`; a negative per-handle status contributes `EPOLLERR` even when
    the event bitset is empty. Ready nodes snapshot the data, context, socket
@@ -548,10 +563,13 @@ those lanes reproducible.
 
 The deterministic long stress profile completed 250,000 operations on 128
 sockets with zero backpressure in combined best-effort and best-effort,
-strict, and synchronized shared-library builds. The production benchmark also
-completed all 13 CSV rows for those four builds at a 50,000-socket maximum and
-1,000 timed iterations. This is registration scaling plus ready batches up to
-512, not a 50,000-socket armed-wait result, and no performance threshold is
+strict, and synchronized shared-library builds. On August 1, 2026, after eager
+socket ADD was enabled, the production benchmark completed all 13 CSV rows for
+the same four builds at a 50,000-socket maximum and 1,000 timed iterations.
+The 50k registration row now includes provider submission plus pending-IRP or
+synchronous-success handling and cancellation-initiation work; final close
+drains the resulting completion burst outside the per-operation samples. The
+run took about 99.765 seconds overall, and no performance threshold is
 claimed.
 
 The nginx 1.31.3 adapter passes a strict full Win32 link, dependency inspection,

@@ -365,7 +365,6 @@ static int test_exclusive_two_cycles(int edge_triggered)
     SOCKET client = INVALID_SOCKET;
     SOCKET accepted = INVALID_SOCKET;
     struct epoll_event event;
-    struct epoll_event events[1];
     int epfd_a = -1;
     int epfd_b = -1;
     int first_winner = 0;
@@ -398,10 +397,6 @@ static int test_exclusive_two_cycles(int edge_triggered)
         fprintf(stderr, "exclusive: ADD B failed errno=%d\n", errno);
         goto fail;
     }
-
-    /* Arm both instances by entering wait briefly. */
-    (void)epoll_wait(epfd_a, events, 1, 0);
-    (void)epoll_wait(epfd_b, events, 1, 0);
 
     if (send(client, "x", 1, 0) != 1)
         goto fail;
@@ -685,22 +680,8 @@ static int test_exclusive_mixed_order(int exclusive_first,
         }
     }
 
-    /* ADD records interest, while the first wait performs the AFD submit.
-     * Pre-arm in the requested order so both ordinary-first and
-     * exclusive-first cases exercise their named native request ordering. */
-    for (i = 0; i < MULTI_WAITERS; i++) {
-        int index = registration_order[i];
-        int n = epoll_wait(epfds[index], &output, 1, 0);
-
-        if (n != 0) {
-            fprintf(stderr,
-                    "exclusive-mixed %s %s: pre-arm %d returned %d "
-                    "events=%u errno=%d\n",
-                    order_label, trigger_label, index, n,
-                    n > 0 ? output.events : 0U, errno);
-            goto done;
-        }
-    }
+    /* ADD synchronously submits each AFD request, so the registration loop
+     * above also defines the ordinary-first/exclusive-first native order. */
 
     for (cycle = 0; cycle < 2; cycle++) {
         if (cycle != 0) {
@@ -810,19 +791,23 @@ static int test_ordinary_multi_variant(int edge_triggered,
         }
     }
 
+    /* The first cycle deliberately relies only on requests armed by the four
+     * idle ADD calls above. */
     for (cycle = 0; cycle < 2; cycle++) {
-        /* Every zero-time wait submits or rearms its native AFD request while
-         * the socket is quiescent. */
-        for (i = 0; i < MULTI_WAITERS; i++) {
-            int n = epoll_wait(epfds[i], &output, 1, 0);
+        if (cycle != 0) {
+            /* After the prior byte is drained, every registration must
+             * observe quiescence and rearm before the second cycle. */
+            for (i = 0; i < MULTI_WAITERS; i++) {
+                int n = epoll_wait(epfds[i], &output, 1, 0);
 
-            if (n != 0) {
-                fprintf(stderr,
-                        "%s %s cycle %d: pre-arm %d returned %d "
-                        "events=%u errno=%d\n",
-                        suite_label, trigger_label, cycle + 1, i, n,
-                        n > 0 ? output.events : 0U, errno);
-                goto done;
+                if (n != 0) {
+                    fprintf(stderr,
+                            "%s %s cycle %d: rearm %d returned %d "
+                            "events=%u errno=%d\n",
+                            suite_label, trigger_label, cycle + 1, i, n,
+                            n > 0 ? output.events : 0U, errno);
+                    goto done;
+                }
             }
         }
 
@@ -1331,6 +1316,8 @@ static int test_exclusive_invalid_combos(void)
         fprintf(stderr, "exclusive+et: ADD failed errno=%d\n", errno);
         goto fail;
     }
+    /* DEL must retire the request submitted by ADD even though no wait has
+     * run yet. */
     if (epoll_fd_count(epfd) != 1 ||
         epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL) != 0 ||
         epoll_fd_count(epfd) != 0) {
@@ -1338,7 +1325,12 @@ static int test_exclusive_invalid_combos(void)
         goto fail;
     }
 
-    (void)wepoll_close(epfd);
+    if (wepoll_close(epfd) != 0) {
+        fprintf(stderr, "exclusive+et: close after DEL failed errno=%d\n",
+                errno);
+        goto fail;
+    }
+    epfd = -1;
     closesocket(accepted);
     closesocket(client);
     closesocket(listener);
@@ -1440,7 +1432,14 @@ static int test_wakeup_flag_accepted(void)
         goto fail;
     }
 
-    (void)wepoll_close(epfd);
+    /* Closing the epoll instance before its first wait must cancel and drain
+     * the AFD request synchronously submitted by ADD. */
+    if (wepoll_close(epfd) != 0) {
+        fprintf(stderr, "EPOLLWAKEUP close-before-wait failed errno=%d\n",
+                errno);
+        goto fail;
+    }
+    epfd = -1;
     closesocket(accepted);
     closesocket(client);
     closesocket(listener);

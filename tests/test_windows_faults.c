@@ -250,6 +250,7 @@ cleanup:
 }
 
 static int g_submit_calls;
+static NTSTATUS g_submit_status = STATUS_PENDING;
 
 static NTSTATUS NTAPI submit_stub(
     HANDLE file_handle, HANDLE event, PIO_APC_ROUTINE apc_routine,
@@ -268,7 +269,7 @@ static NTSTATUS NTAPI submit_stub(
     (void)output_buffer;
     (void)output_length;
     g_submit_calls++;
-    return STATUS_PENDING;
+    return g_submit_status;
 }
 
 static void submit_sock_init(ep_sock_t *sock, ep_port_t *port,
@@ -882,6 +883,267 @@ static int make_udp_receiver(SOCKET *receiver_out,
     return 0;
 }
 
+static int wait_for_empty_public_port(int epfd)
+{
+    ULONGLONG deadline = GetTickCount64() + 2000;
+    struct epoll_event event;
+    wepoll_ex_stats stats;
+
+    for (;;) {
+        memset(&stats, 0, sizeof(stats));
+        if (epoll_fd_count(epfd) != 0 ||
+            wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0) {
+            return -1;
+        }
+        if (stats.active_registrations == 0 && stats.pending_polls == 0 &&
+            stats.rearm_queue_depth == 0 &&
+            stats.oneshot_probe_queue_depth == 0 &&
+            stats.ready_queue_depth == 0 && stats.afd_pool_in_use == 0 &&
+            stats.ready_pool_in_use == 0) {
+            return 0;
+        }
+        if (GetTickCount64() >= deadline)
+            return -1;
+
+        memset(&event, 0, sizeof(event));
+        if (epoll_wait(epfd, &event, 1, 10) != 0)
+            return -1;
+    }
+}
+
+static int test_afd_submit_batch(void)
+{
+    struct sockaddr_in addresses[2];
+    struct epoll_event events[2];
+    wepoll_ex_stats stats;
+    SOCKET receivers[2] = { INVALID_SOCKET, INVALID_SOCKET };
+    epoll_fd_t fds[2];
+    int add_ops[2] = { EPOLL_CTL_ADD, EPOLL_CTL_ADD };
+    int del_ops[2] = { EPOLL_CTL_DEL, EPOLL_CTL_DEL };
+    int epfd = -1;
+    int result = -1;
+
+    ep_fault_reset();
+    if (ep_global_init() != 0 ||
+        make_udp_receiver(&receivers[0], &addresses[0]) != 0 ||
+        make_udp_receiver(&receivers[1], &addresses[1]) != 0 ||
+        (epfd = epoll_create1(0)) < 0) {
+        goto cleanup;
+    }
+
+    memset(events, 0, sizeof(events));
+    events[0].events = EPOLLIN;
+    events[0].data.u64 = UINT64_C(0x1111222233334444);
+    events[1].events = EPOLLIN;
+    events[1].data.u64 = UINT64_C(0x5555666677778888);
+    fds[0] = (epoll_fd_t)receivers[0];
+    fds[1] = (epoll_fd_t)receivers[1];
+
+    if (ep_fault_configure(EP_FAULT_AFD_SUBMIT, 2, EAGAIN) != 0)
+        goto cleanup;
+    errno = 0;
+    if (epoll_ctl_batch(epfd, add_ops, fds, events, 2) != -1 ||
+        errno != EAGAIN || ep_fault_hits(EP_FAULT_AFD_SUBMIT) != 2 ||
+        epoll_fd_count(epfd) != 0 ||
+        wait_for_empty_public_port(epfd) != 0) {
+        goto cleanup;
+    }
+
+    /* A stale logical AFD key from either rolled-back ADD would force its
+     * retry through the duplicate-target reservation path.  Neither clean
+     * retry should touch that optional hook. */
+    ep_fault_reset();
+    if (ep_fault_configure(EP_FAULT_AFD_KEY_RESERVATION, 1, EBUSY) != 0 ||
+        epoll_ctl_batch(epfd, add_ops, fds, events, 2) != 0 ||
+        ep_fault_hits(EP_FAULT_AFD_SUBMIT) != 0 ||
+        ep_fault_hits(EP_FAULT_AFD_KEY_RESERVATION) != 0 ||
+        epoll_fd_count(epfd) != 2 ||
+        wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
+        stats.active_registrations != 2 || stats.pending_polls != 2 ||
+        stats.rearm_queue_depth != 0 ||
+        stats.oneshot_probe_queue_depth != 0 ||
+        stats.ready_queue_depth != 0 || stats.afd_pool_in_use != 2 ||
+        stats.ready_pool_in_use != 0) {
+        goto cleanup;
+    }
+
+    ep_fault_reset();
+    if (epoll_ctl_batch(epfd, del_ops, fds, NULL, 2) != 0 ||
+        epoll_fd_count(epfd) != 0 ||
+        wait_for_empty_public_port(epfd) != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (epfd >= 0 && wepoll_close(epfd) != 0)
+        result = -1;
+    for (size_t i = 0; i < 2; i++) {
+        if (receivers[i] != INVALID_SOCKET)
+            (void)closesocket(receivers[i]);
+    }
+    return result;
+}
+
+static int test_afd_refresh_submit(void)
+{
+    static const uint64_t value = UINT64_C(0x7265667265736831);
+    struct sockaddr_in address;
+    ep_port_t *port = NULL;
+    ep_sock_t *sock = NULL;
+    epoll_data_t data;
+    epoll_event_ex event;
+    PNtDeviceIoControlFile original_submit = NULL;
+    SOCKET receiver = INVALID_SOCKET;
+    SOCKET sender = INVALID_SOCKET;
+    int context = 1;
+    int stub_installed = 0;
+    int synthetic_pending = 0;
+    int completion_posted = 0;
+    int registered = 0;
+    int state_ok;
+    int result = -1;
+
+    ep_fault_reset();
+    memset(&data, 0, sizeof(data));
+    memset(&event, 0, sizeof(event));
+    data.u64 = value;
+    if (ep_global_init() != 0 ||
+        make_udp_receiver(&receiver, &address) != 0 ||
+        (sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) ==
+            INVALID_SOCKET ||
+        ep_port_create(0, 0, &port) != 0) {
+        goto cleanup;
+    }
+
+    original_submit = g_ntdll.NtDeviceIoControlFile;
+    g_submit_calls = 0;
+    g_ntdll.NtDeviceIoControlFile = submit_stub;
+    stub_installed = 1;
+    if (ep_port_register(port, receiver, EPOLLIN | EPOLLONESHOT,
+                         EPOLLONESHOT, data, &context) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    synthetic_pending = 1;
+    g_ntdll.NtDeviceIoControlFile = original_submit;
+    stub_installed = 0;
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    state_ok = sock != NULL && sock->next == NULL &&
+        g_submit_calls == 1 && sock->submitted_wait_epoch == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING &&
+        port->pending_poll_count == 1;
+    if (state_ok) {
+        sock->afd_info->NumberOfHandles = 1;
+        sock->afd_info->Handles[0].Events = AFD_POLL_RECEIVE;
+        sock->afd_info->Handles[0].Status = STATUS_SUCCESS;
+        sock->io_status_block.Status = STATUS_SUCCESS;
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok ||
+        !PostQueuedCompletionStatus(
+            port->iocp, 0, 0,
+            (OVERLAPPED *)&sock->io_status_block)) {
+        goto cleanup;
+    }
+    completion_posted = 1;
+    synthetic_pending = 0;
+
+    if (ep_fault_configure(EP_FAULT_AFD_SUBMIT, 1, EAGAIN) != 0) {
+        goto cleanup;
+    }
+    errno = 0;
+    if (ep_port_wait(port, &event, 1, 1000, NULL) != -1 ||
+        errno != EAGAIN || ep_fault_hits(EP_FAULT_AFD_SUBMIT) != 1) {
+        goto cleanup;
+    }
+    completion_posted = 0;
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    state_ok = port->fd_table_count == 1 &&
+        port->sock_list_head == sock && sock->next == NULL &&
+        port->pending_poll_count == 0 && port->needs_rearm_count == 1 &&
+        port->rearm_head == sock && port->rearm_tail == sock &&
+        port->oneshot_fired_count == 0 &&
+        port->oneshot_head == NULL && port->oneshot_tail == NULL &&
+        port->async_error == 0 && port->asynchronous_errors == 1 &&
+        sock->submitted_wait_epoch == 0 && sock->needs_rearm &&
+        !sock->oneshot_fired && sock->pending_events == 0 &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_REGISTERED &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&port->ready_queue.queued,
+                             memory_order_relaxed) == 0 &&
+        sock->afd_poll_key_owned == 0 && sock->afd_poll_target == NULL &&
+        sock->afd_poll_key_reservation == NULL &&
+        atomic_load_explicit(&port->active_wait_epoch,
+                             memory_order_relaxed) == 0 &&
+        ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok) {
+        goto cleanup;
+    }
+
+    ep_fault_reset();
+    if (sendto(sender, "r", 1, 0,
+               (const struct sockaddr *)&address,
+               (int)sizeof(address)) != 1) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(port, &event, 1, 2000, NULL) != 1 ||
+        event.events != EPOLLIN || event.data.u64 != value ||
+        event.user_ctx != &context ||
+        event.flags != WEPOLL_FLAG_ONESHOT_FIRED ||
+        event.timestamp == 0 || g_submit_calls != 1) {
+        goto cleanup;
+    }
+    {
+        char byte = 0;
+
+        if (recv(receiver, &byte, 1, 0) != 1 || byte != 'r') {
+            goto cleanup;
+        }
+    }
+    if (ep_port_unregister(port, receiver) != 0) {
+        goto cleanup;
+    }
+    registered = 0;
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (stub_installed) {
+        g_ntdll.NtDeviceIoControlFile = original_submit;
+    }
+    if (port != NULL && sock != NULL && synthetic_pending) {
+        sock->io_status_block.Status = STATUS_CANCELLED;
+        if (PostQueuedCompletionStatus(
+                port->iocp, 0, 0,
+                (OVERLAPPED *)&sock->io_status_block)) {
+            completion_posted = 1;
+            synthetic_pending = 0;
+        }
+    }
+    (void)completion_posted;
+    if (registered && port != NULL) {
+        (void)ep_port_unregister(port, receiver);
+    }
+    if (port != NULL && ep_port_destroy(port) != 0) {
+        result = -1;
+    }
+    if (sender != INVALID_SOCKET) closesocket(sender);
+    if (receiver != INVALID_SOCKET) closesocket(receiver);
+    return result;
+}
+
 static int test_endpoint_policy(void)
 {
 #ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
@@ -1051,6 +1313,78 @@ cleanup:
     ep_fault_reset();
     if (first != NULL && ep_port_destroy(first) != 0) result = -1;
     if (second != NULL && ep_port_destroy(second) != 0) result = -1;
+    return result;
+}
+
+/* A synchronous AFD success is converted into an internal IOCP packet only
+ * when a waiter is active.  Exercise the packet-post failure rollback so an
+ * ADD does not strand a pending count or an AFD key after the port is
+ * force-closed. */
+static int test_iocp_post_immediate_socket(void)
+{
+    struct sockaddr_in address;
+    ep_port_t *port = NULL;
+    PNtDeviceIoControlFile original_submit = NULL;
+    SOCKET receiver = INVALID_SOCKET;
+    epoll_data_t data;
+    int context = 1;
+    int result = -1;
+
+    memset(&data, 0, sizeof(data));
+    data.u64 = UINT64_C(0x696d6d706f737466);
+    ep_fault_reset();
+    g_submit_status = STATUS_SUCCESS;
+    g_submit_calls = 0;
+    if (ep_global_init() != 0 ||
+        make_udp_receiver(&receiver, &address) != 0 ||
+        ep_port_create(0, 0, &port) != 0 ||
+        ep_fault_configure(EP_FAULT_IOCP_POST, 1, EIO) != 0) {
+        goto cleanup;
+    }
+
+    original_submit = g_ntdll.NtDeviceIoControlFile;
+    g_ntdll.NtDeviceIoControlFile = submit_stub;
+    atomic_store_explicit(&port->active_wait_epoch, 1,
+                          memory_order_release);
+    atomic_store_explicit(&port->waiter_active, 1, memory_order_release);
+    errno = 0;
+    if (ep_port_register(port, receiver, EPOLLIN, 0, data, &context) != -1 ||
+        errno != EIO || g_submit_calls != 1 ||
+        ep_fault_hits(EP_FAULT_IOCP_POST) != 1) {
+        goto cleanup;
+    }
+    atomic_store_explicit(&port->waiter_active, 0, memory_order_release);
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    if (port->fd_table_count != 0 || port->pending_poll_count != 0 ||
+        port->needs_rearm_count != 0 || port->rearm_head != NULL ||
+        port->rearm_tail != NULL ||
+        atomic_load_explicit(&port->iocp_closed, memory_order_acquire) == 0 ||
+        atomic_load_explicit(&port->closing, memory_order_acquire) == 0 ||
+        atomic_load_explicit(&port->iocp_post_error, memory_order_acquire) ==
+            0 ||
+        ep_port_worklists_valid_locked(port) == 0) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        goto cleanup;
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+    result = 0;
+
+cleanup:
+    if (port != NULL) {
+        atomic_store_explicit(&port->waiter_active, 0,
+                              memory_order_release);
+        atomic_store_explicit(&port->active_wait_epoch, 0,
+                              memory_order_release);
+    }
+    if (original_submit != NULL)
+        g_ntdll.NtDeviceIoControlFile = original_submit;
+    g_submit_status = STATUS_PENDING;
+    ep_fault_reset();
+    if (port != NULL && ep_port_destroy(port) != 0)
+        result = -1;
+    if (receiver != INVALID_SOCKET)
+        (void)closesocket(receiver);
     return result;
 }
 
@@ -1900,6 +2234,8 @@ static const fault_test_case_t g_tests[] = {
     { "provider-base", test_provider_base },
     { "afd-open", test_afd_open },
     { "afd-submit", test_afd_submit },
+    { "afd-submit-batch", test_afd_submit_batch },
+    { "afd-refresh-submit", test_afd_refresh_submit },
     { "afd-key-fallback", test_afd_key_fallback },
     { "afd-cancel", test_afd_cancel },
     { "endpoint-identity", test_endpoint_identity },
@@ -1907,6 +2243,7 @@ static const fault_test_case_t g_tests[] = {
     { "endpoint-closed-token-loss", test_endpoint_closed_after_token_loss },
     { "iocp-create", test_iocp_create },
     { "iocp-post", test_iocp_post },
+    { "iocp-post-immediate-socket", test_iocp_post_immediate_socket },
     { "iocp-dequeue", test_iocp_dequeue },
     { "aux-closed-iocp", test_aux_closed_iocp_retire },
     { "aux-post", test_aux_post_failure },
@@ -1966,7 +2303,9 @@ int main(int argc, char **argv)
 
     fprintf(stderr,
             "usage: %s [all|framework|pool-init|pool-grow|provider-base|"
-            "afd-open|afd-submit|afd-key-fallback|afd-cancel|"
+            "afd-open|afd-submit|afd-submit-batch|afd-refresh-submit|"
+            "afd-key-fallback|"
+            "afd-cancel|"
             "endpoint-identity|"
             "endpoint-policy|endpoint-closed-token-loss|iocp-create|"
             "iocp-post|iocp-dequeue|"
