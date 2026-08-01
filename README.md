@@ -32,9 +32,12 @@ initial submission failure is reported synchronously and readiness can be
 retained before the first wait. Waitable and pipe ADD remain lazy when no
 waiter is active, avoiding notification consumption and timer polling. A
 pending socket MOD whose mask is already covered keeps the request; an
-expansion cancels once and rearms with the latest metadata. Wait work is
-proportional to queued rearm and oneshot-probe work rather than all
-registrations. An idle socket whose poll remains pending owns an AFD IRP;
+expansion cancels once and rearms with the latest metadata. If cancellation
+loses to an already queued AFD completion, that packet remains pending until
+the completion path refreshes any newly uncovered classes, so a same-wait MOD
+cannot publish a partial snapshot. Wait work is proportional to queued rearm
+and oneshot-probe work rather than all registrations. An idle socket whose poll
+remains pending owns an AFD IRP;
 simultaneous registrations of one socket across epoll ports may also hold
 temporary duplicate/reservation HANDLEs. An immediately satisfied idle poll
 is consumed synchronously, discarded, and left on the rearm queue so the first
@@ -43,7 +46,8 @@ wait samples the then-current level without retaining an idle IOCP packet.
 An eager AFD request can complete on the first ready class before another
 class becomes ready. The AFD control handle suppresses native IOCP packets for
 synchronous success. Completions queued during an idle interval or an earlier
-serialized wait epoch are refreshed before delivery; an immediately satisfied
+serialized wait epoch, and completions whose submitted AFD mask no longer
+covers a same-wait MOD, are refreshed before delivery; an immediately satisfied
 refresh is translated in place rather than moved behind the completion
 backlog. When the cached provider metadata is an exact TCP match, completion
 handling also non-destructively merges requested read, write, and non-inline

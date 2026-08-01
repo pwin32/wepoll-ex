@@ -938,6 +938,12 @@ static volatile LONG counted_cancel_calls;
 static PNtDeviceIoControlFile counted_submit_delegate;
 static volatile LONG counted_submit_calls;
 
+static ep_port_t *expansion_refresh_port;
+static volatile LONG expansion_refresh_cancel_calls;
+static volatile LONG expansion_refresh_submit_calls;
+static volatile LONG expansion_refresh_invalid;
+static ULONG expansion_refresh_masks[2];
+
 #define TEST_FILE_PIPE_LOCAL_INFORMATION_CLASS 24U
 #define TEST_STATUS_UNSUCCESSFUL ((NTSTATUS)0xC0000001L)
 
@@ -1026,6 +1032,63 @@ static NTSTATUS NTAPI counted_submit_stub(
                                    io_control_code, input_buffer,
                                    input_buffer_length, output_buffer,
                                    output_buffer_length);
+}
+
+static NTSTATUS NTAPI expansion_refresh_cancel_stub(
+    HANDLE file_handle,
+    PIO_STATUS_BLOCK io_request_to_cancel,
+    PIO_STATUS_BLOCK io_status_block)
+{
+    (void)file_handle;
+    (void)io_request_to_cancel;
+    (void)io_status_block;
+    InterlockedIncrement(&expansion_refresh_cancel_calls);
+    /* Model the documented race: the old AFD completion has already won and
+     * cannot be cancelled, but its IOCP packet has not been handled yet. */
+    return STATUS_NOT_FOUND;
+}
+
+static NTSTATUS NTAPI expansion_refresh_submit_stub(
+    HANDLE file_handle,
+    HANDLE event,
+    PIO_APC_ROUTINE apc_routine,
+    PVOID apc_context,
+    PIO_STATUS_BLOCK io_status_block,
+    ULONG io_control_code,
+    PVOID input_buffer,
+    ULONG input_buffer_length,
+    PVOID output_buffer,
+    ULONG output_buffer_length)
+{
+    AFD_POLL_INFO *info = (AFD_POLL_INFO *)output_buffer;
+    LONG call = InterlockedIncrement(&expansion_refresh_submit_calls);
+
+    (void)event;
+    (void)apc_routine;
+    if (expansion_refresh_port == NULL ||
+        file_handle != expansion_refresh_port->afd ||
+        apc_context != io_status_block || io_status_block == NULL ||
+        io_control_code != IOCTL_AFD_POLL || input_buffer != output_buffer ||
+        info == NULL || input_buffer_length < sizeof(*info) ||
+        output_buffer_length < sizeof(*info) ||
+        info->NumberOfHandles != 1 || call < 1 || call > 2) {
+        InterlockedIncrement(&expansion_refresh_invalid);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    expansion_refresh_masks[call - 1] = info->Handles[0].Events;
+    if (call == 1) {
+        io_status_block->Status = STATUS_PENDING;
+        io_status_block->Information = 0;
+        return STATUS_PENDING;
+    }
+
+    info->NumberOfHandles = 1;
+    info->Handles[0].Events = AFD_POLL_RECEIVE | AFD_POLL_SEND;
+    info->Handles[0].Status = STATUS_SUCCESS;
+    io_status_block->Status = STATUS_SUCCESS;
+    io_status_block->Information = sizeof(*info);
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS NTAPI submit_failure_stub(
@@ -3144,6 +3207,189 @@ cleanup:
     return result;
 }
 
+static int test_pending_expansion_ready_race(void)
+{
+    static const uint64_t old_value = UINT64_C(0xb1b2b3b4b5b6b7b8);
+    static const uint64_t new_value = UINT64_C(0xc1c2c3c4c5c6c7c8);
+    const uint32_t old_events = EPOLLOUT | EPOLLONESHOT;
+    const uint32_t new_events = EPOLLIN | EPOLLOUT | EPOLLONESHOT;
+    state_fixture_t fixture;
+    PNtCancelIoFileEx original_cancel = NULL;
+    PNtDeviceIoControlFile original_submit = NULL;
+    ep_sock_t *sock = NULL;
+    epoll_event_ex event;
+    uint64_t old_generation = 0;
+    int old_context;
+    int new_context;
+    int cancel_installed = 0;
+    int submit_installed = 0;
+    int registered = 0;
+    int state_ok;
+    int result = -1;
+
+    if (fixture_open(&fixture) != 0) return -1;
+
+    expansion_refresh_port = fixture.port;
+    InterlockedExchange(&expansion_refresh_cancel_calls, 0);
+    InterlockedExchange(&expansion_refresh_submit_calls, 0);
+    InterlockedExchange(&expansion_refresh_invalid, 0);
+    memset(expansion_refresh_masks, 0, sizeof(expansion_refresh_masks));
+    original_submit = g_ntdll.NtDeviceIoControlFile;
+    g_ntdll.NtDeviceIoControlFile = expansion_refresh_submit_stub;
+    submit_installed = 1;
+    atomic_store_explicit(&fixture.port->active_wait_epoch, 1,
+                          memory_order_release);
+    atomic_store_explicit(&fixture.port->waiter_active, 1,
+                          memory_order_release);
+
+    if (register_events(&fixture, old_events, EPOLLONESHOT,
+                        old_value, &old_context) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    sock = fixture_sock(&fixture);
+    if (sock == NULL) goto cleanup;
+
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    old_generation = sock->generation;
+    /* Disable the TCP select merge so both delivered classes must come from
+     * the fresh full-mask AFD snapshot, not a test-host level sample. */
+    sock->socket_protocol = EP_SOCKET_PROTOCOL_UNKNOWN;
+    state_ok =
+        InterlockedCompareExchange(&expansion_refresh_submit_calls, 0, 0) ==
+            1 &&
+        expansion_refresh_masks[0] == ep_epoll_to_afd_events(old_events) &&
+        sock->submitted_wait_epoch == 1 &&
+        sock->submitted_afd_events == ep_epoll_to_afd_events(old_events) &&
+        fixture.port->pending_poll_count == 1 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING;
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok) goto cleanup;
+
+    original_cancel = g_ntdll.NtCancelIoFileEx;
+    g_ntdll.NtCancelIoFileEx = expansion_refresh_cancel_stub;
+    cancel_installed = 1;
+    if (modify_events(&fixture, new_events, EPOLLONESHOT,
+                      new_value, &new_context) != 0) {
+        goto cleanup;
+    }
+    g_ntdll.NtCancelIoFileEx = original_cancel;
+    cancel_installed = 0;
+
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok =
+        InterlockedCompareExchange(&expansion_refresh_cancel_calls, 0, 0) ==
+            1 &&
+        InterlockedCompareExchange(&expansion_refresh_submit_calls, 0, 0) ==
+            1 &&
+        sock->generation != old_generation &&
+        sock->user_events == new_events &&
+        sock->user_data.u64 == new_value && sock->user_ctx == &new_context &&
+        sock->submitted_wait_epoch == 1 &&
+        sock->submitted_afd_events == ep_epoll_to_afd_events(old_events) &&
+        sock->needs_rearm && fixture.port->needs_rearm_count == 1 &&
+        fixture.port->rearm_head == sock && fixture.port->rearm_tail == sock &&
+        fixture.port->pending_poll_count == 1 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING &&
+        ep_port_worklists_valid_locked(fixture.port);
+    if (state_ok) {
+        sock->afd_info->NumberOfHandles = 1;
+        sock->afd_info->Handles[0].Events = AFD_POLL_SEND;
+        sock->afd_info->Handles[0].Status = STATUS_SUCCESS;
+        sock->io_status_block.Status = STATUS_SUCCESS;
+        sock->io_status_block.Information = sizeof(*sock->afd_info);
+    }
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok) goto cleanup;
+
+    ep_sock_handle_completion(sock, 0, STATUS_SUCCESS);
+
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok =
+        InterlockedCompareExchange(&expansion_refresh_cancel_calls, 0, 0) ==
+            1 &&
+        InterlockedCompareExchange(&expansion_refresh_submit_calls, 0, 0) ==
+            2 &&
+        InterlockedCompareExchange(&expansion_refresh_invalid, 0, 0) == 0 &&
+        expansion_refresh_masks[1] == ep_epoll_to_afd_events(new_events) &&
+        sock->submitted_wait_epoch == 1 &&
+        sock->submitted_afd_events == ep_epoll_to_afd_events(new_events) &&
+        sock->pending_events == (EPOLLIN | EPOLLOUT) &&
+        sock->user_data.u64 == new_value && sock->user_ctx == &new_context &&
+        !sock->needs_rearm && sock->oneshot_fired &&
+        fixture.port->pending_poll_count == 0 &&
+        fixture.port->needs_rearm_count == 0 &&
+        fixture.port->oneshot_fired_count == 1 &&
+        fixture.port->oneshot_head == sock &&
+        fixture.port->oneshot_tail == sock &&
+        fixture.port->async_error == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == EP_SOCK_READY &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 1 &&
+        atomic_load_explicit(&fixture.port->ready_queue.queued,
+                             memory_order_relaxed) == 1 &&
+        sock->afd_poll_key_owned == 0 && sock->afd_poll_target == NULL &&
+        sock->afd_poll_key_reservation == NULL &&
+        ep_port_worklists_valid_locked(fixture.port);
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok) goto cleanup;
+
+    g_ntdll.NtDeviceIoControlFile = original_submit;
+    submit_installed = 0;
+    atomic_store_explicit(&fixture.port->waiter_active, 0,
+                          memory_order_release);
+    atomic_store_explicit(&fixture.port->active_wait_epoch, 0,
+                          memory_order_release);
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(fixture.port, &event, 1, 0, NULL) != 1 ||
+        event.events != (EPOLLIN | EPOLLOUT) ||
+        event.data.u64 != new_value || event.user_ctx != &new_context ||
+        event.flags != WEPOLL_FLAG_ONESHOT_FIRED || event.timestamp == 0) {
+        goto cleanup;
+    }
+    if (ep_port_unregister(fixture.port, fixture.server) != 0) {
+        goto cleanup;
+    }
+    registered = 0;
+    result = 0;
+
+cleanup:
+    if (cancel_installed) {
+        g_ntdll.NtCancelIoFileEx = original_cancel;
+    }
+    if (submit_installed) {
+        g_ntdll.NtDeviceIoControlFile = original_submit;
+    }
+    if (fixture.port != NULL) {
+        int pending = 0;
+
+        atomic_store_explicit(&fixture.port->waiter_active, 0,
+                              memory_order_release);
+        atomic_store_explicit(&fixture.port->active_wait_epoch, 0,
+                              memory_order_release);
+        if (registered && sock != NULL) {
+            pending = atomic_load_explicit(
+                &sock->poll_status, memory_order_relaxed) != EP_POLL_IDLE;
+        }
+        if (registered) {
+            (void)ep_port_unregister(fixture.port, fixture.server);
+            registered = 0;
+        }
+        if (pending) {
+            sock->io_status_block.Status = STATUS_CANCELLED;
+            ep_sock_handle_completion(sock, 0, STATUS_CANCELLED);
+        }
+    }
+    expansion_refresh_port = NULL;
+    fixture_close(&fixture);
+    return result;
+}
+
 static int test_transitional_idle(void)
 {
     state_fixture_t fixture;
@@ -4277,6 +4523,8 @@ int main(int argc, char **argv)
         result = test_pending_narrowing_mod();
     } else if (strcmp(argv[1], "pending-expansion-mod") == 0) {
         result = test_pending_expansion_cancelled_mod();
+    } else if (strcmp(argv[1], "pending-expansion-ready-race") == 0) {
+        result = test_pending_expansion_ready_race();
     } else if (strcmp(argv[1], "transitional-idle") == 0) {
         result = test_transitional_idle();
     } else if (strcmp(argv[1], "aux-posted-cancel") == 0) {

@@ -427,7 +427,8 @@ struct ep_sock {
     uint32_t pending_events;
     /* Exact AFD interest mask used by the in-flight/last submission.  MOD
      * uses it to avoid cancelling a request whose mask already covers the
-     * new interests. */
+     * new interests; completion refreshes a cancellation-losing snapshot
+     * when this mask no longer covers the current interest. */
     uint32_t submitted_afd_events;
     /* Serialized epoll_wait epoch in which the in-flight/last AFD request
      * was submitted.  Zero means that no public waiter was active.  A

@@ -143,6 +143,47 @@ static int wait_exact(int epfd, int timeout_ms, uint64_t expected_data,
     return 0;
 }
 
+static int wait_until_exact(int epfd, int timeout_ms, uint64_t expected_data,
+                            uint32_t expected_events, const char *name)
+{
+    ULONGLONG deadline = GetTickCount64() + (ULONGLONG)timeout_ms;
+
+    for (;;) {
+        struct epoll_event output;
+        ULONGLONG now = GetTickCount64();
+        int remaining = now >= deadline ? 0 : (int)(deadline - now);
+        int count;
+
+        memset(&output, 0, sizeof(output));
+        count = epoll_wait(epfd, &output, 1, remaining);
+        if (count == 1 && output.data.u64 == expected_data &&
+            output.events == expected_events) {
+            return 0;
+        }
+        if (count != 1 || output.data.u64 != expected_data ||
+            output.events == 0 ||
+            (output.events & ~expected_events) != 0 ||
+            GetTickCount64() >= deadline) {
+            fprintf(stderr,
+                    "%s: count=%d errno=%d WSA=%d data=0x%llx "
+                    "events=0x%08lx expected_data=0x%llx "
+                    "expected_events=0x%08lx\n",
+                    name, count, errno, WSAGetLastError(),
+                    (unsigned long long)output.data.u64,
+                    (unsigned long)output.events,
+                    (unsigned long long)expected_data,
+                    (unsigned long)expected_events);
+            return -1;
+        }
+
+        /* send(MSG_OOB) can complete before the urgent byte reaches the peer
+         * receive side.  Linux epoll may legally return the already-ready
+         * normal subset first; keep sampling LT readiness until the complete
+         * expected level is observable, while rejecting any unexpected bit. */
+        Sleep(0);
+    }
+}
+
 static int wait_empty(int epfd, int timeout_ms, const char *name)
 {
     struct epoll_event output;
@@ -552,7 +593,7 @@ static int run_oob_lt_case(uint32_t interest, uint32_t expected,
         goto cleanup;
     }
     if ((expected != 0 &&
-         (wait_exact(epfd, 2000, data, expected, name) != 0 ||
+         (wait_until_exact(epfd, 2000, data, expected, name) != 0 ||
           wait_exact(epfd, 2000, data, expected, name) != 0)) ||
         (expected == 0 && wait_empty(epfd, 100, name) != 0) ||
         recv_oob(pair.server, '!') != 0) {

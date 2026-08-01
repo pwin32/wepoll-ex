@@ -245,6 +245,7 @@ else()
                 pending-metadata-mod
                 pending-narrowing-mod
                 pending-expansion-mod
+                pending-expansion-ready-race
                 transitional-idle
                 udp-readless-error
                 udp-readless-park

@@ -3021,8 +3021,10 @@ static int ep_sock_cancel_locked(ep_sock_t *sock)
     }
 
     sock->pending_events = 0;
-    atomic_store_explicit(&sock->poll_status, EP_POLL_CANCELLED,
-                          memory_order_relaxed);
+    /* ep_afd_cancel marks the request CANCELLED only when cancellation won.
+     * STATUS_NOT_FOUND means the completion is already queued or racing into
+     * IOCP, so leave it PENDING and let completion decide whether its AFD
+     * snapshot still covers the latest MOD interest. */
     return 0;
 }
 
@@ -3316,19 +3318,27 @@ process_socket_snapshot:
     if (sock->kind == EP_REG_SOCKET && status >= 0) {
         uint64_t active_wait_epoch = atomic_load_explicit(
             &port->active_wait_epoch, memory_order_acquire);
+        uint32_t current_afd_events =
+            ep_sock_afd_events_locked(sock, sock->user_events);
+        int stale_wait_epoch = active_wait_epoch != 0 &&
+            sock->submitted_wait_epoch != active_wait_epoch;
+        int uncovered_interest =
+            (current_afd_events & ~sock->submitted_afd_events) != 0;
 
-        if (active_wait_epoch != 0 &&
-            sock->submitted_wait_epoch != active_wait_epoch) {
+        if (stale_wait_epoch || uncovered_interest) {
             int immediate = 0;
             int submit_result;
 
             /* AFD settles a poll when the first requested class becomes
              * ready.  An eager request can therefore leave an old SEND (or
              * other partial) snapshot queued across an idle interval or
-             * serialized waiter handoff.  Linux re-polls a ready item while
-             * copying it to the caller.  Retire this packet's accounting and
-             * submit one current-epoch full poll before any ET/ONESHOT latch
-             * or ready node can consume the stale snapshot. */
+             * serialized waiter handoff.  A MOD expansion can also lose its
+             * cancellation race after that old snapshot is already queued;
+             * in that case the packet belongs to the current wait epoch but
+             * does not cover the latest interest.  Linux re-polls a ready item
+             * while copying it to the caller.  Retire this packet's accounting
+             * and submit one current full poll before any ET/ONESHOT latch or
+             * ready node can consume the incomplete snapshot. */
             atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
                                   memory_order_relaxed);
             ep_sock_set_needs_rearm_locked(sock, 1);

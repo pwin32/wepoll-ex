@@ -73,15 +73,19 @@ the nginx-embedded source build independent of a generated CMake header.
    `SIO_BASE_HANDLE`, then walks distinct `SIO_BSP_HANDLE_SELECT`,
    `SIO_BSP_HANDLE_POLL`, and generic `SIO_BSP_HANDLE` results with cycle and
    depth guards. A pending MOD keeps a covering request and replaces its
-   delivery snapshot; only a mask expansion cancels and rearms it. Best-effort
-   mode accepts a provider that
+   delivery snapshot; only a mask expansion cancels and rearms it. If
+   cancellation loses to a completion already queued in IOCP, the request
+   remains pending until completion refreshes any newly uncovered classes, so
+   a same-wait MOD cannot publish a partial AFD snapshot. Best-effort mode
+   accepts a provider that
    cannot expose an endpoint token, strict mode rejects it with
    `EOPNOTSUPP`, and synchronized mode omits token queries entirely.
    The AFD control handle suppresses native completion packets for synchronous
    success. Each serialized public wait publishes an epoch; a socket packet
-   queued during an idle interval or an earlier wait epoch is refreshed before
-   delivery, and an immediately satisfied refresh is translated in place to
-   avoid a large ready-set FIFO treadmill. Because an eager AFD request can
+   queued during an idle interval, an earlier wait epoch, or a cancellation-
+   losing same-wait MOD is refreshed before delivery, and an immediately
+   satisfied refresh is translated in place to avoid a large ready-set FIFO
+   treadmill. Because an eager AFD request can
    also snapshot the first matching class during the current wait, exact TCP
    registrations merge missing requested read, write, and non-inline priority
    levels with zero-time Winsock `select()` before event filtering and
@@ -549,7 +553,9 @@ repeats each of the API and pool executables, an explicitly forced
 Release also passed 4/4. Coverage includes exact preview package compatibility,
 ELF SONAME and Linux/MinGW export surfaces; socket alias, urgent-data,
 status/error, ET/exclusive read, write, mixed-class, and stale-snapshot
-transitions; direction-aware pipe adapters; waitable terminal ET and
+transitions; cancellation-losing same-wait MOD expansion refresh; mixed
+normal/urgent LT convergence and persistence; direction-aware pipe adapters;
+waitable terminal ET and
 pending/queued MOD races; consumptive notification counts; auxiliary-disarm
 fault recovery and preserved consumptive retries; immediate auxiliary
 cancellation reclamation; IOCP post/close lease races and fatal-post wakeups;

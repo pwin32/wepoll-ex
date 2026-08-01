@@ -491,24 +491,32 @@ queued for a fresh first-wait submission. Simultaneous registrations of one
 socket across epoll ports may also hold duplicate/reservation HANDLEs. The AFD
 control handle suppresses native synchronous-success completion packets, and
 packets queued before the current serialized wait epoch are refreshed before
-delivery. An immediately satisfied refresh is translated in place so a large
-ready set does not move through the completion FIFO one epoch at a time. Exact
+delivery. A MOD expansion that loses its cancellation race keeps the queued
+request pending until the completion path refreshes any newly uncovered AFD
+classes, preventing a same-wait partial snapshot. An immediately satisfied
+refresh is translated in place so a large ready set does not move through the
+completion FIFO one epoch at a time. Exact
 TCP registrations also merge requested read, write, and non-inline priority
 levels that race within the current wait using a zero-time public-socket
 `select()` sample before LT/ET/ONESHOT filtering. Terminal error/HUP snapshots
 and unknown protocol metadata retain the conservative AFD result.
 
-The August 1, 2026 eager-socket-ADD qualification used Windows 10.0.19044,
-MSYS2 MinGW GCC 15.2, and `-O2 -Wall -Wextra -Wpedantic -Werror`. The seven
-lanes completed 176 combined best-effort (175 passed/1 skip), 174 static-only
-(173/1), 99 shared-only (98/1), 176 strict combined (175/1), 99 strict
-shared-only (98/1), 176 synchronized combined (171/5), and 99 synchronized
-shared-only (94/5) CTest entries. The general skip was the host-dependent
+The August 1, 2026 eager-socket-ADD and racing-MOD qualification used Windows
+10.0.19044, MSYS2 MinGW GCC 15.2, and
+`-O2 -Wall -Wextra -Wpedantic -Werror`. The seven lanes completed 177 combined
+best-effort (176 passed/1 skip), 175 static-only (174/1), 99 shared-only
+(98/1), 177 strict combined (176/1), 99 strict shared-only (98/1), 177
+synchronized combined (172/5), and 99 synchronized shared-only (94/5) CTest
+entries. The general skip was the host-dependent
 UDP/ICMP probe; synchronized lanes also skipped the four native-reuse identity
 cases covered by their DEL-before-close contract. Three repeats of every
-applicable focused lane passed: 87 tests in combined/static/strict/synchronized
-builds and 53 tests in shared/strict-shared/synchronized-shared builds. Linux
-native and forced-fallback strict Release CTest passed 5/5 each, repeated
+applicable focused lane passed: 88 tests in combined/static/strict/synchronized
+builds and 53 tests in shared/strict-shared/synchronized-shared builds. This
+included the deterministic cancellation-losing same-wait MOD expansion. The
+mixed normal/urgent LT regression permits the requested normal subset while
+the urgent byte is still in transport, but requires the exact combined level
+to converge within the deadline and then persist on a second wait. Linux native
+and forced-fallback strict Release CTest passed 5/5 each, repeated
 API/large-wait/pool checks passed five times, and ASan/UBSan passed 4/4. The
 Windows production benchmark completed all 13 CSV rows through 50,000 sockets
 and 1,000 timed iterations (about 99.765 seconds elapsed); no performance
