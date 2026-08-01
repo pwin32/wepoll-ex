@@ -358,15 +358,6 @@ typedef enum ep_socket_async_read_capability {
     EP_SOCKET_ASYNC_READ_UNSAFE = 2
 } ep_socket_async_read_capability_t;
 
-/* SIO_TCP_INFO is optional before Windows 10 version 1703 and may also be
- * unavailable through a custom provider.  Cache only a definitive supported
- * or unsupported result; transient query failures remain retryable. */
-typedef enum ep_socket_tcp_info_capability {
-    EP_SOCKET_TCP_INFO_UNKNOWN = 0,
-    EP_SOCKET_TCP_INFO_AVAILABLE = 1,
-    EP_SOCKET_TCP_INFO_UNAVAILABLE = 2
-} ep_socket_tcp_info_capability_t;
-
 typedef enum ep_udp_read_probe_result {
     EP_UDP_READ_PROBE_UNAVAILABLE = -1,
     EP_UDP_READ_PROBE_NOT_READY = 0,
@@ -379,7 +370,6 @@ typedef enum ep_udp_read_probe_result {
 #ifdef _WIN32
 typedef ep_udp_read_probe_result_t (*ep_udp_probe_read_fn)(
     ep_sock_t *sock, int *identity_error_out);
-typedef int (*ep_tcp_state_query_fn)(ep_sock_t *sock, ULONG *state_out);
 #endif
 
 typedef enum ep_waitable_semantics {
@@ -413,7 +403,6 @@ struct ep_sock {
     uint8_t socket_protocol; /* ep_socket_protocol_t */
     uint8_t udp_afd_qualifier_eligible;
     uint8_t async_read_capability; /* ep_socket_async_read_capability_t */
-    uint8_t tcp_info_capability; /* ep_socket_tcp_info_capability_t */
     /* A readless UDP registration briefly adds AFD_POLL_RECEIVE so queued
      * transport errors can still become implicit EPOLLERR.  Once an ordinary
      * unread datagram is observed, park that internal interest until a fresh
@@ -610,7 +599,6 @@ struct ep_port {
     HANDLE udp_probe_event;
 #ifdef _WIN32
     ep_udp_probe_read_fn udp_probe_read;
-    ep_tcp_state_query_fn tcp_state_query;
 #endif
 
     /* Per-port fd table — indexed by SOCKET value masked by fd_mask.

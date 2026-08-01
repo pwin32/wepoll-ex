@@ -247,7 +247,7 @@ else()
                 pending-expansion-mod
                 pending-expansion-ready-race
                 tcp-current-rdhup
-                tcp-info-runtime
+                tcp-current-reset
                 transitional-idle
                 udp-readless-error
                 udp-readless-park
@@ -266,9 +266,6 @@ else()
             set_tests_properties(wepoll_ex_windows_state_${_state_name}
                 PROPERTIES TIMEOUT 15)
         endforeach()
-        set_tests_properties(wepoll_ex_windows_state_tcp_info_runtime
-            PROPERTIES SKIP_RETURN_CODE 77)
-
         foreach(_events_mode IN ITEMS mapping status fin spin)
             add_test(NAME wepoll_ex_windows_events_${_events_mode}
                 COMMAND test_wepoll_ex_windows_events ${_events_mode})

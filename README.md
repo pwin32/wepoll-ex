@@ -50,13 +50,13 @@ serialized wait epoch, and completions whose submitted AFD mask no longer
 covers a same-wait MOD, are refreshed before delivery; an immediately satisfied
 refresh is translated in place rather than moved behind the completion
 backlog. When the cached provider metadata is an exact TCP match, completion
-handling also non-destructively merges requested read, write, and non-inline
-priority levels that race within the current wait. If the system/provider
-supports `SIO_TCP_INFO` (Windows 10 version 1703 or later for the base
-provider), a read-ready socket also merges requested `EPOLLRDHUP` from the
-current TCP state, including a FIN queued behind unread data. Terminal
-error/HUP snapshots and unknown protocols retain the original conservative AFD
-result.
+handling also non-destructively samples current normal and terminal state with
+zero-time `WSAPoll`, then separately qualifies non-inline priority. A graceful
+`POLLHUP` merges requested readable EOF and `EPOLLRDHUP`, including a FIN queued
+behind unread data; `POLLERR | POLLHUP` merges unrequested
+`EPOLLERR | EPOLLHUP` for reset without clearing the application's later
+`WSAECONNRESET`. Unknown protocols and providers that reject `WSAPoll` retain
+the original conservative AFD/select result.
 
 Internal failures after a successful control call are latched for the wait
 path. Already-queued readiness is delivered before the deferred error; a later
@@ -337,8 +337,8 @@ may each receive an exclusive wake for the same socket, the claim and active-
 target indexes coordinate only registrations within one process and one loaded
 wepoll-ex image, separately linked static copies and distinct loaded DLL images
 do not coordinate, the active-target index cannot arbitrate unrelated raw AFD
-consumers, a system/provider without `SIO_TCP_INFO` retains the AFD snapshot
-when a same-wait FIN loses to an earlier nonterminal class (a later rearm can
+consumers, a provider that rejects `WSAPoll` retains the AFD snapshot when a
+same-wait FIN/reset loses to an earlier nonterminal class (a later rearm can
 observe it, while ONESHOT requires the normal MOD rearm), unknown provider
 protocol metadata retains a conservative abort mapping, pipe
 writable readiness can remain advisory when native local

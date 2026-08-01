@@ -44,18 +44,6 @@
 #define EP_PIPE_SERVER_END          1U
 #define EP_STATUS_INVALID_HANDLE    UINT32_C(0xC0000008)
 
-/* SIO_TCP_INFO and TCPSTATE were added to the public SDK after the project's
- * Windows 8 compile floor.  Keep private version-zero definitions so newer
- * systems/providers can supply current connection state without raising the
- * library's minimum target. */
-#define EP_SIO_TCP_INFO _WSAIORW(IOC_VENDOR, 39)
-#define EP_TCP_INFO_VERSION_0 0UL
-#define EP_TCP_STATE_CLOSE_WAIT 7UL
-#define EP_TCP_STATE_CLOSING    8UL
-#define EP_TCP_STATE_LAST_ACK   9UL
-#define EP_TCP_STATE_TIME_WAIT 10UL
-#define EP_TCP_INFO_BUFFER_SIZE 256U
-
 static _Atomic uint64_t g_quarantined_ports;
 
 #ifdef _WIN32
@@ -847,61 +835,36 @@ static int ep_socket_select_priority_ready(SOCKET fd)
     return result > 0 && FD_ISSET(fd, &descriptors);
 }
 
-static int ep_socket_tcp_info_unavailable(int error)
+static int ep_socket_poll_current(ep_sock_t *sock, short *revents_out)
 {
-    return error == WSAEINVAL || error == WSAENOPROTOOPT ||
-        error == WSAEOPNOTSUPP;
-}
-
-static int ep_socket_tcp_state_query_locked(ep_sock_t *sock,
-                                            ULONG *state_out)
-{
-    union {
-        ULONGLONG alignment;
-        unsigned char bytes[EP_TCP_INFO_BUFFER_SIZE];
-    } info;
     struct sockaddr_storage peer;
-    ULONG version = EP_TCP_INFO_VERSION_0;
-    ULONG state = 0;
-    DWORD bytes = 0;
+    WSAPOLLFD item;
     int peer_length = (int)sizeof(peer);
     int saved_errno = ep_last_err();
     int saved_wsa_error = WSAGetLastError();
     DWORD saved_last_error = GetLastError();
     int result = 0;
 
-    if (sock == NULL || state_out == NULL ||
-        sock->socket_protocol != EP_SOCKET_PROTOCOL_TCP ||
-        sock->tcp_info_capability == EP_SOCKET_TCP_INFO_UNAVAILABLE) {
+    if (sock == NULL || revents_out == NULL ||
+        sock->socket_protocol != EP_SOCKET_PROTOCOL_TCP) {
         goto done;
     }
 
-    /* Do not classify listeners or transitional connect sockets as lacking
-     * the optional control code; a later established endpoint may support it. */
+    /* Failed connects and listeners need their original AFD classifications;
+     * only an established peer is eligible for current FIN/reset synthesis. */
     if (getpeername(sock->fd, (struct sockaddr *)&peer, &peer_length) ==
             SOCKET_ERROR) {
         goto done;
     }
 
-    memset(&info, 0, sizeof(info));
-    if (WSAIoctl(sock->fd, EP_SIO_TCP_INFO,
-                 &version, (DWORD)sizeof(version),
-                 info.bytes, (DWORD)sizeof(info.bytes),
-                 &bytes, NULL, NULL) == SOCKET_ERROR) {
-        int error = WSAGetLastError();
-
-        if (ep_socket_tcp_info_unavailable(error)) {
-            sock->tcp_info_capability = EP_SOCKET_TCP_INFO_UNAVAILABLE;
-        }
+    memset(&item, 0, sizeof(item));
+    item.fd = sock->fd;
+    item.events = POLLRDNORM | POLLWRNORM;
+    if (WSAPoll(&item, 1, 0) == SOCKET_ERROR ||
+        (item.revents & POLLNVAL) != 0) {
         goto done;
     }
-    if (bytes < sizeof(state)) {
-        goto done;
-    }
-
-    memcpy(&state, info.bytes, sizeof(state));
-    sock->tcp_info_capability = EP_SOCKET_TCP_INFO_AVAILABLE;
-    *state_out = state;
+    *revents_out = item.revents;
     result = 1;
 
 done:
@@ -911,25 +874,13 @@ done:
     return result;
 }
 
-static int ep_socket_tcp_state_has_remote_fin(ULONG state)
-{
-    switch (state) {
-    case EP_TCP_STATE_CLOSE_WAIT:
-    case EP_TCP_STATE_CLOSING:
-    case EP_TCP_STATE_LAST_ACK:
-    case EP_TCP_STATE_TIME_WAIT:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
 static void ep_socket_merge_current_levels(ep_sock_t *sock,
                                            uint32_t *delivered)
 {
     uint32_t read_interest;
     uint32_t write_interest;
-    int read_ready = -1;
+    short revents = 0;
+    int polled;
 
     if (sock->socket_protocol != EP_SOCKET_PROTOCOL_TCP ||
         (*delivered & (EPOLLERR | EPOLLHUP)) != 0) {
@@ -938,38 +889,45 @@ static void ep_socket_merge_current_levels(ep_sock_t *sock,
 
     /* AFD snapshots the first matching class that completes an eagerly armed
      * request.  Linux epoll re-polls a ready item while copying it to the user,
-     * so merge requested TCP levels that became ready before this IOCP packet
-     * is processed.  select() observes the public provider socket without
-     * consuming data; unknown protocols retain the conservative AFD snapshot. */
+     * so merge the current established-TCP snapshot before this IOCP packet is
+     * filtered or latched.  WSAPoll is non-consuming, reports POLLERR/POLLHUP
+     * regardless of requested bits, and handles more sockets than fd_set.
+     * Unknown protocols or providers that reject it retain the select/AFD
+     * fallback below. */
     read_interest = sock->user_events & (EPOLLIN | EPOLLRDNORM);
-    if ((read_interest & ~*delivered) != 0 ||
-        ((sock->user_events & EPOLLRDHUP) != 0 &&
-         (*delivered & EPOLLRDHUP) == 0)) {
-        read_ready = ep_socket_select_ready(sock->fd, 0);
-    }
-    if ((read_interest & ~*delivered) != 0 && read_ready > 0) {
-        *delivered |= read_interest;
-    }
-
-    if ((sock->user_events & EPOLLRDHUP) != 0 &&
-        (*delivered & EPOLLRDHUP) == 0 && read_ready > 0 &&
-        sock->port->tcp_state_query != NULL) {
-        ULONG state = 0;
-
-        if (sock->port->tcp_state_query(sock, &state) > 0 &&
-            ep_socket_tcp_state_has_remote_fin(state)) {
-            *delivered |= EPOLLRDHUP;
-        }
-    }
-
     write_interest = sock->user_events & (EPOLLOUT | EPOLLWRNORM);
-    if ((write_interest & ~*delivered) != 0 &&
-        ep_socket_select_ready(sock->fd, 1) > 0) {
-        *delivered |= write_interest;
+    polled = ep_socket_poll_current(sock, &revents);
+    if (polled) {
+        if ((revents & POLLERR) != 0) {
+            /* An established TCP reset is terminal and leaves the Winsock
+             * receive error untouched for the application's later recv(). */
+            *delivered |= EPOLLERR | EPOLLHUP;
+        } else if ((revents & POLLHUP) != 0) {
+            /* Winsock POLLHUP is the graceful receive-side disconnect.  Linux
+             * exposes readable EOF and requested RDHUP, not EPOLLHUP, while
+             * the local write half can remain usable. */
+            *delivered |= read_interest;
+            *delivered |= sock->user_events & EPOLLRDHUP;
+        } else if ((revents & POLLRDNORM) != 0) {
+            *delivered |= read_interest;
+        }
+        if ((revents & POLLWRNORM) != 0) {
+            *delivered |= write_interest;
+        }
+    } else {
+        if ((read_interest & ~*delivered) != 0 &&
+            ep_socket_select_ready(sock->fd, 0) > 0) {
+            *delivered |= read_interest;
+        }
+        if ((write_interest & ~*delivered) != 0 &&
+            ep_socket_select_ready(sock->fd, 1) > 0) {
+            *delivered |= write_interest;
+        }
     }
 
     if ((sock->user_events & EPOLLPRI) != 0 &&
         (*delivered & EPOLLPRI) == 0 &&
+        (*delivered & (EPOLLERR | EPOLLHUP)) == 0 &&
         ep_socket_select_priority_ready(sock->fd) > 0) {
         *delivered |= EPOLLPRI;
     }
@@ -3814,7 +3772,6 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     port->get_queued_completion_status_ex = GetQueuedCompletionStatusEx;
     port->post_queued_completion_status = PostQueuedCompletionStatus;
     port->udp_probe_read = ep_udp_probe_read_locked;
-    port->tcp_state_query = ep_socket_tcp_state_query_locked;
     {
         HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
 
