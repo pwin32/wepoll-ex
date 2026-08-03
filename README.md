@@ -75,9 +75,9 @@ completion draining, and hands recoverable late completions to a detached
 reaper. An unrecoverable port remains quarantined rather than risking
 use-after-free. AFD is undocumented, and the build currently targets Windows
 8 or later (`_WIN32_WINNT=0x0602`). Release-qualified Windows evidence is
-limited to x86-64 MinGW-w64 GCC 15.2 on Windows 10.0.19044. Windows 8 itself,
-MSVC/clang-cl, x86/ARM64, and real alternative Winsock providers remain
-unqualified.
+limited to x86-64 MinGW-w64 GCC 15.2 and 16.1 on Windows 10.0.19044. Windows 8
+itself, MSVC/clang-cl, x86/ARM64, and real alternative Winsock providers
+remain unqualified.
 
 At most four detached reapers run concurrently, each with a 60-second drain
 window. A production workload should finish with `active_quarantines == 0` and
@@ -172,6 +172,9 @@ a Winsock provider-resolution error. Every operation other than numeric
 `EPOLL_CTL_DEL` snapshots one event value at entry; a null pointer returns
 `EFAULT` before descriptor and operation validation, while DEL ignores the
 pointer.
+Normal ADD and MOD registrations accept `EPOLLMSG` and undefined event bits,
+then filter them from delivered readiness, matching Linux. ADD-time
+`EPOLLEXCLUSIVE` masks retain Linux's stricter allowed-bit validation.
 As a userspace Windows API, wepoll-ex cannot safely probe every arbitrary
 unreadable non-null pointer: callers must provide valid event storage or the
 process may fault instead of receiving `EFAULT`.
@@ -354,9 +357,11 @@ do not coordinate, the active-target index cannot arbitrate unrelated raw AFD
 consumers, a provider that rejects `WSAPoll` retains the AFD snapshot when a
 same-wait FIN/reset loses to an earlier nonterminal class (a later rearm can
 observe it, while ONESHOT requires the normal MOD rearm), unknown provider
-protocol metadata retains a conservative abort mapping, pipe
-writable readiness can remain advisory when native local
-information is unavailable or access is denied,
+protocol metadata retains a conservative abort mapping, pipe writable
+readiness can remain advisory when native local information is unavailable,
+an overlapped or mode-unknown write-only pipe cannot be safely
+zero-write-probed, local receive/full shutdown has no asynchronous Winsock
+read/RDHUP transition,
 exclusive-claim updates serialize through one process-wide mutex, and virtual
 epoll descriptors cannot be monitored or nested. Consequently, Windows cannot
 reproduce Linux's distinct self-registration and nested-epoll `EINVAL` cases;

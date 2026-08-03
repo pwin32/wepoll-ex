@@ -566,6 +566,57 @@ static int test_aliases(void)
     return 0;
 }
 
+static int test_inert_bits(void)
+{
+    const uint32_t unknown_event = UINT32_C(1) << 11;
+    const uint64_t data = UINT64_C(0x494e455254);
+    tcp_pair_t pair;
+    int epfd = -1;
+    int registered = 0;
+    int result = -1;
+
+    if (make_tcp_pair(&pair) != 0) {
+        return -1;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0 ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, pair.server,
+                   EPOLLIN | EPOLLMSG | unknown_event, data) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (send_normal(pair.client, 'a') != 0 ||
+        wait_exact(epfd, 2000, data, EPOLLIN,
+                   "inert-bit ADD delivery") != 0 ||
+        recv_normal(pair.server, 'a') != 0 ||
+        ctl_socket(epfd, EPOLL_CTL_MOD, pair.server,
+                   EPOLLMSG | unknown_event, data) != 0 ||
+        send_normal(pair.client, 'b') != 0 ||
+        wait_empty(epfd, 100, "inert-only MOD") != 0 ||
+        ctl_socket(epfd, EPOLL_CTL_MOD, pair.server,
+                   EPOLLIN, data) != 0 ||
+        wait_exact(epfd, 2000, data, EPOLLIN,
+                   "inert-bit MOD restore") != 0 ||
+        recv_normal(pair.server, 'b') != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, pair.server, 0, 0) != 0) {
+        result = -1;
+    }
+    if (epfd >= 0) {
+        (void)wepoll_close(epfd);
+    }
+    tcp_pair_close(&pair);
+    if (result == 0) {
+        puts("inert-bits: OK");
+    }
+    return result;
+}
+
 static int run_oob_lt_case(uint32_t interest, uint32_t expected,
                            uint64_t data, const char *name,
                            int urgent_first)
@@ -1892,6 +1943,9 @@ static int run_mode(const char *mode)
     if (strcmp(mode, "aliases") == 0) {
         return test_aliases();
     }
+    if (strcmp(mode, "inert-bits") == 0) {
+        return test_inert_bits();
+    }
     if (strcmp(mode, "oob-lt") == 0) {
         return test_oob_lt();
     }
@@ -1960,7 +2014,7 @@ static int run_mode(const char *mode)
     }
     fprintf(stderr,
             "usage: test_windows_socket_events "
-            "[aliases|oob-lt|oob-et|oob-oneshot|oob-mod|"
+            "[aliases|inert-bits|oob-lt|oob-et|oob-oneshot|oob-mod|"
             "oob-inline-lt|oob-inline-et|udp-v4|udp-v6|"
             "udp-readless-data|prewait-refresh|prewait-scale|"
             "udp-error|udp-error-v6|"

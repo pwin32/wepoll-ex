@@ -518,6 +518,13 @@ those transitions without an application write or MOD. Overlapped or
 mode-unknown write-only handles remain advisory because probing them could
 interfere with an application-owned IOCP.
 
+The final event-mask audit now codifies another Linux-compatible control
+detail: ordinary ADD and MOD registrations accept `EPOLLMSG` and undefined
+non-exclusive bits, but those inert bits never appear in returned readiness.
+Native Linux and Windows regressions exercise ADD delivery, an inert-only MOD,
+and restoration of normal read interest. ADD-time `EPOLLEXCLUSIVE` retains its
+separate strict allowed-mask validation.
+
 The August 1, 2026 eager-socket-ADD, racing-MOD, current-terminal, and
 synchronous-pipe-fallback qualification used Windows 10.0.19044, MSYS2 MinGW
 GCC 15.2, and
@@ -542,9 +549,18 @@ the urgent byte is still in transport, but requires the exact combined level
 to converge within the deadline and then persist on a second wait. On August
 3, 2026, Linux GCC 14.2 native and forced-fallback strict Release CTest passed
 5/5 each, repeated API/large-wait/pool checks passed five times, and
-ASan/UBSan passed 4/4. The Windows production benchmark completed all 13 CSV
-rows through 50,000 sockets and 1,000 timed iterations (about 99.765 seconds
-elapsed); no performance threshold is claimed.
+ASan/UBSan passed 4/4. The corresponding final Windows audit used Windows
+10.0.19044, MSYS2 MinGW GCC 16.1, and
+`-O2 -Wall -Wextra -Wpedantic -Werror`. The seven lanes passed 180/180 combined
+best-effort, 178/178 static-only, 100/100 shared-only, 180/180 strict combined,
+100/100 strict shared-only, 176/180 synchronized combined, and 96/100
+synchronized shared-only CTest entries. The synchronized lanes skipped only
+the four native-reuse identity cases owned by their DEL-before-close contract;
+the UDP/ICMP probe succeeded on this run. In every applicable lane, three
+repetitions of 91 internal-capable tests (273 executions) or 54 shared-only
+tests (162 executions) also passed. The Windows production benchmark completed
+all 13 CSV rows through 50,000 sockets and 1,000 timed iterations (about 99.765
+seconds elapsed); no performance threshold is claimed.
 
 Linux extended waits now hold a stable duplicate of the epoll descriptor.
 `wepoll_close()` wakes all blocked extended waiters, which fail with `EBADF`,
@@ -633,10 +649,10 @@ handler. This tree measured a 79.9k requests/s median versus 78.5k for commit
 local noise, so this run does not demonstrate a throughput improvement.
 
 This validation is not a support matrix. Release-qualified Windows evidence is
-limited to x86-64 MinGW-w64 GCC 15.2 on Windows 10.0.19044. MSVC/clang-cl,
-x86/ARM64, real alternative Winsock providers, and Windows 8 itself remain
-unqualified. AFD is undocumented, and `_WIN32_WINNT=0x0602` remains the
-Windows 8-or-later compile/runtime assumption.
+limited to x86-64 MinGW-w64 GCC 15.2 and 16.1 on Windows 10.0.19044.
+MSVC/clang-cl, x86/ARM64, real alternative Winsock providers, and Windows 8
+itself remain unqualified. AFD is undocumented, and `_WIN32_WINNT=0x0602`
+remains the Windows 8-or-later compile/runtime assumption.
 Windows now accepts `EPOLLET` and ADD-time `EPOLLEXCLUSIVE`. Socket edge
 delivery is an observed-bit filter over AFD level reports rather than a kernel
 edge queue. Distinct process-local AFD target keys let every ordinary local

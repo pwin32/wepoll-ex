@@ -417,6 +417,79 @@ cleanup:
 }
 
 /* --------------------------------------------------------------------- */
+/* Undefined normal bits and EPOLLMSG are accepted but never emitted.    */
+/* --------------------------------------------------------------------- */
+
+static void test_inert_event_bits(void)
+{
+    const uint32_t unknown_event = UINT32_C(1) << 11;
+    int pair[2];
+    int epfd = -1;
+    struct epoll_event event;
+    struct epoll_event output;
+    char byte;
+    int count;
+
+    TEST("normal registrations accept and filter inert event bits");
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        FAIL("socketpair");
+        return;
+    }
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        close(pair[0]);
+        close(pair[1]);
+        return;
+    }
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLMSG | unknown_event;
+    event.data.u64 = UINT64_C(0x494e455254);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair[0], &event) != 0 ||
+        write(pair[1], "a", 1) != 1) {
+        FAIL("ADD/write");
+        goto cleanup;
+    }
+    memset(&output, 0, sizeof(output));
+    count = epoll_wait(epfd, &output, 1, 100);
+    if (count != 1 || output.events != EPOLLIN ||
+        output.data.u64 != event.data.u64 ||
+        read(pair[0], &byte, 1) != 1 || byte != 'a') {
+        FAIL("inert ADD mask delivery");
+        goto cleanup;
+    }
+
+    event.events = EPOLLMSG | unknown_event;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, pair[0], &event) != 0 ||
+        write(pair[1], "b", 1) != 1 ||
+        epoll_wait(epfd, &output, 1, 20) != 0) {
+        FAIL("inert-only MOD should stay quiet");
+        goto cleanup;
+    }
+
+    event.events = EPOLLIN;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, pair[0], &event) != 0) {
+        FAIL("MOD restore");
+        goto cleanup;
+    }
+    memset(&output, 0, sizeof(output));
+    count = epoll_wait(epfd, &output, 1, 100);
+    if (count != 1 || output.events != EPOLLIN ||
+        output.data.u64 != event.data.u64 ||
+        read(pair[0], &byte, 1) != 1 || byte != 'b') {
+        FAIL("restored read interest");
+        goto cleanup;
+    }
+    PASS();
+
+cleanup:
+    wepoll_close(epfd);
+    close(pair[0]);
+    close(pair[1]);
+}
+
+/* --------------------------------------------------------------------- */
 /* Extension API.                                                    */
 /* --------------------------------------------------------------------- */
 
@@ -2604,6 +2677,7 @@ int main(void)
     test_double_add();
     test_del_noent();
     test_edge_triggered();
+    test_inert_event_bits();
     test_extension_api();
     test_user_ctx();
     test_create_ex_and_timeout_validation();

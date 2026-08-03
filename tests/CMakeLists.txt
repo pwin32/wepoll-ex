@@ -317,6 +317,7 @@ else()
 
     foreach(_socket_event_mode IN ITEMS
             aliases
+            inert-bits
             oob-lt
             oob-et
             oob-oneshot
