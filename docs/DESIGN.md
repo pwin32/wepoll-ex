@@ -294,8 +294,9 @@ temporary fallback signal mask before unwinding.
 - Pipes use short timer-queue polls because anonymous pipe handles are not
   reliably waitable. Each poll combines
   `NtQueryInformationFile(FilePipeLocalInformation)` state, readable-byte, and
-  writable-quota fields with the existing `PeekNamedPipe` fallback and the
-  ADD-time granted-access classification. Readable data produces only the
+  writable-quota fields with `PeekNamedPipe`, a synchronous zero-byte write
+  fallback for write-only handles, and the ADD-time granted-access
+  classification. Readable data produces only the
   requested `EPOLLIN`/`EPOLLRDNORM` aliases. A read endpoint whose writer has
   closed retains those aliases while buffered data remains and adds unrequested
   `EPOLLHUP`; after the buffer drains, or when EOF starts empty, the result is
@@ -324,15 +325,21 @@ temporary fallback signal mask before unwinding.
   report readable.
 - Writable backpressure and restoration normally follow quota exhaustion in
   `FILE_PIPE_LOCAL_INFORMATION`. If the native query is unavailable or returns
-  `STATUS_ACCESS_DENIED`, the adapter uses `PeekNamedPipe`; write-only handles
-  can then retain advisory writable readiness and peer closure may be
-  indistinguishable. Pure write-only outbound named-pipe server handles are the
-  known access-denied case. Other native-query errors produce no fabricated
-  readiness and are retried by the timer path. Overlapped pipe HANDLEs use the
-  same synchronous metadata snapshots, independently of application
-  `OVERLAPPED` operations. Polling is a compatibility path, not a high-scale
-  substitute for overlapped application I/O. Pipe and waitable registrations
-  reject `EPOLLEXCLUSIVE`.
+  `STATUS_ACCESS_DENIED`, the adapter uses `PeekNamedPipe`; quota can then be
+  unavailable and writable readiness remains advisory. A synchronous
+  write-only handle that rejects `PeekNamedPipe` is sampled with a zero-byte
+  `WriteFile`: success means connected/writable, `ERROR_PIPE_LISTENING` means
+  no current peer, and broken/disconnected errors produce the requested
+  writable aliases plus `EPOLLERR`. The probe consumes no quota and enqueues no
+  byte or message. It is deliberately not issued on an overlapped or
+  mode-unknown write-only handle because that HANDLE may be associated with an
+  application IOCP; this narrow fallback remains advisory and may not
+  distinguish peer closure.
+  Other native-query errors produce no fabricated readiness and are retried by
+  the timer path. Overlapped pipe HANDLEs use the same synchronous metadata
+  snapshots, independently of application `OVERLAPPED` operations. Polling is
+  a compatibility path, not a high-scale substitute for overlapped application
+  I/O. Pipe and waitable registrations reject `EPOLLEXCLUSIVE`.
 - Applications must issue DEL before `CloseHandle()` for a registered pipe or
   waitable object. The socket identity policies do not extend to arbitrary
   HANDLE reuse.
@@ -391,6 +398,15 @@ temporary fallback signal mask before unwinding.
   A provider that rejects `WSAPoll` retains the conservative AFD snapshot;
   LT/ET rearm can observe the later terminal class, while ONESHOT needs the
   normal MOD rearm after a partial first-class delivery.
+- Local Winsock receive shutdown is not an AFD readiness transition.
+  `shutdown(SD_RECEIVE)` and `shutdown(SD_BOTH)` leave AFD, zero-time
+  `WSAPoll`, and zero-time `select` without a readable indication, including
+  after a fresh MOD submission. Consequently the adapter cannot reproduce
+  Linux's immediate local `EPOLLIN | EPOLLRDHUP` state, or the additional
+  `EPOLLHUP` for full local shutdown, without intercepting `shutdown()` or
+  replacing queued-event scaling with whole-registration scans. A wait whose
+  only relevant interests are read/RDHUP may remain blocked until another
+  observable event. Peer FIN/reset readiness retains the exact behavior above.
 - TCP urgent-data readiness is qualified for LT persistence until
   `recv(MSG_OOB)`, observed ET suppression and re-edge, ONESHOT MOD rearm, and
   MOD filtering/data replacement. Exact-event regressions verify that urgent

@@ -58,6 +58,15 @@ behind unread data; `POLLERR | POLLHUP` merges unrequested
 `WSAECONNRESET`. Unknown protocols and providers that reject `WSAPoll` retain
 the original conservative AFD/select result.
 
+Winsock local receive shutdown is a platform boundary. `shutdown(SD_RECEIVE)`
+and `shutdown(SD_BOTH)` do not raise an AFD, `WSAPoll`, or `select` read event,
+so wepoll-ex cannot asynchronously reproduce Linux's immediate local
+`EPOLLIN | EPOLLRDHUP` state (or the additional `EPOLLHUP` after full local
+shutdown) without interposing `shutdown()` or scanning every registered
+socket. A read/RDHUP-only wait can therefore remain blocked after a local
+receive shutdown until some independently observable event occurs, and a MOD
+does not manufacture the missing state. Peer FIN/reset behavior is unaffected.
+
 Internal failures after a successful control call are latched for the wait
 path. Already-queued readiness is delivered before the deferred error; a later
 wait returns `-1` with that error. `wepoll_close()` removes the virtual
@@ -173,8 +182,9 @@ and threads). Waitable HANDLEs must grant `SYNCHRONIZE`; otherwise ADD returns
 `EACCES`. Mutexes, jobs, ordinary disk files, and other unsupported object
 types are rejected with Linux-compatible `EPERM`. Pipe readiness uses short
 timer polls and combines `NtQueryInformationFile(FilePipeLocalInformation)`
-state/quota snapshots with the existing `PeekNamedPipe` fallback and HANDLE
-access classification. Buffered read-side EOF reports the requested
+state/quota snapshots with `PeekNamedPipe`, a synchronous zero-byte write
+fallback for write-only handles, and HANDLE access classification. Buffered
+read-side EOF reports the requested
 `EPOLLIN`/`EPOLLRDNORM` aliases plus
 unrequested `EPOLLHUP`; empty or drained EOF reports `EPOLLHUP` alone. A write
 endpoint whose reader has closed reports the requested `EPOLLOUT`/`EPOLLWRNORM`
@@ -191,10 +201,14 @@ sampled because `DisconnectNamedPipe()` and `ConnectNamedPipe()` can reuse the
 same HANDLE; readiness on the next client produces a fresh edge without MOD.
 Writable backpressure and restoration normally follow the reported quota.
 When native local information is unavailable or access is denied, the
-`PeekNamedPipe` compatibility path can retain advisory writable readiness and
-may not distinguish peer closure. Pure write-only outbound named-pipe servers
-are the known access-denied case. Overlapped pipe HANDLEs use the same metadata
-sampling; the adapter does not manage application `OVERLAPPED` requests. Issue
+fallback can retain advisory writable readiness because quota is unknown.
+For a synchronous write-only handle (notably an outbound named-pipe server), a
+zero-byte write distinguishes listening, connected, and peer-closed states
+without consuming quota or adding pipe data. The adapter does not issue that
+probe on an overlapped or mode-unknown write-only handle because it may belong
+to an application IOCP; that narrow fallback remains advisory and may not
+distinguish peer closure. Other overlapped pipe HANDLEs use the same metadata sampling;
+the adapter does not manage application `OVERLAPPED` requests. Issue
 `EPOLL_CTL_DEL` before `CloseHandle()` for every registered non-socket object.
 `EPOLLONESHOT` is supported. Manual-reset events use ordinary observed-level ET
 filtering;

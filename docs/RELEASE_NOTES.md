@@ -338,8 +338,8 @@ and restoration, and a reused named-server HANDLE re-edges for its next client
 without MOD. Regressions cover exact normal and terminal aliases,
 mixed-direction ET, LT terminal redelivery, both terminal ONESHOT rearm paths,
 both native named-pipe endpoint orientations with overlapped handles, rejected
-native snapshots, the outbound-server advisory fallback, server reconnect,
-pending MOD, exclusive rejection, and cancellation cleanup.
+native snapshots, exact synchronous outbound-server fallback transitions,
+server reconnect, pending MOD, exclusive rejection, and cancellation cleanup.
 
 Windows registrations now accept waitable HANDLEs in addition to
 Winsock sockets. Events, semaphores, waitable timers, processes, and threads
@@ -507,8 +507,20 @@ zero-time `select()` qualification. Providers that reject `WSAPoll`, terminal
 snapshots already supplied by AFD, and unknown protocol metadata retain the
 conservative prior path.
 
-The August 1, 2026 eager-socket-ADD, racing-MOD, and current-terminal
-qualification used Windows 10.0.19044, MSYS2 MinGW GCC 15.2, and
+Pure write-only synchronous pipe handles now use a zero-byte `WriteFile` when
+native local information and `PeekNamedPipe` are denied. The non-consuming
+probe distinguishes listening, connected, disconnected, and broken states:
+connected handles report requested writable aliases, listening handles remain
+quiet, and reader closure adds unrequested `EPOLLERR`. ET now observes the
+complete `OUT` -> `OUT|ERR` transition and re-edges when a named server is
+relisted and accepts another client. The focused regression requires all of
+those transitions without an application write or MOD. Overlapped or
+mode-unknown write-only handles remain advisory because probing them could
+interfere with an application-owned IOCP.
+
+The August 1, 2026 eager-socket-ADD, racing-MOD, current-terminal, and
+synchronous-pipe-fallback qualification used Windows 10.0.19044, MSYS2 MinGW
+GCC 15.2, and
 `-O2 -Wall -Wextra -Wpedantic -Werror`. The seven lanes completed 179 combined
 best-effort (178 passed/1 skip), 177 static-only (176/1), 99 shared-only
 (98/1), 179 strict combined (178/1), 99 strict shared-only (98/1), 179
@@ -519,16 +531,20 @@ cases covered by their DEL-before-close contract. Three repeats of every
 applicable focused lane passed: 90 tests in combined/static/strict/synchronized
 builds and 53 tests in shared/strict-shared/synchronized-shared builds. This
 included the deterministic cancellation-losing same-wait MOD expansion plus
-live current FIN/reset `WSAPoll` merges; both TCP modes also passed 100
-standalone repetitions. The
+live current FIN/reset `WSAPoll` merges and the exact synchronous outbound-pipe
+state transitions. Both TCP modes also passed 100 standalone repetitions, and
+the pipe transition passed 30 standalone repetitions. A post-restart August 3,
+2026 best-effort combined smoke build used MSYS2 MinGW GCC 16.1 with the same
+strict flags; all 25 pipe modes passed, followed by ten more outbound-fallback
+transition repetitions. The
 mixed normal/urgent LT regression permits the requested normal subset while
 the urgent byte is still in transport, but requires the exact combined level
-to converge within the deadline and then persist on a second wait. Linux native
-and forced-fallback strict Release CTest passed 5/5 each, repeated
-API/large-wait/pool checks passed five times, and ASan/UBSan passed 4/4. The
-Windows production benchmark completed all 13 CSV rows through 50,000 sockets
-and 1,000 timed iterations (about 99.765 seconds elapsed); no performance
-threshold is claimed.
+to converge within the deadline and then persist on a second wait. On August
+3, 2026, Linux GCC 14.2 native and forced-fallback strict Release CTest passed
+5/5 each, repeated API/large-wait/pool checks passed five times, and
+ASan/UBSan passed 4/4. The Windows production benchmark completed all 13 CSV
+rows through 50,000 sockets and 1,000 timed iterations (about 99.765 seconds
+elapsed); no performance threshold is claimed.
 
 Linux extended waits now hold a stable duplicate of the epoll descriptor.
 `wepoll_close()` wakes all blocked extended waiters, which fail with `EBADF`,
@@ -639,9 +655,13 @@ synchronous/layered-provider and parked receive-head caveats described above,
 same-wait TCP terminal merging behind an earlier nonterminal AFD class remains
 conservative when a provider rejects `WSAPoll`,
 unknown provider protocol metadata retains a conservative abort
-mapping, and pipe writable readiness can remain advisory
-when native local information is unavailable or access is denied. Pure
-write-only outbound named-pipe server handles are the known access-denied case.
+mapping, local `shutdown(SD_RECEIVE)`/`shutdown(SD_BOTH)` cannot synthesize
+Linux's immediate read/RDHUP/HUP state because Winsock exposes no corresponding
+AFD, `WSAPoll`, or `select` transition, and pipe writable readiness can remain
+advisory when native quota information is unavailable. In particular, an
+overlapped or mode-unknown write-only handle is not zero-write-probed because
+it may belong to an application IOCP, so peer closure can remain
+indistinguishable on that narrow fallback.
 Performance measurements are local loopback observations, not portable
 throughput guarantees.
 

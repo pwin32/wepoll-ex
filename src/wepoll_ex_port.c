@@ -1284,6 +1284,39 @@ static int ep_pipe_query_access(HANDLE handle, uint8_t *access_out)
     return 0;
 }
 
+static uint8_t ep_pipe_has_synchronous_io(HANDLE handle)
+{
+    ep_file_mode_information_t info;
+    IO_STATUS_BLOCK io_status_block;
+    NTSTATUS status;
+    int saved_errno = ep_last_err();
+    int saved_wsa_error = WSAGetLastError();
+    DWORD saved_last_error = GetLastError();
+    uint8_t synchronous = 0;
+
+    if (g_ntdll.NtQueryInformationFile == NULL) {
+        goto done;
+    }
+    memset(&info, 0, sizeof(info));
+    memset(&io_status_block, 0, sizeof(io_status_block));
+    status = g_ntdll.NtQueryInformationFile(
+        handle, &io_status_block, &info, (ULONG)sizeof(info),
+        EP_FILE_MODE_INFORMATION_CLASS);
+    if (status == STATUS_SUCCESS &&
+        io_status_block.Status == STATUS_SUCCESS &&
+        io_status_block.Information == sizeof(info) &&
+        (info.mode & (EP_FILE_SYNCHRONOUS_IO_ALERT |
+                      EP_FILE_SYNCHRONOUS_IO_NONALERT)) != 0) {
+        synchronous = 1;
+    }
+
+done:
+    WSASetLastError(saved_wsa_error);
+    SetLastError(saved_last_error);
+    ep_set_errno(saved_errno);
+    return synchronous;
+}
+
 typedef enum ep_target_kind {
     EP_TARGET_INVALID = 0,
     EP_TARGET_SOCKET,
@@ -1296,6 +1329,7 @@ typedef struct ep_target_info {
     ep_target_kind_t kind;
     SOCKET base_socket;
     uint8_t pipe_access;
+    uint8_t pipe_synchronous_io;
     uint8_t waitable_semantics;
     int registration_error;
 } ep_target_info_t;
@@ -1378,6 +1412,8 @@ static int ep_target_probe(SOCKET fd, ep_target_info_t *target)
         if (ep_pipe_query_access(duplicate, &target->pipe_access) != 0) {
             target->registration_error = ep_last_err();
         }
+        target->pipe_synchronous_io =
+            ep_pipe_has_synchronous_io(duplicate);
     } else if (file_type == FILE_TYPE_DISK) {
         target->kind = EP_TARGET_UNSUPPORTED;
     } else if (waitability == -2) {
@@ -1539,12 +1575,42 @@ static ep_pipe_snapshot_t ep_pipe_fallback_snapshot(const ep_sock_t *sock)
         snapshot.events = ep_pipe_peer_closed_events(sock, 0);
         break;
     case ERROR_ACCESS_DENIED:
-        /* Pure write-only pipe handles reject PeekNamedPipe.  Without the
-         * optional native query, retain advisory writable readiness; peer
-         * closure cannot be distinguished on this fallback path. */
         snapshot.valid = 1;
         if ((sock->pipe_access & EP_PIPE_ACCESS_WRITE) != 0) {
-            snapshot.events |= ep_pipe_write_events(sock);
+            char byte = 0;
+            DWORD transferred = 0;
+
+            if (!sock->pipe_synchronous_io ||
+                WriteFile((HANDLE)sock->fd, &byte, 0,
+                          &transferred, NULL)) {
+                /* Pure write-only pipes reject PeekNamedPipe.  A synchronous
+                 * null write cannot consume quota or enqueue pipe data, and
+                 * distinguishes their connection state.  Do not issue one on
+                 * overlapped or mode-unknown handles: they may belong to an
+                 * application IOCP, so that fallback deliberately remains
+                 * advisory. */
+                snapshot.events |= ep_pipe_write_events(sock);
+                break;
+            }
+            switch (GetLastError()) {
+            case ERROR_INVALID_HANDLE:
+                snapshot.local_closed = 1;
+                snapshot.valid = 0;
+                break;
+            case ERROR_BROKEN_PIPE:
+            case ERROR_NO_DATA:
+            case ERROR_PIPE_NOT_CONNECTED:
+            case ERROR_BAD_PIPE:
+                snapshot.events = ep_pipe_peer_closed_events(sock, 0);
+                break;
+            case ERROR_PIPE_LISTENING:
+                break;
+            default:
+                /* An unfamiliar zero-write failure is not terminal proof.
+                 * Preserve the historical advisory writable fallback. */
+                snapshot.events |= ep_pipe_write_events(sock);
+                break;
+            }
         }
         break;
     default:
@@ -2538,6 +2604,7 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd,
     if (target->kind == EP_TARGET_PIPE) {
         sock->kind = EP_REG_PIPE;
         sock->pipe_access = target->pipe_access;
+        sock->pipe_synchronous_io = target->pipe_synchronous_io;
         sock->base_socket = fd;
         sock->afd_info = NULL;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME

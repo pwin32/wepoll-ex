@@ -1284,19 +1284,24 @@ static int test_named_pipe_outbound_fallback(void)
 {
     const uint32_t interest =
         EPOLLIN | EPOLLRDNORM | EPOLLRDBAND |
-        EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND;
-    const uint32_t expected = EPOLLOUT | EPOLLWRNORM;
+        EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND | EPOLLET;
+    const uint32_t writable = EPOLLOUT | EPOLLWRNORM;
+    const uint32_t broken = writable | EPOLLERR;
+    wchar_t name[160];
     HANDLE server = INVALID_HANDLE_VALUE;
     HANDLE client = INVALID_HANDLE_VALUE;
     struct epoll_event event;
-    DWORD written = 0;
-    DWORD write_error;
+    DWORD error;
     int epfd = -1;
     int result = 1;
 
-    if (create_named_pipe_pair(
-            L"outbound-fallback", PIPE_ACCESS_OUTBOUND, PIPE_WAIT,
-            GENERIC_READ, 0, &server, &client) != 0)
+    make_named_pipe_name(name, sizeof(name) / sizeof(name[0]),
+                         L"outbound-fallback");
+    server = CreateNamedPipeW(
+        name, PIPE_ACCESS_OUTBOUND,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
+        1, 4096, 4096, 0, NULL);
+    if (server == INVALID_HANDLE_VALUE)
         goto done;
     epfd = epoll_create1(0);
     if (epfd < 0)
@@ -1305,32 +1310,55 @@ static int test_named_pipe_outbound_fallback(void)
     event.events = interest;
     event.data.u64 = UINT64_C(0x7701);
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, (epoll_fd_t)server, &event) != 0 ||
-        expect_exact_event(epfd, 1000, expected, event.data.u64,
-                           "pipe-outbound-fallback-connected") != 0)
+        expect_no_event(epfd, 75,
+                        "pipe-outbound-fallback-listening") != 0)
+        goto done;
+
+    client = CreateFileW(name, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0,
+                         NULL);
+    if (client == INVALID_HANDLE_VALUE ||
+        expect_exact_event(epfd, 1000, writable, event.data.u64,
+                           "pipe-outbound-fallback-connected") != 0 ||
+        expect_no_event(epfd, 75,
+                        "pipe-outbound-fallback-connected-stable") != 0)
         goto done;
 
     CloseHandle(client);
     client = INVALID_HANDLE_VALUE;
-    SetLastError(ERROR_SUCCESS);
-    if (WriteFile(server, "f", 1, &written, NULL)) {
-        fputs("pipe-outbound-fallback: write unexpectedly succeeded\n",
+    if (expect_exact_event(epfd, 1000, broken, event.data.u64,
+                           "pipe-outbound-fallback-broken") != 0 ||
+        expect_no_event(epfd, 75,
+                        "pipe-outbound-fallback-broken-stable") != 0)
+        goto done;
+
+    if (!DisconnectNamedPipe(server)) {
+        fprintf(stderr, "pipe-outbound-fallback: disconnect error=%lu\n",
+                (unsigned long)GetLastError());
+        goto done;
+    }
+    if (ConnectNamedPipe(server, NULL)) {
+        fputs("pipe-outbound-fallback: empty reconnect succeeded\n",
               stderr);
         goto done;
     }
-    write_error = GetLastError();
-    if (write_error != ERROR_BROKEN_PIPE &&
-        write_error != ERROR_NO_DATA &&
-        write_error != ERROR_PIPE_NOT_CONNECTED) {
+    error = GetLastError();
+    if (error != ERROR_PIPE_LISTENING) {
         fprintf(stderr,
-                "pipe-outbound-fallback: unexpected write error=%lu\n",
-                (unsigned long)write_error);
+                "pipe-outbound-fallback: reconnect error=%lu\n",
+                (unsigned long)error);
         goto done;
     }
+    if (expect_no_event(epfd, 75,
+                        "pipe-outbound-fallback-relistening") != 0)
+        goto done;
 
-    event.data.u64 = UINT64_C(0x7702);
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, (epoll_fd_t)server, &event) != 0 ||
-        expect_exact_event(epfd, 1000, expected, event.data.u64,
-                           "pipe-outbound-fallback-broken") != 0)
+    client = CreateFileW(name, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0,
+                         NULL);
+    if (client == INVALID_HANDLE_VALUE ||
+        expect_exact_event(epfd, 1000, writable, event.data.u64,
+                           "pipe-outbound-fallback-reconnected") != 0 ||
+        expect_no_event(epfd, 75,
+                        "pipe-outbound-fallback-reconnected-stable") != 0)
         goto done;
     result = 0;
 

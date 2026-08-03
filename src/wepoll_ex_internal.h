@@ -400,6 +400,7 @@ struct ep_sock {
     uint8_t kind; /* ep_reg_kind_t */
     uint8_t waitable_semantics; /* ep_waitable_semantics_t */
     uint8_t pipe_access; /* ep_pipe_access_t */
+    uint8_t pipe_synchronous_io; /* FileModeInformation proved synchronous. */
     uint8_t socket_protocol; /* ep_socket_protocol_t */
     uint8_t udp_afd_qualifier_eligible;
     uint8_t async_read_capability; /* ep_socket_async_read_capability_t */
