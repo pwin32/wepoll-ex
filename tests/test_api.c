@@ -658,6 +658,11 @@ static void test_extension_api(void)
         FAIL("POSIX wake support boundary");
         return;
     }
+    errno = 0;
+    if (wepoll_ex_wake_event(-1, NULL) != -1 || errno != EOPNOTSUPP) {
+        FAIL("POSIX tagged wake support boundary");
+        return;
+    }
     PASS();
 
     TEST("POSIX reports explicit edge rearm unsupported");

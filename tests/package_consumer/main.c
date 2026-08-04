@@ -25,16 +25,28 @@ int main(void)
         return 3;
     }
 
+    struct epoll_event wake_event;
+    memset(&wake_event, 0, sizeof(wake_event));
+    wake_event.events = EPOLLIN;
+    wake_event.data.u64 = UINT64_C(0x57414b45544f4b4e);
+
     errno = 0;
 #ifdef _WIN32
-    if (epoll_rearm_classes(epfd, EPOLL_FD_INVALID,
+    struct epoll_event wake_output;
+    if (wepoll_ex_wake_event(epfd, &wake_event) != 0 ||
+        epoll_wait(epfd, &wake_output, 1, 1000) != 1 ||
+        wake_output.events != wake_event.events ||
+        wake_output.data.u64 != wake_event.data.u64 ||
+        epoll_rearm_classes(epfd, EPOLL_FD_INVALID,
                             WEPOLL_EX_REARM_ALL) != -1 ||
         errno != EBADF) {
         (void)wepoll_close(epfd);
         return 4;
     }
 #else
-    if (epoll_rearm_classes(epfd, EPOLL_FD_INVALID,
+    if (wepoll_ex_wake_event(epfd, &wake_event) != -1 ||
+        errno != EOPNOTSUPP ||
+        epoll_rearm_classes(epfd, EPOLL_FD_INVALID,
                             WEPOLL_EX_REARM_ALL) != -1 ||
         errno != EOPNOTSUPP) {
         (void)wepoll_close(epfd);

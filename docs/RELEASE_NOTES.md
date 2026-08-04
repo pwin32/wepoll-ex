@@ -31,12 +31,25 @@ native nginx 1.31.3 module still needs read/write acknowledgements after the
 actual handler, including posted-event dispatch, so the checked-in adapter
 remains level-triggered.
 
+The exact nginx 1.31.3, libuv 1.52.1, Mio 1.2.2, and Boost.Asio 1.38.2 source
+archives were then audited for event-loop assumptions. The common control-path
+gap is addressed by `wepoll_ex_wake_event()`: Windows snapshots one synthetic
+event, coalesces repeated requests, lets a tagged request upgrade a pending
+plain wake, preserves the first pending tagged payload, and returns ordinary
+readiness or asynchronous errors first. Extended waits add
+`WEPOLL_FLAG_WAKE_EVENT`; `WEPOLL_EX_CAP_TAGGED_WAKE_EVENT` advertises support;
+POSIX reports `EOPNOTSUPP`. Fault injection covers failed IOCP post rollback,
+and a persistent manual-reset HANDLE regression covers Boost.Asio's ET
+same-mask-MOD interrupter pattern. The audit also records conditional future
+work—virtual epfd aliases and supplemental AFD requests—without claiming that
+wepoll-ex should replace libuv, Mio, or Asio's native Windows IOCP backends.
+
 Qualification for this slice used Windows 10.0.19044.1826 with MSYS2 MinGW
 GCC 16.1.0 and Release `-O2 -Wall -Wextra -Wpedantic -Werror` builds. The
 combined, static-only, shared-only, strict combined, strict shared,
-synchronized combined, and synchronized shared lanes contained 189, 187, 107,
-189, 107, 189, and 107 CTest entries. Their passed/skipped counts were 188/1,
-186/1, 106/1, 188/1, 106/1, 184/5, and 102/5; the skips are the documented
+synchronized combined, and synchronized shared lanes contained 190, 188, 108,
+190, 108, 190, and 108 CTest entries. Their passed/skipped counts were 189/1,
+187/1, 107/1, 189/1, 107/1, 185/5, and 103/5; the skips are the documented
 environment-dependent IPv4 UDP/ICMP case plus four synchronized-lifetime
 native-reuse identity cases. Focused repeats passed 100/100 in combined/static/
 strict/synchronized builds and 61/61 in shared-only builds. Linux/WSL GCC

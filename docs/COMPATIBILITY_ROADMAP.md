@@ -52,16 +52,38 @@ level-triggered. See `docs/NGINX_NATIVE_EPOLL_PORT.md`.
 ### Wait notification
 
 An embedding event loop needs a supported way for another thread or control
-path to interrupt a blocked wait. The first implementation slice adds a
-coalesced `wepoll_ex_wake()` operation for Windows basic and extended waits.
-It produces an early zero-event return only after already-ready events and
-pending errors have priority. The caller owns the notification payload or
-handler queue; the library does not execute callbacks inside `epoll_wait()`.
+path to interrupt a blocked wait. Windows now provides both a coalesced
+`wepoll_ex_wake()` zero-event return and `wepoll_ex_wake_event()`, which
+snapshots one application-supplied event. A tagged request upgrades a pending
+plain wake, while later requests do not replace an already pending tagged
+payload. Basic waits return the supplied event directly; extended waits add
+`WEPOLL_FLAG_WAKE_EVENT`. Already-ready registrations and pending errors retain
+priority. The library does not execute callbacks inside `epoll_wait()`.
 
-The POSIX wrapper deliberately reports this operation unsupported. Its basic
+The POSIX wrapper deliberately reports both operations unsupported. Its basic
 wait calls go directly to libc, and injecting the existing internal eventfd
 would either expose a private token or require an additional outer epoll layer.
-The capability API makes this difference discoverable.
+`WEPOLL_EX_CAP_TAGGED_WAKE_EVENT` makes the stronger Windows contract
+discoverable. nginx control notification, Mio's Waker, libuv's async marker,
+and Asio's interrupter can map to the tagged form without creating a synthetic
+socket or eventfd side channel.
+
+### Exact-source audit follow-ups
+
+The nginx 1.31.3, libuv 1.52.1, Mio 1.2.2, and Boost.Asio 1.38.2 reference
+archives were compared in `docs/UPSTREAM_EVENT_LOOP_AUDIT.md`. The remaining
+cross-loop candidates are intentionally conditional:
+
+- a virtual epfd alias/clone would serve a direct Mio Unix-selector port, but
+  needs shared-close semantics rather than pretending the virtual integer is a
+  native HANDLE;
+- a supplemental/double-buffered AFD request, inspired by libuv, may reduce
+  cancel/refresh work during interest expansion, but should follow measured
+  cancellation and probe pressure;
+- close-aware registration ownership would help all ET integrations only if
+  callers can adopt it consistently without retaining sockets; and
+- native file AIO, io_uring, timerfd, named-pipe completions, and general IOCP
+  dispatch remain separate integration facilities, not epoll readiness gaps.
 
 ### Socket lifetime ownership
 
@@ -129,6 +151,9 @@ reported cleanly rather than being treated as a portable guarantee.
   Windows facility.
 - Generic pipe and waitable extensions should not be expanded merely to make
   the socket/nginx compatibility claim look broader.
+- An epfd alias/clone and supplemental AFD request remain opt-in candidates;
+  neither should change the default ABI or request topology without a concrete
+  embedder and before/after measurements.
 
 ## Required nginx qualification
 

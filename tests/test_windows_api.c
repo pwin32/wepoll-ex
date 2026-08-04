@@ -171,7 +171,8 @@ static void test_operational_stats(void)
         WEPOLL_EX_CAP_WAKE_STANDARD_WAIT |
         WEPOLL_EX_CAP_WAKE_EXTENDED_WAIT |
         WEPOLL_EX_CAP_VIRTUAL_EPOLL_DESCRIPTOR |
-        WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM;
+        WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM |
+        WEPOLL_EX_CAP_TAGGED_WAKE_EVENT;
     wepoll_ex_capabilities capabilities;
     wepoll_ex_global_stats global_stats;
     wepoll_ex_stats stats;
@@ -1615,10 +1616,13 @@ static DWORD WINAPI close_wait_thread(void *opaque)
 static void test_wait_wake(void)
 {
     const uint64_t data = UINT64_C(0x57414b4552454144);
+    const uint64_t wake_data = UINT64_C(0x57414b45544f4b31);
+    const uint64_t wake_data_2 = UINT64_C(0x57414b45544f4b32);
     close_wait_context_t context;
     epoll_event_ex extended_event;
     struct epoll_event event;
     struct epoll_event output;
+    struct epoll_event wake_event;
     wepoll_ex_stats stats;
     tcp_pair_t pair;
     HANDLE thread = NULL;
@@ -1648,6 +1652,24 @@ static void test_wait_wake(void)
         goto cleanup;
     }
 
+    memset(&wake_event, 0, sizeof(wake_event));
+    wake_event.events = EPOLLIN;
+    wake_event.data.u64 = wake_data;
+    errno = 0;
+    if (wepoll_ex_wake_event(-1, &wake_event) != -1 || errno != EBADF) {
+        goto cleanup;
+    }
+    errno = 0;
+    if (wepoll_ex_wake_event(epfd, NULL) != -1 || errno != EFAULT) {
+        goto cleanup;
+    }
+    wake_event.events = EPOLLET;
+    errno = 0;
+    if (wepoll_ex_wake_event(epfd, &wake_event) != -1 || errno != EINVAL) {
+        goto cleanup;
+    }
+    wake_event.events = EPOLLIN;
+
     thread = CreateThread(NULL, 0, close_wait_thread, &context, 0, NULL);
     if (thread == NULL ||
         WaitForSingleObject(context.started, 2000) != WAIT_OBJECT_0) {
@@ -1665,6 +1687,32 @@ static void test_wait_wake(void)
 
     if (wepoll_ex_wake(epfd) != 0 ||
         epoll_wait_ex(epfd, &extended_event, 1, 2000) != 0 ||
+        wepoll_ex_wake(epfd) != 0 ||
+        wepoll_ex_wake_event(epfd, &wake_event) != 0) {
+        goto cleanup;
+    }
+    wake_event.data.u64 = wake_data_2;
+    if (epoll_wait(epfd, &output, 1, 2000) != 1 ||
+        output.events != EPOLLIN || output.data.u64 != wake_data) {
+        goto cleanup;
+    }
+
+    if (wepoll_ex_wake_event(epfd, &wake_event) != 0 ||
+        wepoll_ex_wake(epfd) != 0) {
+        goto cleanup;
+    }
+    wake_event.data.u64 = wake_data;
+    if (epoll_wait(epfd, &output, 1, 2000) != 1 ||
+        output.events != EPOLLIN || output.data.u64 != wake_data_2) {
+        goto cleanup;
+    }
+
+    if (wepoll_ex_wake_event(epfd, &wake_event) != 0 ||
+        epoll_wait_ex(epfd, &extended_event, 1, 2000) != 1 ||
+        extended_event.events != EPOLLIN ||
+        extended_event.data.u64 != wake_data ||
+        extended_event.flags != WEPOLL_FLAG_WAKE_EVENT ||
+        extended_event.timestamp == 0 || extended_event.user_ctx != NULL ||
         make_tcp_pair(&pair) != 0 || send_byte(pair.client) != 0) {
         goto cleanup;
     }
@@ -1677,14 +1725,15 @@ static void test_wait_wake(void)
     registered = 1;
     if (epoll_wait(epfd, &output, 1, 2000) != 1 ||
         output.events != EPOLLIN || output.data.u64 != data ||
-        wepoll_ex_wake(epfd) != 0 ||
+        wepoll_ex_wake_event(epfd, &wake_event) != 0 ||
         epoll_wait(epfd, &output, 1, 2000) != 1 ||
         output.events != EPOLLIN || output.data.u64 != data ||
         recv(pair.server, &byte, 1, 0) != 1 || byte != 'x' ||
-        epoll_wait(epfd, &output, 1, 2000) != 0 ||
+        epoll_wait(epfd, &output, 1, 2000) != 1 ||
+        output.events != EPOLLIN || output.data.u64 != wake_data ||
         wepoll_ex_get_stats(epfd, &stats, sizeof(stats)) != 0 ||
-        stats.wake_requests != 5 || stats.wake_coalesced != 1 ||
-        stats.wake_returns != 4) {
+        stats.wake_requests != 10 || stats.wake_coalesced != 3 ||
+        stats.wake_returns != 7) {
         goto cleanup;
     }
     ok = 1;

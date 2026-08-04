@@ -15,10 +15,12 @@ bugs in the two platform paths. It is not a drop-in replacement for Linux
 is promised. Treat all extension semantics as provisional until they have a
 platform-specific regression test.
 
-The archive `nginx-1.31.3.tar.gz` is reference material only. It is deliberately
-not part of the tracked source and is not evidence that the adapter builds.
-See [`docs/NGINX_INTEGRATION.md`](docs/NGINX_INTEGRATION.md) for the current
-validation checklist and
+The nginx, libuv, Mio, and Asio source archives are reference material only.
+They are deliberately not part of the tracked source and must never be staged.
+See [`docs/UPSTREAM_EVENT_LOOP_AUDIT.md`](docs/UPSTREAM_EVENT_LOOP_AUDIT.md)
+for the exact-source comparison,
+[`docs/NGINX_INTEGRATION.md`](docs/NGINX_INTEGRATION.md) for the current
+adapter validation checklist, and
 [`docs/NGINX_NATIVE_EPOLL_PORT.md`](docs/NGINX_NATIVE_EPOLL_PORT.md) for the
 native Linux module's portability boundary.
 
@@ -125,7 +127,7 @@ The header [`include/wepoll_ex.h`](include/wepoll_ex.h) declares
 `epoll_create_ex`, `epoll_ctl_ctx`, `epoll_wait_ex`, `epoll_pwait2_ex`,
 `epoll_ctl_batch`, `epoll_drain`, `epoll_rearm`, `epoll_rearm_classes`,
 `epoll_fd_count`, version helpers, capability/socket-lifetime/statistics
-queries, `wepoll_ex_wake`, and `wepoll_close`.
+queries, `wepoll_ex_wake`, `wepoll_ex_wake_event`, and `wepoll_close`.
 `epoll_ctl_batch` applies operations in order and best-effort rolls back ADDs;
 it is not transactional.
 
@@ -439,10 +441,15 @@ not an atomic transactional view.
 `wepoll_ex_get_capabilities()` distinguishes native Linux edge queues from the
 Windows observed-edge filter, reports the optional explicit edge-rearm
 contract and process-local exclusive arbitration, and identifies which wait
-families support `wepoll_ex_wake()`. Windows basic
-and extended waits consume one coalesced wake as an early zero-event return
-after ready events and pending errors. The POSIX wrapper reports wake
-unsupported because its basic waits are direct libc calls.
+families support `wepoll_ex_wake()`. Windows basic and extended waits consume
+one coalesced plain wake as an early zero-event return after ready events and
+pending errors. `wepoll_ex_wake_event()` instead snapshots an application
+event and returns it as a one-record synthetic batch; extended waits add
+`WEPOLL_FLAG_WAKE_EVENT`. A tagged request upgrades a pending plain wake, while
+the first pending tagged payload is retained when later requests coalesce.
+`WEPOLL_EX_CAP_TAGGED_WAKE_EVENT` advertises the tagged form. The POSIX wrapper
+reports both wake operations unsupported because its basic waits are direct
+libc calls.
 
 The prioritized follow-up work and nginx qualification gates are recorded in
 [`docs/COMPATIBILITY_ROADMAP.md`](docs/COMPATIBILITY_ROADMAP.md).

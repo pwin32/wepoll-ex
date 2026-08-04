@@ -28,6 +28,9 @@
 #define EP_100NS_PER_MILLISECOND         UINT64_C(10000)
 #define EP_MAX_FINITE_IOCP_WAIT_MS       (INFINITE - 1U)
 #define EP_MAX_SIZE_HINT                  4096U
+#define EP_WAKE_NONE                         0
+#define EP_WAKE_UNTAGGED                     1
+#define EP_WAKE_TAGGED                       2
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #  define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002UL
@@ -45,6 +48,8 @@
 #define EP_STATUS_INVALID_HANDLE    UINT32_C(0xC0000008)
 
 static _Atomic uint64_t g_quarantined_ports;
+
+static uint64_t ep_now_ns(void);
 
 #ifdef _WIN32
 static void ep_port_store_proc(void *target, size_t target_size, FARPROC proc)
@@ -478,11 +483,12 @@ static void ep_port_fail_iocp_post(ep_port_t *port, DWORD win_error)
     }
 }
 
-int ep_port_wake(ep_port_t *port)
+static int ep_port_request_wake(ep_port_t *port,
+                                const struct epoll_event *event)
 {
     DWORD win_error = ERROR_SUCCESS;
     int error;
-    int expected = 0;
+    int pending_state;
 
     if (port == NULL) {
         ep_set_errno(EFAULT);
@@ -494,15 +500,44 @@ int ep_port_wake(ep_port_t *port)
         return -1;
     }
 
+    pthread_mutex_lock(&port->wake_lock);
+    if (atomic_load_explicit(&port->closing, memory_order_acquire) ||
+        atomic_load_explicit(&port->iocp_closed, memory_order_acquire)) {
+        pthread_mutex_unlock(&port->wake_lock);
+        ep_set_errno(EBADF);
+        return -1;
+    }
     atomic_fetch_add_explicit(&port->wake_requests, 1,
                               memory_order_relaxed);
-    if (!atomic_compare_exchange_strong_explicit(
-            &port->wake_pending, &expected, 1,
-            memory_order_acq_rel, memory_order_acquire)) {
+    pending_state = atomic_load_explicit(&port->wake_pending,
+                                         memory_order_relaxed);
+    if (event != NULL && pending_state == EP_WAKE_UNTAGGED) {
+        /* A tagged wake carries strictly more information than an existing
+         * zero-event request.  Upgrade it in place; the already-posted IOCP
+         * control packet is sufficient to wake the waiter. */
+        port->wake_event = *event;
+        atomic_store_explicit(&port->wake_pending, EP_WAKE_TAGGED,
+                              memory_order_release);
         atomic_fetch_add_explicit(&port->wake_coalesced, 1,
                                   memory_order_relaxed);
+        pthread_mutex_unlock(&port->wake_lock);
         return 0;
     }
+    if (pending_state != EP_WAKE_NONE) {
+        /* The first tagged payload remains stable until delivery. */
+        atomic_fetch_add_explicit(&port->wake_coalesced, 1,
+                                  memory_order_relaxed);
+        pthread_mutex_unlock(&port->wake_lock);
+        return 0;
+    }
+    if (event != NULL) {
+        port->wake_event = *event;
+    }
+    atomic_store_explicit(&port->wake_pending,
+                          event != NULL ? EP_WAKE_TAGGED
+                                        : EP_WAKE_UNTAGGED,
+                          memory_order_release);
+    pthread_mutex_unlock(&port->wake_lock);
 
     /* Always queue one control packet for the pending transition.  A future
      * waiter may otherwise begin after the active-waiter observation and
@@ -513,7 +548,10 @@ int ep_port_wake(ep_port_t *port)
         return 0;
     }
 
-    atomic_store_explicit(&port->wake_pending, 0, memory_order_release);
+    pthread_mutex_lock(&port->wake_lock);
+    atomic_store_explicit(&port->wake_pending, EP_WAKE_NONE,
+                          memory_order_release);
+    pthread_mutex_unlock(&port->wake_lock);
     error = atomic_load_explicit(&port->closing, memory_order_acquire)
         ? EBADF : ep_winerr_to_errno(win_error);
     if (error == 0) error = EIO;
@@ -522,14 +560,58 @@ int ep_port_wake(ep_port_t *port)
     return -1;
 }
 
-static int ep_port_take_wake(ep_port_t *port)
+int ep_port_wake(ep_port_t *port)
 {
-    if (atomic_exchange_explicit(&port->wake_pending, 0,
-                                 memory_order_acq_rel) == 0) {
+    return ep_port_request_wake(port, NULL);
+}
+
+int ep_port_wake_event(ep_port_t *port, const struct epoll_event *event)
+{
+    if (event == NULL) {
+        ep_set_errno(EFAULT);
+        return -1;
+    }
+    return ep_port_request_wake(port, event);
+}
+
+static int ep_port_take_wake(ep_port_t *port, void *out,
+                             int basic_events, int *result_out)
+{
+    struct epoll_event event;
+    int pending_state;
+
+    pthread_mutex_lock(&port->wake_lock);
+    pending_state = atomic_load_explicit(&port->wake_pending,
+                                         memory_order_relaxed);
+    if (pending_state == EP_WAKE_NONE) {
+        pthread_mutex_unlock(&port->wake_lock);
         return 0;
     }
+    if (pending_state == EP_WAKE_TAGGED) {
+        event = port->wake_event;
+    }
+    atomic_store_explicit(&port->wake_pending, EP_WAKE_NONE,
+                          memory_order_release);
+    pthread_mutex_unlock(&port->wake_lock);
+
     atomic_fetch_add_explicit(&port->wake_returns, 1,
                               memory_order_relaxed);
+    if (pending_state == EP_WAKE_TAGGED) {
+        if (basic_events) {
+            *(struct epoll_event *)out = event;
+        } else {
+            epoll_event_ex *extended = (epoll_event_ex *)out;
+
+            memset(extended, 0, sizeof(*extended));
+            extended->events = event.events;
+            extended->data = event.data;
+            extended->flags = WEPOLL_FLAG_WAKE_EVENT;
+            extended->timestamp = ep_now_ns();
+        }
+        *result_out = 1;
+    } else {
+        *result_out = 0;
+    }
     return 1;
 }
 
@@ -3888,6 +3970,7 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     size_t pool_capacity = WEPOLL_AFD_POOL_SIZE;
     int fd_lock_initialized = 0;
     int wait_lock_initialized = 0;
+    int wake_lock_initialized = 0;
     int iocp_post_lock_initialized = 0;
     int ready_initialized = 0;
     int afd_pool_initialized = 0;
@@ -3920,6 +4003,12 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
         goto fail;
     }
     wait_lock_initialized = 1;
+    mutex_error = pthread_mutex_init(&port->wake_lock, NULL);
+    if (mutex_error != 0) {
+        ep_set_errno(mutex_error);
+        goto fail;
+    }
+    wake_lock_initialized = 1;
     mutex_error = pthread_mutex_init(&port->iocp_post_lock, NULL);
     if (mutex_error != 0) {
         ep_set_errno(mutex_error);
@@ -4080,6 +4169,9 @@ fail:
         }
         if (wait_lock_initialized) {
             pthread_mutex_destroy(&port->wait_lock);
+        }
+        if (wake_lock_initialized) {
+            pthread_mutex_destroy(&port->wake_lock);
         }
         if (iocp_post_lock_initialized) {
             pthread_mutex_destroy(&port->iocp_post_lock);
@@ -4257,6 +4349,7 @@ static void ep_port_finish_destroy_locked(ep_port_t *port)
 
     pthread_mutex_unlock(&port->wait_lock);
     pthread_mutex_destroy(&port->wait_lock);
+    pthread_mutex_destroy(&port->wake_lock);
     pthread_mutex_destroy(&port->iocp_post_lock);
     pthread_mutex_destroy(&port->fd_table_lock);
     free(port);
@@ -5683,8 +5776,11 @@ static int ep_port_wait_timeout_impl(ep_port_t *port, void *out,
                 break;
             }
             if (error == WAIT_TIMEOUT) {
-                if (ep_port_take_wake(port)) {
-                    result = 0;
+                int wake_result;
+
+                if (ep_port_take_wake(port, out, basic_events,
+                                      &wake_result)) {
+                    result = wake_result;
                     break;
                 }
                 if (deferred_rearm_wait) {
@@ -5708,8 +5804,11 @@ static int ep_port_wait_timeout_impl(ep_port_t *port, void *out,
             break;
         }
         if (removed == 0) {
-            if (ep_port_take_wake(port)) {
-                result = 0;
+            int wake_result;
+
+            if (ep_port_take_wake(port, out, basic_events,
+                                  &wake_result)) {
+                result = wake_result;
                 break;
             }
             if (!ep_wait_expired(port, &wait_state)) {
@@ -5834,9 +5933,14 @@ coalesce:
             result = -1;
             break;
         }
-        if (ep_port_take_wake(port)) {
-            result = 0;
-            break;
+        {
+            int wake_result;
+
+            if (ep_port_take_wake(port, out, basic_events,
+                                  &wake_result)) {
+                result = wake_result;
+                break;
+            }
         }
         if (timeout_packet && ep_wait_expired(port, &wait_state)) {
             result = 0;

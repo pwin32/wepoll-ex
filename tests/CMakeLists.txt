@@ -407,6 +407,7 @@ else()
     foreach(_waitable_mode IN ITEMS
             event
             event-et
+            event-et-mod
             auto-reset
             auto-reset-et
             semaphore

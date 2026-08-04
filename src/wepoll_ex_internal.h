@@ -659,6 +659,7 @@ struct ep_port {
     /* Close/wait coordination.  A closing port cancels all outstanding AFD
      * polls and waits for their IOCP completions before storage is freed. */
     pthread_mutex_t wait_lock;
+    pthread_mutex_t wake_lock;
     _Atomic int waiter_active;
     /* The ready queue has a single serialized consumer.  Publish its current
      * logical wait generation so socket submissions can be refreshed when an
@@ -670,10 +671,14 @@ struct ep_port {
      * operations then queue rearm work for the next wait instead of creating
      * a second generation that the same coalescing drain could return. */
     _Atomic int waiter_coalescing;
-    /* One application-requested early wait return.  Requests coalesce while
-     * this bit remains set; ready events and asynchronous errors take
-     * priority, leaving the wake pending for a later wait. */
+    /* One application-requested early wait return.  Zero means none, one is
+     * an untagged zero-event return, and two carries wake_event.  Requests
+     * coalesce while nonzero; a tagged request may upgrade an untagged one.
+     * Ready events and asynchronous errors take priority, leaving the wake
+     * pending for a later wait.  wake_lock protects the payload and state
+     * transitions while the atomic state supports the waiter's fast check. */
     _Atomic int wake_pending;
+    struct epoll_event wake_event;
     _Atomic uint64_t wake_requests;
     _Atomic uint64_t wake_coalesced;
     _Atomic uint64_t wake_returns;
@@ -804,6 +809,8 @@ int  ep_port_unregister(ep_port_t *port, SOCKET fd);
 int  ep_port_rearm(ep_port_t *port, SOCKET fd);
 int  ep_port_rearm_classes(ep_port_t *port, SOCKET fd, uint32_t classes);
 int  ep_port_wake(ep_port_t *port);
+int  ep_port_wake_event(ep_port_t *port,
+                        const struct epoll_event *event);
 
 int  ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
                   int timeout_ms, const wepoll_sigset_t *sigmask);

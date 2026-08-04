@@ -138,6 +138,7 @@ typedef struct epoll_event {
 #define WEPOLL_FLAG_ONESHOT_FIRED  (1U << 0)
 #define WEPOLL_FLAG_ET_DELIVERED   (1U << 1) /* native EPOLLET was delivered */
 #define WEPOLL_FLAG_EDGE_ARMED     (1U << 2) /* native edge registration */
+#define WEPOLL_FLAG_WAKE_EVENT     (1U << 3) /* synthetic tagged wake */
 
 typedef struct epoll_event_ex {
     uint32_t      events;
@@ -224,6 +225,8 @@ typedef struct wepoll_ex_global_stats {
     (UINT64_C(1) << 7)
 #define WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM \
     (UINT64_C(1) << 8)
+#define WEPOLL_EX_CAP_TAGGED_WAKE_EVENT \
+    (UINT64_C(1) << 9)
 
 typedef struct wepoll_ex_capabilities {
     uint32_t version;
@@ -396,6 +399,17 @@ WEPOLL_EX_API int wepoll_ex_get_global_stats(
  * basic epoll wait family and therefore returns EOPNOTSUPP; callers must check
  * WEPOLL_EX_CAP_WAKE_* before using this extension. */
 WEPOLL_EX_API int wepoll_ex_wake(int epfd);
+
+/* Request one coalesced synthetic event from a wait on this epoll instance.
+ * Windows snapshots the supplied event and returns it through the basic or
+ * extended wait family after already-ready registrations and pending errors.
+ * A tagged request upgrades a pending untagged wepoll_ex_wake(); once a tagged
+ * request is pending, later wake requests coalesce without replacing its
+ * payload. event->events must be a nonzero combination of ordinary delivered
+ * EPOLL* readiness bits, not registration/control flags. Extended waits add
+ * WEPOLL_FLAG_WAKE_EVENT. POSIX reports EOPNOTSUPP. */
+WEPOLL_EX_API int wepoll_ex_wake_event(
+    int epfd, const struct epoll_event *event);
 
 /* Close an epoll fd created by epoll_create / epoll_create1 /
  * epoll_create_ex.  On POSIX this normally behaves like close(); tracked

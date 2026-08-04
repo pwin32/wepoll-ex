@@ -160,6 +160,18 @@ the nginx-embedded source build independent of a generated CMake header.
    path. Ready snapshots already in the queue are returned first; the pending
    error is reported by the next wait. Only the first currently pending error
    is returned, while the statistics counter records every occurrence.
+   An application wake is one coalesced per-port state transition plus one
+   IOCP control packet. `wepoll_ex_wake()` consumes that state as a zero-event
+   return. `wepoll_ex_wake_event()` snapshots a supplied `epoll_event` and
+   consumes it as a one-record basic or extended result; extended output adds
+   `WEPOLL_FLAG_WAKE_EVENT`, a timestamp, and a null context. A tagged request
+   may upgrade a pending plain wake without another post, while a pending
+   tagged payload is not replaced. The ready queue and latched asynchronous
+   errors are checked first, so notification does not reorder socket failure
+   or readiness. A mutex protects payload publication and consumption; the
+   atomic state remains the waiter's fast test. An IOCP post failure clears the
+   pending state and follows the same fatal port path as other unexpected
+   control-post failures.
    The public Windows x86/x86-64 `epoll_event` itself uses Linux's UAPI layout:
    `data` is at offset 4 and size/stride is 12, with alignment 4 on x86 and 1
    on x86-64. Native arrays and FFI declarations therefore share the Linux

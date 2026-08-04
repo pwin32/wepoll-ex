@@ -24,13 +24,14 @@ optional `notify` action unset and does not claim thread-pool support on
 Windows. A configuration that requires `thread_pool` must use a separately
 validated platform/backend.
 
-The library now exposes a coalesced `wepoll_ex_wake()` primitive for a future
-notification bridge. It wakes a Windows basic or extended wait with a
-zero-event return after ordinary readiness and pending errors have priority;
-the nginx module must still own and dispatch the pending handler queue. The
-current adapter does not enable `notify`, because stock nginx 1.31.3 rejects
-the required Win32 thread-pool configuration and a bare wake is not itself a
-handler-delivery contract.
+The library exposes both a coalesced `wepoll_ex_wake()` zero-event return and a
+tagged `wepoll_ex_wake_event()` for a future notification bridge. The tagged
+form can carry a synthetic `EPOLLIN` record for nginx's notify connection after
+ordinary readiness and pending errors. The nginx module must still serialize
+the pending handler pointer and dispatch it through nginx's event lifecycle.
+The current adapter does not enable `notify`, because stock nginx 1.31.3
+rejects the required Win32 thread-pool configuration and no adapter-level
+handler-delivery contract has been qualified.
 
 The addon compiles wepoll-ex with its Windows 8+ API assumptions even though
 stock nginx 1.31.3 headers advertise an older Win32 target. Treat Windows 8 or
@@ -48,6 +49,8 @@ incorrect.
 The staged work needed to qualify explicit edge rearming, notification,
 lifetime ownership, error bridging, probe optimization, and multiworker
 behavior is tracked in `docs/COMPATIBILITY_ROADMAP.md`.
+The exact nginx/libuv/Mio/Asio source comparison is recorded in
+`docs/UPSTREAM_EVENT_LOOP_AUDIT.md`.
 
 The library now contains the first explicit-rearm primitive described by that
 roadmap, but the checked-in adapter does not use it.  A native-module-style

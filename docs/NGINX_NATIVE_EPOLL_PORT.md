@@ -62,6 +62,21 @@ must therefore complete `EPOLL_CTL_DEL` before `closesocket()`.  This matches
 the synchronized lifetime profile intended for an nginx experiment, but every
 core and third-party close path still needs qualification.
 
+## Notification bridge
+
+The native module's control `eventfd` can be replaced without emulating a Unix
+descriptor. `wepoll_ex_wake_event()` snapshots a synthetic `EPOLLIN` event
+whose data points at the nginx notify connection. The next Windows wait returns
+that record after ordinary readiness and pending errors; repeated requests
+coalesce, and extended waits identify it with `WEPOLL_FLAG_WAKE_EVENT`. nginx
+must still serialize ownership of `notify_event.data` and execute the pending
+handler in its normal dispatch path.
+
+This mapping applies only to nginx's control notification. The optional Linux
+file-AIO eventfd is coupled to `io_setup`, `io_submit`, and `io_getevents` and
+therefore needs a separate Windows file-I/O completion design. A tagged wake
+does not manufacture file-AIO completion records.
+
 ## nginx changes still required
 
 Using this facility is more than changing `epoll_create`, `epoll_ctl`, and
@@ -78,8 +93,9 @@ Using this facility is more than changing `epoll_create`, `epoll_ctl`, and
    executes, not at the end of `ngx_epoll_process_events()`;
 5. `EPOLLERR | EPOLLHUP` handling must close/DEL or deliberately rearm the
    surviving classes; and
-6. the Linux `eventfd` notify path, optional Linux file AIO path, and native
-   epoll-fd close assumptions need separate Windows implementations.
+6. the control notify path must use a tagged wake or another Windows primitive;
+   optional Linux file AIO and native epoll-fd close assumptions still need
+   separate Windows implementations.
 
 Those changes can be localized around nginx's event lifecycle, but they are
 semantic changes rather than symbol aliases.  The checked-in
@@ -102,3 +118,7 @@ abortive reset, write half-close, posted events, reload, graceful quit,
 multiple workers, and third-party close paths.  Level-triggered,
 observed-edge, and explicit-rearm builds must be measured separately with the
 wepoll-ex probe, wake, and lifecycle diagnostics recorded.
+
+The broader nginx/libuv/Mio/Asio comparison and the reasons for not treating
+native completion facilities as epoll flags are recorded in
+`UPSTREAM_EVENT_LOOP_AUDIT.md`.

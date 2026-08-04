@@ -1208,6 +1208,15 @@ WEPOLL_EX_API int wepoll_ex_wake(int epfd)
     return -1;
 }
 
+WEPOLL_EX_API int wepoll_ex_wake_event(
+    int epfd, const struct epoll_event *event)
+{
+    (void)epfd;
+    (void)event;
+    errno = EOPNOTSUPP;
+    return -1;
+}
+
 WEPOLL_EX_API int wepoll_close(int epfd)
 {
     pthread_mutex_lock(&g_posix_lock);
@@ -1289,6 +1298,7 @@ int  ep_port_unregister(ep_port_t *p, SOCKET f)    { (void)p;(void)f; errno=ENOS
 int  ep_port_rearm(ep_port_t *p, SOCKET f)         { (void)p;(void)f; errno=ENOSYS; return -1; }
 int  ep_port_rearm_classes(ep_port_t *p, SOCKET f, uint32_t c) { (void)p;(void)f;(void)c; errno=ENOSYS; return -1; }
 int  ep_port_wake(ep_port_t *p)                    { (void)p; errno=ENOSYS; return -1; }
+int  ep_port_wake_event(ep_port_t *p, const struct epoll_event *e) { (void)p;(void)e; errno=ENOSYS; return -1; }
 int  ep_port_wait(ep_port_t *p, epoll_event_ex *o, int m, int t, const sigset_t *s)
                                                     { (void)p;(void)o;(void)m;(void)t;(void)s; errno=ENOSYS; return -1; }
 void ep_sock_handle_completion(ep_sock_t *s, DWORD b, NTSTATUS st) { (void)s;(void)b;(void)st; }

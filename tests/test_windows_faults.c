@@ -1366,17 +1366,21 @@ cleanup:
 static int test_wake_post(void)
 {
     ep_port_t *port = NULL;
+    struct epoll_event event;
     wepoll_ex_stats stats;
     int result = -1;
 
     ep_fault_reset();
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = UINT64_C(0x57414b45504f5354);
     if (ep_port_create(0, 0, &port) != 0 ||
         ep_fault_configure(EP_FAULT_IOCP_POST, 1, EIO) != 0) {
         goto cleanup;
     }
 
     errno = 0;
-    if (ep_port_wake(port) != -1 || errno != EIO ||
+    if (ep_port_wake_event(port, &event) != -1 || errno != EIO ||
         ep_fault_hits(EP_FAULT_IOCP_POST) != 1 ||
         atomic_load_explicit(&port->wake_pending,
                              memory_order_acquire) != 0 ||

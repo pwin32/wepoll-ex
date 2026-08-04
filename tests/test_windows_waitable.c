@@ -223,6 +223,105 @@ fail:
     return 1;
 }
 
+static int test_event_handle_et_mod_retrigger(void)
+{
+    HANDLE event_handle = NULL;
+    struct epoll_event event;
+    struct epoll_event output;
+    int epfd = -1;
+    int n;
+
+    event_handle = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (event_handle == NULL)
+        return 1;
+    epfd = epoll_create1(0);
+    if (epfd < 0)
+        goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLET;
+    event.data.u64 = 81;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD,
+                  (epoll_fd_t)event_handle, &event) != 0 ||
+        !SetEvent(event_handle)) {
+        goto fail;
+    }
+
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || output.events != EPOLLIN || output.data.u64 != 81 ||
+        epoll_wait(epfd, &output, 1, 30) != 0) {
+        fprintf(stderr,
+                "waitable-event-et-mod: initial edge n=%d events=%u "
+                "data=%llu errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0), errno);
+        goto fail;
+    }
+
+    /* Boost.Asio deliberately leaves its eventfd interrupter readable and
+     * uses a same-mask MOD to request the next ET notification.  A persistent
+     * manual-reset event is the Windows equivalent of that ready level. */
+    event.data.u64 = 82;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)event_handle, &event) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || output.events != EPOLLIN || output.data.u64 != 82 ||
+        epoll_wait(epfd, &output, 1, 30) != 0) {
+        fprintf(stderr,
+                "waitable-event-et-mod: first retrigger n=%d events=%u "
+                "data=%llu errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0), errno);
+        goto fail;
+    }
+
+    event.data.u64 = 83;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)event_handle, &event) != 0)
+        goto fail;
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || output.events != EPOLLIN || output.data.u64 != 83 ||
+        epoll_wait(epfd, &output, 1, 30) != 0) {
+        fprintf(stderr,
+                "waitable-event-et-mod: second retrigger n=%d events=%u "
+                "data=%llu errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0), errno);
+        goto fail;
+    }
+
+    if (!ResetEvent(event_handle))
+        goto fail;
+    event.data.u64 = 84;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD,
+                  (epoll_fd_t)event_handle, &event) != 0 ||
+        epoll_wait(epfd, &output, 1, 30) != 0 ||
+        !SetEvent(event_handle)) {
+        goto fail;
+    }
+    n = epoll_wait(epfd, &output, 1, 1000);
+    if (n != 1 || output.events != EPOLLIN || output.data.u64 != 84 ||
+        epoll_wait(epfd, &output, 1, 30) != 0) {
+        fprintf(stderr,
+                "waitable-event-et-mod: new edge n=%d events=%u "
+                "data=%llu errno=%d\n",
+                n, n > 0 ? output.events : 0,
+                (unsigned long long)(n > 0 ? output.data.u64 : 0), errno);
+        goto fail;
+    }
+
+    (void)wepoll_close(epfd);
+    CloseHandle(event_handle);
+    puts("waitable-event-et-mod: OK");
+    return 0;
+
+fail:
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (event_handle) CloseHandle(event_handle);
+    return 1;
+}
+
 static int test_auto_reset_event(void)
 {
     HANDLE event_handle = NULL;
@@ -1719,6 +1818,8 @@ static int run_mode(const char *mode)
         return test_event_handle();
     if (strcmp(mode, "event-et") == 0)
         return test_event_handle_et();
+    if (strcmp(mode, "event-et-mod") == 0)
+        return test_event_handle_et_mod_retrigger();
     if (strcmp(mode, "auto-reset") == 0)
         return test_auto_reset_event();
     if (strcmp(mode, "auto-reset-et") == 0)
@@ -1774,7 +1875,8 @@ int main(int argc, char **argv)
     WSADATA wsa;
     int failures = 0;
     const char *modes[] = {
-        "event", "event-et", "auto-reset", "auto-reset-et", "semaphore",
+        "event", "event-et", "event-et-mod", "auto-reset", "auto-reset-et",
+        "semaphore",
         "semaphore-et", "zero-semaphore", "zero-pending", "zero-callback",
         "zero-ready", "queued-rearm", "pending-mod", "ready-mod",
         "timer-ready-mod",

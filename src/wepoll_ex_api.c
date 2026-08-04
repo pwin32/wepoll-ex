@@ -728,7 +728,8 @@ WEPOLL_EX_API int wepoll_ex_get_capabilities(
                      WEPOLL_EX_CAP_WAKE_STANDARD_WAIT |
                      WEPOLL_EX_CAP_WAKE_EXTENDED_WAIT |
                      WEPOLL_EX_CAP_VIRTUAL_EPOLL_DESCRIPTOR |
-                     WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM;
+                     WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM |
+                     WEPOLL_EX_CAP_TAGGED_WAKE_EVENT;
     return copy_versioned_snapshot(capabilities, capabilities_size,
                                    &snapshot, sizeof(snapshot));
 }
@@ -776,6 +777,36 @@ WEPOLL_EX_API int wepoll_ex_wake(int epfd)
         return -1;
     }
     result = ep_port_wake(entry->port);
+    epfd_put(entry);
+    return result;
+}
+
+WEPOLL_EX_API int wepoll_ex_wake_event(
+    int epfd, const struct epoll_event *event)
+{
+    const uint32_t allowed_events =
+        EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLERR | EPOLLHUP |
+        EPOLLRDNORM | EPOLLRDBAND | EPOLLWRNORM | EPOLLWRBAND |
+        EPOLLMSG | EPOLLRDHUP;
+    struct epoll_event event_copy;
+    epfd_entry_t *entry;
+    int result;
+
+    if (event == NULL) {
+        ep_set_errno(EFAULT);
+        return -1;
+    }
+    event_copy = *event;
+    if (event_copy.events == 0 ||
+        (event_copy.events & ~allowed_events) != 0) {
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+    entry = epfd_require(epfd);
+    if (entry == NULL) {
+        return -1;
+    }
+    result = ep_port_wake_event(entry->port, &event_copy);
     epfd_put(entry);
     return result;
 }
