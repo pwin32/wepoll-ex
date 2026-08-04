@@ -1777,6 +1777,112 @@ static int sleep_milliseconds(long milliseconds)
     return 0;
 }
 
+typedef struct empty_add_wait_context {
+    int                epfd;
+    atomic_int         started;
+    atomic_int         completed;
+    struct epoll_event event;
+    int                result;
+    int                error;
+} empty_add_wait_context_t;
+
+static void *empty_add_wait_thread(void *opaque)
+{
+    empty_add_wait_context_t *context = opaque;
+
+    atomic_store_explicit(&context->started, 1, memory_order_release);
+    errno = 0;
+    context->result = epoll_wait(context->epfd, &context->event, 1, 2000);
+    context->error = errno;
+    atomic_store_explicit(&context->completed, 1, memory_order_release);
+    return NULL;
+}
+
+static void test_empty_wait_wakes_on_concurrent_add(void)
+{
+    const uint64_t data = UINT64_C(0x454d505459414444);
+    int pair[2] = { -1, -1 };
+    int epfd = -1;
+    int thread_created = 0;
+    int failure_errno = 0;
+    pthread_t thread;
+    empty_add_wait_context_t context;
+    struct epoll_event event;
+    const char *failure = NULL;
+
+    TEST("concurrent ready ADD wakes an empty epoll wait");
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        FAIL("socketpair");
+        return;
+    }
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        goto cleanup;
+    }
+    memset(&context, 0, sizeof(context));
+    atomic_init(&context.started, 0);
+    atomic_init(&context.completed, 0);
+    context.epfd = epfd;
+    context.result = -2;
+    {
+        int thread_error = pthread_create(&thread, NULL,
+                                          empty_add_wait_thread, &context);
+        if (thread_error != 0) {
+            errno = thread_error;
+            FAIL("pthread_create");
+            goto cleanup;
+        }
+    }
+    thread_created = 1;
+    if (wait_atomic_at_least(&context.started, 1, 2000) != 0 ||
+        sleep_milliseconds(50) != 0) {
+        failure = "waiter did not block";
+        failure_errno = errno;
+        goto join;
+    }
+    if (atomic_load_explicit(&context.completed, memory_order_acquire)) {
+        failure = "empty wait returned before ADD";
+        failure_errno = context.error;
+        goto join;
+    }
+    if (write(pair[1], "a", 1) != 1) {
+        failure = "write before ADD";
+        failure_errno = errno;
+        goto join;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = data;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair[0], &event) != 0) {
+        failure = "concurrent EPOLL_CTL_ADD";
+        failure_errno = errno;
+        goto join;
+    }
+
+join:
+    pthread_join(thread, NULL);
+    thread_created = 0;
+    if (failure == NULL &&
+        (context.result != 1 || context.event.events != EPOLLIN ||
+         context.event.data.u64 != data)) {
+        failure = "empty wait wake result";
+        failure_errno = context.error;
+    }
+    if (failure != NULL) {
+        errno = failure_errno;
+        FAIL(failure);
+        goto cleanup;
+    }
+    PASS();
+
+cleanup:
+    if (thread_created) pthread_join(thread, NULL);
+    if (epfd >= 0) wepoll_close(epfd);
+    if (pair[0] >= 0) close(pair[0]);
+    if (pair[1] >= 0) close(pair[1]);
+}
+
 typedef struct same_epfd_et_wait_context {
     int                epfd;
     atomic_int        *ready;
@@ -2919,6 +3025,7 @@ int main(void)
     test_rearm_preserves_registration();
     test_drain_and_batch();
     test_invalid_and_closed_descriptors();
+    test_empty_wait_wakes_on_concurrent_add();
     test_same_epfd_et_wakes_one_waiter();
     test_cancel_blocking_extended_wait();
     test_close_wakes_blocking_extended_wait();

@@ -109,6 +109,9 @@ the nginx-embedded source build independent of a generated CMake header.
    set larger than `maxevents` across successive waits. ET observation state
    survives the serialized waiter handoff, so one transition on one epfd wakes
    one waiter rather than being redelivered to the next waiter.
+   A wait on an empty interest list remains blocked. Concurrent ADD observes
+   the active waiter and immediately arms the new target; an already-ready
+   socket therefore publishes its completion and wakes that wait.
    After it acquires the lock, while internal packets keep arriving it
    processes at least 16 successful, nonempty IOCP dequeue batches before
    enforcing a 10 ms drain budget.
@@ -573,30 +576,30 @@ temporary fallback signal mask before unwinding.
 
 ## Verification baseline
 
-On July 29, 2026, strict MinGW GCC 15.2 with
-`-O2 -Wall -Wextra -Wpedantic -Werror` completed 124 combined best-effort, 122
-static-only, 65 shared-only, 124 strict-identity, 65 strict shared-only, 124
-synchronized-lifetime, and 65 synchronized shared-only CTest entries. Their
-passed/skipped counts were 123/1, 121/1, 64/1, 123/1, 64/1, 119/5, and 60/5.
+On August 4, 2026, Windows 10.0.19044 with MSYS2 MinGW GCC 16.1 and
+`-O2 -Wall -Wextra -Wpedantic -Werror` completed 183 combined best-effort, 181
+static-only, 103 shared-only, 183 strict-identity, 103 strict shared-only, 183
+synchronized-lifetime, and 103 synchronized shared-only CTest entries. Their
+passed/skipped counts were 182/1, 180/1, 102/1, 182/1, 102/1, 178/5, and 98/5.
 All seven variants skipped the environment-dependent UDP/ICMP case;
 synchronized modes additionally skipped the four native-reuse identity cases
-owned by their DEL-before-close contract. Three repeats of every applicable
-API, backpressure, stress, concurrent-control, AFD mapping/status,
-socket-alias, urgent-data LT/ET/ONESHOT/MOD, inline-urgent LT/ET, and precise-
-timeout conversion/generation/readiness/close/fallback lane passed. The shared
-builds also passed exact public-export checks.
+owned by their DEL-before-close contract. Three repeats of 94 focused tests in
+each internal-capable build and 57 focused tests in each shared-only build
+passed. The shared builds also passed exact public-export checks.
 
-The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 4/4, five
-repeats each of the API and pool executables, an explicitly forced
-`epoll_pwait2` fallback CTest 4/4, and ASan/UBSan CTest 3/3. Clang 19.1.7 strict
-Release also passed 4/4. Coverage includes exact preview package compatibility,
+The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 5/5 in both
+native and explicitly forced `epoll_pwait2` fallback lanes, five repeats each
+of the API, large-wait, and pool executables, and ASan/UBSan CTest 4/4. The API
+executable reported 50 passed, one focused legacy-WSL1 ready-list-rotation
+skip, and zero failures. Coverage includes exact preview package compatibility,
 ELF SONAME and Linux/MinGW export surfaces; socket alias, urgent-data,
 status/error, ET/exclusive read, write, mixed-class, and stale-snapshot
-transitions; cancellation-losing same-wait MOD expansion refresh; mixed
-normal/urgent LT convergence and persistence; live unread-data TCP FIN and
-reset state, same-wait RDHUP/ERR/HUP merging, and preserved `WSAECONNRESET`;
-direction-aware pipe adapters;
-waitable terminal ET and
+transitions; persistent ready-set rotation, same-epfd ET single-wake behavior,
+duplicate descriptors for one endpoint, and concurrent ready ADD wakeup from
+an empty interest list; cancellation-losing same-wait MOD expansion refresh;
+mixed normal/urgent LT convergence and persistence; live unread-data TCP FIN
+and reset state, same-wait RDHUP/ERR/HUP merging, and preserved
+`WSAECONNRESET`; direction-aware pipe adapters; waitable terminal ET and
 pending/queued MOD races; consumptive notification counts; auxiliary-disarm
 fault recovery and preserved consumptive retries; immediate auxiliary
 cancellation reclamation; IOCP post/close lease races and fatal-post wakeups;
@@ -604,9 +607,8 @@ high-resolution timeout conversion, stale generations, readiness races,
 fallback, close, and init/arm/post failures; long native/fallback timespecs and
 masked cancellation/restoration; provider identity modes;
 cancellation/close/quarantine; packaging; and static-winpthread dependency
-checks. `scripts/qualify-posix.sh`,
-`scripts/qualify-mingw.sh`, CMake presets, and `scripts/repeat-ctest.sh` make
-those lanes reproducible.
+checks. `scripts/qualify-posix.sh`, `scripts/qualify-mingw.sh`, CMake presets,
+and `scripts/repeat-ctest.sh` make those lanes reproducible.
 
 The deterministic long stress profile completed 250,000 operations on 128
 sockets with zero backpressure in combined best-effort and best-effort,

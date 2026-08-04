@@ -147,6 +147,9 @@ When more level-ready registrations exist than `maxevents`, successive Windows
 waits rotate through the persistent ready set. Multiple waiters on one Windows
 epfd serialize ready-queue consumption; for an `EPOLLET` registration, one
 readiness transition wakes one waiter rather than being copied to every waiter.
+A blocking wait may begin with an empty Windows interest list. A concurrent
+ADD arms the new registration immediately when a waiter is active, so adding
+an already-ready socket wakes that wait with the new registration's event.
 POSIX extension waits issue one native wait directly into the packed prefix of
 the caller's wider array, then expand the returned records backward in place.
 They can therefore fill beyond 4096 without proportional conversion storage or

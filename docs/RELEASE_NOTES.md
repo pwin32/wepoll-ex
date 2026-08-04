@@ -539,8 +539,19 @@ Windows epfds are process-local integers with no duplication, inheritance,
 Windows waits neither apply signal masks nor emulate signal-generated `EINTR`.
 The POSIX build retains native descriptor and host-ioctl behavior.
 
-The August 4, 2026 ready-set and descriptor-boundary qualification used
-Windows 10.0.19044, MSYS2 MinGW GCC 16.1, and
+The empty-interest-list audit adds native and Windows regressions that first
+prove a waiter remains blocked with no registrations, then make a socket ready
+before concurrently adding it. The blocked wait must wake with exactly the
+new registration's event. Windows already satisfied this Linux lifecycle
+contract by eagerly submitting socket ADDs and recreating synchronous AFD
+success as an IOCP completion whenever a waiter is active.
+
+The August 4, 2026 ready-set, descriptor-boundary, and empty-interest-list
+qualification used Linux/WSL GCC 14.2 for native and forced-fallback strict
+Release CTest, which passed 5/5 in both lanes. API, large-wait, and pool checks
+passed five repetitions each, and ASan/UBSan passed 4/4. The API executable
+reported 50 passed, one focused legacy-WSL1 rotation skip, and zero failures.
+Windows qualification used Windows 10.0.19044, MSYS2 MinGW GCC 16.1, and
 `-O2 -Wall -Wextra -Wpedantic -Werror`. The seven lanes completed 183
 combined best-effort (182 passed/1 skip), 181 static-only (180/1), 103
 shared-only (102/1), 183 strict combined (182/1), 103 strict shared-only
@@ -551,7 +562,18 @@ by their DEL-before-close contract. Three repeats of every applicable focused
 lane passed: 94 tests in internal-capable builds and 57 tests in shared-only
 builds. This included persistent ready-set rotation, same-epfd ET single-wake
 behavior, direct `EPOLL_CLOEXEC` acceptance, and independent ONESHOT delivery
-for two duplicated socket descriptors referencing one endpoint.
+for two duplicated socket descriptors referencing one endpoint. Every public
+API lane also passed the concurrent ready ADD that wakes a blocked empty epfd.
+
+The final standard-entry-point audit cross-checked creation and flag
+validation, control operations and error precedence, every public event bit,
+implicit error/hangup delivery, LT/ET/ONESHOT/EXCLUSIVE behavior, duplicated
+descriptors, bounded ready-list fairness, multiwaiter wake behavior, empty-list
+ADD wakeup, timeout and signal-mask handling, and close/reuse races. Within the
+supported target types and qualified Windows environment, no further practical
+core epoll behavior gap was identified. Remaining differences are the explicit
+platform and architectural constraints recorded in the README and design
+notes.
 
 The August 1, 2026 eager-socket-ADD, racing-MOD, current-terminal, and
 synchronous-pipe-fallback qualification used Windows 10.0.19044, MSYS2 MinGW

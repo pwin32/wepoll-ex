@@ -1584,6 +1584,102 @@ static DWORD WINAPI close_wait_thread(void *opaque)
     return 0;
 }
 
+typedef struct empty_add_wait_context {
+    int epfd;
+    HANDLE started;
+    int result;
+    int error;
+    struct epoll_event event;
+} empty_add_wait_context_t;
+
+static DWORD WINAPI empty_add_wait_thread(void *opaque)
+{
+    empty_add_wait_context_t *context =
+        (empty_add_wait_context_t *)opaque;
+
+    SetEvent(context->started);
+    errno = 0;
+    context->result = epoll_wait(context->epfd, &context->event, 1, 4000);
+    context->error = errno;
+    return 0;
+}
+
+static void test_empty_wait_concurrent_add(void)
+{
+    const uint64_t data = UINT64_C(0x454d505459414444);
+    tcp_pair_t pair;
+    empty_add_wait_context_t context;
+    struct epoll_event event;
+    HANDLE thread = NULL;
+    int epfd = -1;
+    int registered = 0;
+    int ok = 0;
+    char byte = 0;
+
+    TEST("concurrent ready ADD wakes an empty epoll wait");
+    memset(&context, 0, sizeof(context));
+    if (make_tcp_pair(&pair) != 0) {
+        FAIL("pair setup");
+        return;
+    }
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    context.epfd = epfd;
+    context.started = CreateEventA(NULL, TRUE, FALSE, NULL);
+    context.result = -2;
+    if (epfd < 0 || context.started == NULL) {
+        goto cleanup;
+    }
+    thread = CreateThread(NULL, 0, empty_add_wait_thread,
+                          &context, 0, NULL);
+    if (thread == NULL ||
+        WaitForSingleObject(context.started, 2000) != WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+    Sleep(100);
+    if (WaitForSingleObject(thread, 0) != WAIT_TIMEOUT ||
+        send(pair.client, "a", 1, 0) != 1) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = data;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0 ||
+        context.result != 1 || context.event.events != EPOLLIN ||
+        context.event.data.u64 != data ||
+        recv(pair.server, &byte, 1, 0) != 1 || byte != 'a') {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    if (registered && epfd >= 0 &&
+        epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL) != 0) {
+        ok = 0;
+    }
+    if (epfd >= 0) {
+        if (wepoll_close(epfd) != 0) ok = 0;
+        epfd = -1;
+    }
+    if (thread != NULL &&
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0) {
+        TerminateThread(thread, 1);
+        ok = 0;
+    }
+    if (thread != NULL) CloseHandle(thread);
+    if (context.started != NULL) CloseHandle(context.started);
+    tcp_pair_close(&pair);
+    if (!ok) {
+        errno = context.error != 0 ? context.error : errno;
+        FAIL("empty wait concurrent ADD");
+        return;
+    }
+    PASS();
+}
+
 static void test_concurrent_close(void)
 {
     close_wait_context_t context;
@@ -1782,6 +1878,7 @@ int main(void)
     test_oneshot_native_close_cleanup();
     test_batch_safety();
     test_epfd_collision_and_reuse();
+    test_empty_wait_concurrent_add();
     test_concurrent_close();
     test_bounded_wait_under_contention();
 
