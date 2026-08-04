@@ -49,6 +49,13 @@ The staged work needed to qualify explicit edge rearming, notification,
 lifetime ownership, error bridging, probe optimization, and multiworker
 behavior is tracked in `docs/COMPATIBILITY_ROADMAP.md`.
 
+The library now contains the first explicit-rearm primitive described by that
+roadmap, but the checked-in adapter does not use it.  A native-module-style
+experiment must acknowledge READ/WRITE after the corresponding nginx handler
+actually drains, including after posted handlers rather than merely after
+`process_events()` returns.  The exact compatibility analysis and API contract
+are in `docs/NGINX_NATIVE_EPOLL_PORT.md`.
+
 Abortive TCP reset delivery now guarantees both `EPOLLERR` and `EPOLLHUP`.
 The adapter's existing terminal-event path treats either bit as readable and
 writable so nginx can run both active handlers; graceful peer half-close stays

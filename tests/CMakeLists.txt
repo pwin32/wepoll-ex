@@ -242,6 +242,7 @@ else()
                 aux-add-lazy
                 failed-mod
                 failed-rearm
+                explicit-rearm-state
                 pending-metadata-mod
                 pending-narrowing-mod
                 pending-expansion-mod
@@ -372,6 +373,10 @@ else()
             readable
             same-epfd-et
             writable
+            explicit-rearm
+            explicit-terminal
+            explicit-fin
+            explicit-contract
             exclusive-mod
             exclusive-wake
             exclusive-et

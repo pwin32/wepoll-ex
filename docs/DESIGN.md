@@ -466,6 +466,28 @@ temporary fallback signal mask before unwinding.
   observations and losing exclusive claims use a short deferred retry instead
   of a tight immediate-completion loop. Pipe and waitable ET use the adapter-
   specific readiness observations described above.
+- A Windows port created with `WEPOLL_EX_CREATE_EXPLICIT_REARM` gives socket
+  `EPOLLET` a separate readiness-class ownership contract. Delivery disables
+  READ or WRITE while leaving undelivered classes in the next AFD mask;
+  `EPOLLERR`/`EPOLLHUP` disables READ, WRITE, and TERMINAL together.
+  `epoll_rearm_classes()` clears selected disarms and the corresponding
+  observed bits. If its expanded AFD mask is not covered by an in-flight
+  request, cancellation either wins and completion rearms the new mask or
+  loses and the queued completion refreshes uncovered interest before
+  delivery. An incompletely drained class therefore redelivers its current
+  level exactly once per acknowledgement, while a drained submission remains
+  pending across the next transition. A successful MOD clears every disarm;
+  DEL may retire pending or fully idle state. The operation returns `EBUSY`
+  while a ready node has not yet been consumed, and `epoll_rearm()` is the
+  all-class shorthand after consumption.
+
+  This mode is socket-only and initially rejects ET combined with ONESHOT or
+  EXCLUSIVE. A terminal delivery can remove every AFD interest, so explicit
+  users must issue DEL before `closesocket()` instead of relying on an idle
+  native-close probe. POSIX reports the creation flag and class-rearm API as
+  unsupported. The mode supplies a deterministic drain/ack primitive for an
+  nginx experiment; nginx still needs per-handler rearm hooks and cannot use
+  its unmodified Linux module.
 - `EPOLLEXCLUSIVE` applies only to socket registrations and may be set only by
   ADD. It may be combined with `EPOLLET`, but not with `EPOLLONESHOT`,
   `EPOLLRDHUP`, or unsupported event bits. Every MOD of a registration added

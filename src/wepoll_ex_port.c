@@ -68,11 +68,18 @@ static void ep_port_store_proc(void *target, size_t target_size, FARPROC proc)
  * claims; one process-wide mutex serializes ownership across independent
  * ports. */
 #define EP_EXCLUSIVE_CLAIM_BUCKETS 128U
-#define EP_EXCLUSIVE_CLASS_READ      UINT8_C(0x01)
-#define EP_EXCLUSIVE_CLASS_WRITE     UINT8_C(0x02)
-#define EP_EXCLUSIVE_CLASS_TERMINAL  UINT8_C(0x04)
+#define EP_READINESS_CLASS_READ      UINT8_C(0x01)
+#define EP_READINESS_CLASS_WRITE     UINT8_C(0x02)
+#define EP_READINESS_CLASS_TERMINAL  UINT8_C(0x04)
 static ep_sock_t *g_exclusive_claim_buckets[EP_EXCLUSIVE_CLAIM_BUCKETS];
 static pthread_mutex_t g_exclusive_lock = PTHREAD_MUTEX_INITIALIZER;
+
+_Static_assert(WEPOLL_EX_REARM_READ == EP_READINESS_CLASS_READ,
+               "public/internal read-class values differ");
+_Static_assert(WEPOLL_EX_REARM_WRITE == EP_READINESS_CLASS_WRITE,
+               "public/internal write-class values differ");
+_Static_assert(WEPOLL_EX_REARM_TERMINAL == EP_READINESS_CLASS_TERMINAL,
+               "public/internal terminal-class values differ");
 
 static unsigned ep_exclusive_bucket(SOCKET base)
 {
@@ -82,49 +89,82 @@ static unsigned ep_exclusive_bucket(SOCKET base)
     return (unsigned)(value % EP_EXCLUSIVE_CLAIM_BUCKETS);
 }
 
-static uint8_t ep_exclusive_classes(uint32_t delivered)
+static uint8_t ep_readiness_classes(uint32_t delivered)
 {
     uint8_t classes = 0;
 
     if ((delivered &
          (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP | EPOLLPRI)) != 0) {
-        classes |= EP_EXCLUSIVE_CLASS_READ;
+        classes |= EP_READINESS_CLASS_READ;
     }
     if ((delivered & (EPOLLOUT | EPOLLWRNORM)) != 0) {
-        classes |= EP_EXCLUSIVE_CLASS_WRITE;
+        classes |= EP_READINESS_CLASS_WRITE;
     }
     if ((delivered & (EPOLLERR | EPOLLHUP)) != 0) {
-        classes |= EP_EXCLUSIVE_CLASS_TERMINAL;
+        classes |= EP_READINESS_CLASS_TERMINAL;
     }
     return classes;
 }
 
-static uint32_t ep_exclusive_class_afd_events(uint8_t readiness_class)
+static uint32_t ep_readiness_class_afd_events(uint8_t readiness_class)
 {
     switch (readiness_class) {
-    case EP_EXCLUSIVE_CLASS_READ:
-        return AFD_POLL_RECEIVE | AFD_POLL_ACCEPT | AFD_POLL_DISCONNECT;
-    case EP_EXCLUSIVE_CLASS_WRITE:
+    case EP_READINESS_CLASS_READ:
+        return AFD_POLL_RECEIVE | AFD_POLL_RECEIVE_EXPEDITED |
+               AFD_POLL_ACCEPT | AFD_POLL_DISCONNECT;
+    case EP_READINESS_CLASS_WRITE:
         return AFD_POLL_SEND;
-    case EP_EXCLUSIVE_CLASS_TERMINAL:
+    case EP_READINESS_CLASS_TERMINAL:
         return AFD_POLL_ABORT | AFD_POLL_CONNECT_FAIL | AFD_POLL_LOCAL_CLOSE;
     default:
         return 0;
     }
 }
 
-static void ep_exclusive_filter_classes(uint32_t *delivered,
+static void ep_readiness_filter_classes(uint32_t *delivered,
                                         uint8_t denied_classes)
 {
-    if ((denied_classes & EP_EXCLUSIVE_CLASS_READ) != 0) {
+    if ((denied_classes & EP_READINESS_CLASS_READ) != 0) {
         *delivered &= ~(EPOLLIN | EPOLLRDNORM | EPOLLRDHUP | EPOLLPRI);
     }
-    if ((denied_classes & EP_EXCLUSIVE_CLASS_WRITE) != 0) {
+    if ((denied_classes & EP_READINESS_CLASS_WRITE) != 0) {
         *delivered &= ~(EPOLLOUT | EPOLLWRNORM);
     }
-    if ((denied_classes & EP_EXCLUSIVE_CLASS_TERMINAL) != 0) {
+    if ((denied_classes & EP_READINESS_CLASS_TERMINAL) != 0) {
         *delivered &= ~(EPOLLERR | EPOLLHUP);
     }
+}
+
+static uint32_t ep_readiness_classes_afd_events(uint8_t classes)
+{
+    uint32_t afd_events = 0;
+
+    for (uint8_t bit = EP_READINESS_CLASS_READ;
+         bit <= EP_READINESS_CLASS_TERMINAL; bit <<= 1) {
+        if ((classes & bit) != 0) {
+            afd_events |= ep_readiness_class_afd_events(bit);
+        }
+    }
+    return afd_events;
+}
+
+static uint8_t ep_explicit_delivery_classes(uint32_t delivered)
+{
+    uint8_t classes = ep_readiness_classes(delivered);
+
+    /* A terminal condition supersedes both directional states.  Keep the
+     * registration completely idle while the application closes it or
+     * deliberately rearms the directions that remain meaningful. */
+    if ((classes & EP_READINESS_CLASS_TERMINAL) != 0) {
+        classes |= EP_READINESS_CLASS_READ | EP_READINESS_CLASS_WRITE;
+    }
+    return classes;
+}
+
+static int ep_sock_explicit_rearm_enabled(const ep_sock_t *sock)
+{
+    return sock->port->explicit_rearm && sock->kind == EP_REG_SOCKET &&
+           (sock->user_flags & EPOLLET) != 0;
 }
 
 static void ep_exclusive_unlink_locked(ep_sock_t *sock)
@@ -201,9 +241,16 @@ static uint8_t ep_exclusive_quiescent_classes(uint32_t submitted_afd_events)
 {
     uint8_t classes = 0;
 
-    for (uint8_t bit = EP_EXCLUSIVE_CLASS_READ;
-         bit <= EP_EXCLUSIVE_CLASS_TERMINAL; bit <<= 1) {
-        uint32_t class_events = ep_exclusive_class_afd_events(bit);
+    for (uint8_t bit = EP_READINESS_CLASS_READ;
+         bit <= EP_READINESS_CLASS_TERMINAL; bit <<= 1) {
+        uint32_t class_events = ep_readiness_class_afd_events(bit);
+
+        if (bit == EP_READINESS_CLASS_READ) {
+            /* Linux excludes EPOLLPRI from an EPOLLEXCLUSIVE ADD mask, so a
+             * normal read request proves quiescence without expedited-read
+             * coverage.  Explicit rearm still treats priority as READ. */
+            class_events &= ~AFD_POLL_RECEIVE_EXPEDITED;
+        }
 
         if ((class_events & ~submitted_afd_events) == 0) {
             classes |= bit;
@@ -215,7 +262,7 @@ static uint8_t ep_exclusive_quiescent_classes(uint32_t submitted_afd_events)
 static int ep_exclusive_try_claim(ep_sock_t *sock, uint32_t *delivered)
 {
     SOCKET base = sock->base_socket;
-    uint8_t requested_classes = ep_exclusive_classes(*delivered);
+    uint8_t requested_classes = ep_readiness_classes(*delivered);
     uint8_t denied_classes = 0;
     uint8_t owned_classes = 0;
     uint8_t granted_classes;
@@ -240,17 +287,17 @@ static int ep_exclusive_try_claim(ep_sock_t *sock, uint32_t *delivered)
         claim_classes = claim->exclusive_claim_classes;
         if (claim == sock) {
             owned_classes |= claim_classes;
-            if ((claim_classes & EP_EXCLUSIVE_CLASS_TERMINAL) != 0) {
+            if ((claim_classes & EP_READINESS_CLASS_TERMINAL) != 0) {
                 owner_terminal = 1;
             }
-        } else if ((claim_classes & EP_EXCLUSIVE_CLASS_TERMINAL) != 0) {
+        } else if ((claim_classes & EP_READINESS_CLASS_TERMINAL) != 0) {
             peer_terminal = 1;
-        } else if ((requested_classes & EP_EXCLUSIVE_CLASS_TERMINAL) == 0) {
+        } else if ((requested_classes & EP_READINESS_CLASS_TERMINAL) == 0) {
             denied_classes |= claim_classes & requested_classes;
         }
     }
 
-    if ((requested_classes & EP_EXCLUSIVE_CLASS_TERMINAL) != 0) {
+    if ((requested_classes & EP_READINESS_CLASS_TERMINAL) != 0) {
         if (peer_terminal) {
             denied_classes = requested_classes;
         } else {
@@ -263,8 +310,8 @@ static int ep_exclusive_try_claim(ep_sock_t *sock, uint32_t *delivered)
 
                 if (claim->exclusive_claim_base == base) {
                     ep_exclusive_remove_classes_locked(
-                        claim, EP_EXCLUSIVE_CLASS_READ |
-                                   EP_EXCLUSIVE_CLASS_WRITE);
+                        claim, EP_READINESS_CLASS_READ |
+                                   EP_READINESS_CLASS_WRITE);
                 }
                 claim = next;
             }
@@ -280,14 +327,14 @@ static int ep_exclusive_try_claim(ep_sock_t *sock, uint32_t *delivered)
     }
     if (owner_terminal) {
         missing_classes = 0;
-    } else if ((granted_classes & EP_EXCLUSIVE_CLASS_TERMINAL) != 0) {
+    } else if ((granted_classes & EP_READINESS_CLASS_TERMINAL) != 0) {
         /* One terminal claim covers every bit in this delivered snapshot. */
-        missing_classes = EP_EXCLUSIVE_CLASS_TERMINAL;
+        missing_classes = EP_READINESS_CLASS_TERMINAL;
     } else {
         missing_classes = granted_classes & (uint8_t)~owned_classes;
     }
     ep_exclusive_add_classes_locked(sock, base, missing_classes);
-    ep_exclusive_filter_classes(delivered, denied_classes);
+    ep_readiness_filter_classes(delivered, denied_classes);
     pthread_mutex_unlock(&g_exclusive_lock);
     return 1;
 }
@@ -2802,7 +2849,8 @@ static void ep_sock_drop_closed_locked(ep_port_t *port, ep_sock_t *sock)
 
 static uint32_t ep_sock_afd_events_for_state_locked(
     ep_sock_t *sock, uint32_t user_events,
-    uint8_t udp_readless_receive_parked)
+    uint8_t udp_readless_receive_parked,
+    uint8_t explicit_disarmed_classes)
 {
     uint32_t afd_events = ep_epoll_to_afd_events(user_events);
 
@@ -2829,6 +2877,8 @@ static uint32_t ep_sock_afd_events_for_state_locked(
 #else
     (void)sock;
 #endif
+    afd_events &= ~ep_readiness_classes_afd_events(
+        explicit_disarmed_classes);
     return afd_events;
 }
 
@@ -2836,7 +2886,9 @@ static uint32_t ep_sock_afd_events_locked(ep_sock_t *sock,
                                           uint32_t user_events)
 {
     return ep_sock_afd_events_for_state_locked(
-        sock, user_events, sock->udp_readless_receive_parked);
+        sock, user_events, sock->udp_readless_receive_parked,
+        ep_sock_explicit_rearm_enabled(sock)
+            ? sock->explicit_disarmed_classes : 0);
 }
 
 #ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
@@ -3076,6 +3128,15 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated,
      * preparing submissions. */
     sock->et_holdoff = 0;
     uint32_t afd_events = ep_sock_afd_events_locked(sock, sock->user_events);
+    if (afd_events == 0) {
+        /* Explicit terminal delivery can intentionally disarm every native
+         * class.  Keep the registration installed but do not submit a zero-
+         * interest AFD request; the embedder must rearm or DEL it. */
+        ep_sock_set_needs_rearm_locked(sock, 0);
+        atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                              memory_order_relaxed);
+        return 0;
+    }
     int poll_pending = 0;
     old_submitted_wait_epoch = sock->submitted_wait_epoch;
     sock->submitted_wait_epoch = atomic_load_explicit(
@@ -3646,6 +3707,13 @@ process_socket_snapshot:
     }
     if (sock->kind == EP_REG_SOCKET)
         ep_socket_merge_current_levels(sock, &delivered);
+    if (ep_sock_explicit_rearm_enabled(sock)) {
+        /* A stale completion or the current-level merge can still contain a
+         * class that another delivery already disarmed.  Filter it before the
+         * ordinary ET latch so no unacknowledged class reaches the caller. */
+        ep_readiness_filter_classes(
+            &delivered, sock->explicit_disarmed_classes);
+    }
     if (sock->kind == EP_REG_SOCKET &&
         (sock->user_flags & (EPOLLET | EPOLLEXCLUSIVE)) != 0) {
         int sample_all = (sock->user_flags & EPOLLEXCLUSIVE) != 0;
@@ -3663,11 +3731,11 @@ process_socket_snapshot:
         }
         if (read_ready == 0) {
             delivered &= ~(EPOLLIN | EPOLLRDNORM | EPOLLRDHUP);
-            inactive_classes |= EP_EXCLUSIVE_CLASS_READ;
+            inactive_classes |= EP_READINESS_CLASS_READ;
         }
         if (write_ready == 0) {
             delivered &= ~(EPOLLOUT | EPOLLWRNORM);
-            inactive_classes |= EP_EXCLUSIVE_CLASS_WRITE;
+            inactive_classes |= EP_READINESS_CLASS_WRITE;
         }
         if (sample_all && inactive_classes != 0) {
             ep_exclusive_release_inactive(sock, inactive_classes);
@@ -3791,6 +3859,11 @@ process_socket_snapshot:
         return;
     }
     node->events = delivered;
+
+    if (ep_sock_explicit_rearm_enabled(sock)) {
+        sock->explicit_disarmed_classes |=
+            ep_explicit_delivery_classes(delivered);
+    }
 
     sock->pending_events = delivered;
     sock->et_holdoff = 0;
@@ -3959,6 +4032,8 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     }
 
     port->close_on_exec = (flags & EPOLL_CLOEXEC) != 0;
+    port->explicit_rearm =
+        (flags & WEPOLL_EX_CREATE_EXPLICIT_REARM) != 0;
     atomic_init(&port->waiter_active, 0);
     atomic_init(&port->active_wait_epoch, 0);
     atomic_init(&port->waiter_coalescing, 0);
@@ -4453,8 +4528,27 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
     sock->user_data = data;
     sock->user_ctx = ctx;
     sock->observed_events = 0;
+    sock->explicit_disarmed_classes = 0;
     sock->pipe_terminal_delivered = 0;
     sock->et_holdoff = 0;
+    if (port->explicit_rearm && (flags & EPOLLET) != 0) {
+        if (sock->kind != EP_REG_SOCKET) {
+            if (sock->afd_info != NULL) {
+                ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
+            }
+            free(sock);
+            pthread_mutex_unlock(&port->fd_table_lock);
+            ep_set_errno(EOPNOTSUPP);
+            return -1;
+        }
+        if ((flags & (EPOLLONESHOT | EPOLLEXCLUSIVE)) != 0) {
+            ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
+            free(sock);
+            pthread_mutex_unlock(&port->fd_table_lock);
+            ep_set_errno(EINVAL);
+            return -1;
+        }
+    }
     if ((sock->kind == EP_REG_WAITABLE || sock->kind == EP_REG_PIPE) &&
         (flags & EPOLLEXCLUSIVE) != 0) {
         /* Exclusive wake is defined for AFD socket polls only. */
@@ -4527,6 +4621,7 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     uint32_t old_ready_queued;
     uint32_t old_state;
     uint32_t old_observed_events;
+    uint8_t old_explicit_disarmed_classes;
     uint32_t old_user_events;
     uint32_t old_user_flags;
     uint32_t new_afd_events;
@@ -4576,10 +4671,22 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
             return -1;
         }
     }
+    if (port->explicit_rearm && (flags & EPOLLET) != 0) {
+        if (sock->kind != EP_REG_SOCKET) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            ep_set_errno(EOPNOTSUPP);
+            return -1;
+        }
+        if ((flags & EPOLLONESHOT) != 0) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            ep_set_errno(EINVAL);
+            return -1;
+        }
+    }
 
     /* Every MOD is a fresh readiness scan.  Compute the requested mask as if
      * a previously parked readless UDP receive were active again. */
-    new_afd_events = ep_sock_afd_events_for_state_locked(sock, events, 0);
+    new_afd_events = ep_sock_afd_events_for_state_locked(sock, events, 0, 0);
     poll_status = atomic_load_explicit(&sock->poll_status,
                                        memory_order_relaxed);
     if (poll_status == EP_POLL_PENDING) {
@@ -4619,6 +4726,7 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     old_user_ctx = sock->user_ctx;
     old_pending_events = sock->pending_events;
     old_observed_events = sock->observed_events;
+    old_explicit_disarmed_classes = sock->explicit_disarmed_classes;
     old_oneshot_fired = sock->oneshot_fired;
     old_needs_rearm = sock->needs_rearm;
     old_pipe_terminal_delivered = sock->pipe_terminal_delivered;
@@ -4670,6 +4778,7 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     /* MOD resets edge observation so a newly requested interest can form a
      * fresh edge against the current level. */
     sock->observed_events = 0;
+    sock->explicit_disarmed_classes = 0;
     sock->pipe_terminal_delivered = 0;
     sock->et_holdoff = 0;
     sock->udp_readless_receive_parked = 0;
@@ -4745,6 +4854,8 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
             sock->user_ctx = old_user_ctx;
             sock->pending_events = old_pending_events;
             sock->observed_events = old_observed_events;
+            sock->explicit_disarmed_classes =
+                old_explicit_disarmed_classes;
             ep_sock_set_oneshot_fired_locked(sock, old_oneshot_fired);
             ep_sock_set_needs_rearm_locked(sock, old_needs_rearm);
             sock->pipe_terminal_delivered = old_pipe_terminal_delivered;
@@ -4820,6 +4931,124 @@ int ep_port_unregister(ep_port_t *port, SOCKET fd)
     return 0;
 }
 
+static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
+                                        uint8_t classes)
+{
+    uint8_t old_disarmed = sock->explicit_disarmed_classes;
+    uint8_t new_disarmed = old_disarmed & (uint8_t)~classes;
+    uint8_t old_needs_rearm = sock->needs_rearm;
+    uint8_t old_et_holdoff = sock->et_holdoff;
+    uint8_t old_udp_readless_receive_parked =
+        sock->udp_readless_receive_parked;
+    uint32_t old_observed_events = sock->observed_events;
+    uint32_t old_state = atomic_load_explicit(&sock->state,
+                                               memory_order_relaxed);
+    uint32_t new_afd_events;
+    uint32_t poll_status;
+    int pending_poll_covers_request = 0;
+
+    if (atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) != 0) {
+        ep_set_errno(EBUSY);
+        return -1;
+    }
+    if (new_disarmed == old_disarmed) {
+        return 0;
+    }
+
+    if ((classes & (EP_READINESS_CLASS_READ |
+                    EP_READINESS_CLASS_TERMINAL)) != 0) {
+        /* A read/terminal acknowledgement starts a fresh receive-error
+         * qualification opportunity for connected UDP sockets. */
+        sock->udp_readless_receive_parked = 0;
+    }
+    new_afd_events = ep_sock_afd_events_for_state_locked(
+        sock, sock->user_events, sock->udp_readless_receive_parked,
+        new_disarmed);
+    poll_status = atomic_load_explicit(&sock->poll_status,
+                                       memory_order_relaxed);
+    if (poll_status == EP_POLL_PENDING) {
+        if ((new_afd_events & ~sock->submitted_afd_events) == 0) {
+            pending_poll_covers_request = 1;
+        } else if (ep_sock_cancel_locked(sock) != 0) {
+            sock->udp_readless_receive_parked =
+                old_udp_readless_receive_parked;
+            return -1;
+        }
+    }
+
+    sock->explicit_disarmed_classes = new_disarmed;
+    ep_readiness_filter_classes(&sock->observed_events, classes);
+    sock->et_holdoff = 0;
+    if (!pending_poll_covers_request) {
+        ep_sock_set_needs_rearm_locked(sock, new_afd_events != 0);
+    }
+
+    if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
+            EP_POLL_IDLE &&
+        new_afd_events != 0 &&
+        atomic_load_explicit(&port->waiter_active, memory_order_acquire) &&
+        !atomic_load_explicit(&port->waiter_coalescing,
+                              memory_order_acquire)) {
+        int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
+
+        if (submit_result > 0) {
+            int saved_errno = ep_last_err();
+
+            ep_set_errno(saved_errno);
+            return -1;
+        }
+        if (submit_result < 0) {
+            int saved_errno = ep_last_err();
+
+            sock->explicit_disarmed_classes = old_disarmed;
+            sock->observed_events = old_observed_events;
+            ep_sock_set_needs_rearm_locked(sock, old_needs_rearm);
+            sock->et_holdoff = old_et_holdoff;
+            sock->udp_readless_receive_parked =
+                old_udp_readless_receive_parked;
+            atomic_store_explicit(&sock->state, old_state,
+                                  memory_order_relaxed);
+            ep_set_errno(saved_errno);
+            return -1;
+        }
+    }
+
+    atomic_fetch_add_explicit(&port->generation, 1, memory_order_relaxed);
+    return 0;
+}
+
+int ep_port_rearm_classes(ep_port_t *port, SOCKET fd, uint32_t classes)
+{
+    int result;
+
+    if (classes == 0 || (classes & ~WEPOLL_EX_REARM_ALL) != 0) {
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    ep_sock_t *sock = ep_fd_table_lookup(port, fd);
+    if (sock == NULL) {
+        result = ep_target_fail_absent(fd);
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return result;
+    }
+    if (ep_sock_validate_control_locked(port, sock) != 0) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return -1;
+    }
+    if (!ep_sock_explicit_rearm_enabled(sock)) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        ep_set_errno(EOPNOTSUPP);
+        return -1;
+    }
+
+    result = ep_sock_rearm_classes_locked(port, sock, (uint8_t)classes);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    return result;
+}
+
 int ep_port_rearm(ep_port_t *port, SOCKET fd)
 {
     uint32_t old_pending_events;
@@ -4850,6 +5079,13 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     if (ep_sock_validate_control_locked(port, sock) != 0) {
         pthread_mutex_unlock(&port->fd_table_lock);
         return -1;
+    }
+    if (ep_sock_explicit_rearm_enabled(sock)) {
+        int result = ep_sock_rearm_classes_locked(
+            port, sock, (uint8_t)WEPOLL_EX_REARM_ALL);
+
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return result;
     }
     if (!sock->oneshot_fired) {
         pthread_mutex_unlock(&port->fd_table_lock);
@@ -5043,7 +5279,13 @@ static int ep_drain_to_buffer(ep_port_t *port,
                      * their delivered ET registrations stay idle until a
                      * later MOD explicitly starts a fresh observation. */
                     sock->et_holdoff = 0;
-                    ep_sock_set_needs_rearm_locked(sock, 1);
+                    if (ep_sock_explicit_rearm_enabled(sock) &&
+                        ep_sock_afd_events_locked(sock,
+                                                  sock->user_events) == 0) {
+                        ep_sock_set_needs_rearm_locked(sock, 0);
+                    } else {
+                        ep_sock_set_needs_rearm_locked(sock, 1);
+                    }
                 }
                 if (delivered == 0 &&
                     maxevents > EP_WAIT_COALESCE_THRESHOLD) {

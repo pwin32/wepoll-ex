@@ -79,6 +79,28 @@ static int wait_one(int epfd, int timeout_ms, uint32_t *events_out,
     return 1;
 }
 
+static int drain_nonblocking_socket(SOCKET socket_fd)
+{
+    char buffer[64];
+    int total = 0;
+
+    for (;;) {
+        int received = recv(socket_fd, buffer, (int)sizeof(buffer), 0);
+
+        if (received > 0) {
+            total += received;
+            continue;
+        }
+        if (received == 0) {
+            return total;
+        }
+        if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            return total;
+        }
+        return -1;
+    }
+}
+
 typedef struct multi_wait_context {
     int epfd;
     HANDLE started;
@@ -378,6 +400,396 @@ static int test_edge_writable_no_spin(void)
 
 fail:
     if (epfd >= 0) (void)wepoll_close(epfd);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return 1;
+}
+
+static int test_explicit_rearm_directional(void)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    uint32_t events = 0;
+    int epfd = -1;
+    int registered = 0;
+    int n;
+
+    if (make_loopback_pair(&listener, &client, &accepted) != 0) {
+        fputs("explicit-rearm: pair setup failed\n", stderr);
+        return 1;
+    }
+    epfd = epoll_create_ex(0, WEPOLL_EX_CREATE_EXPLICIT_REARM);
+    if (epfd < 0) {
+        fprintf(stderr, "explicit-rearm: create failed errno=%d\n", errno);
+        goto fail;
+    }
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLOUT | EPOLLET;
+    event.data.u64 = UINT64_C(0x4558504c49434954);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0) {
+        fprintf(stderr, "explicit-rearm: ADD failed errno=%d\n", errno);
+        goto fail;
+    }
+    registered = 1;
+
+    n = wait_one(epfd, 1000, &events, NULL);
+    if (n != 1 || (events & EPOLLOUT) == 0) {
+        fprintf(stderr,
+                "explicit-rearm: initial writable n=%d events=0x%08lx\n",
+                n, (unsigned long)events);
+        goto fail;
+    }
+    if (wait_one(epfd, 50, &events, NULL) != 0) {
+        fputs("explicit-rearm: writable class redelivered\n", stderr);
+        goto fail;
+    }
+
+    if (send(client, "abc", 3, 0) != 3) {
+        fputs("explicit-rearm: first send failed\n", stderr);
+        goto fail;
+    }
+    n = wait_one(epfd, 1000, &events, NULL);
+    if (n != 1 || (events & EPOLLIN) == 0 ||
+        (events & EPOLLOUT) != 0) {
+        fprintf(stderr,
+                "explicit-rearm: read class n=%d events=0x%08lx\n",
+                n, (unsigned long)events);
+        goto fail;
+    }
+
+    if (send(client, "d", 1, 0) != 1 ||
+        wait_one(epfd, 50, &events, NULL) != 0) {
+        fputs("explicit-rearm: unread level redelivered before ack\n", stderr);
+        goto fail;
+    }
+    if (epoll_rearm_classes(epfd, accepted, WEPOLL_EX_REARM_READ) != 0) {
+        fprintf(stderr, "explicit-rearm: read ack failed errno=%d\n", errno);
+        goto fail;
+    }
+    n = wait_one(epfd, 1000, &events, NULL);
+    if (n != 1 || (events & EPOLLIN) == 0 ||
+        (events & EPOLLOUT) != 0) {
+        fprintf(stderr,
+                "explicit-rearm: incomplete drain n=%d events=0x%08lx\n",
+                n, (unsigned long)events);
+        goto fail;
+    }
+    if (drain_nonblocking_socket(accepted) != 4 ||
+        epoll_rearm_classes(epfd, accepted,
+                            WEPOLL_EX_REARM_READ) != 0 ||
+        wait_one(epfd, 50, &events, NULL) != 0) {
+        fputs("explicit-rearm: drained read did not stay pending\n", stderr);
+        goto fail;
+    }
+
+    if (send(client, "e", 1, 0) != 1) {
+        fputs("explicit-rearm: second send failed\n", stderr);
+        goto fail;
+    }
+    n = wait_one(epfd, 1000, &events, NULL);
+    if (n != 1 || (events & EPOLLIN) == 0 ||
+        (events & EPOLLOUT) != 0 ||
+        drain_nonblocking_socket(accepted) != 1) {
+        fprintf(stderr,
+                "explicit-rearm: second read n=%d events=0x%08lx\n",
+                n, (unsigned long)events);
+        goto fail;
+    }
+
+    if (epoll_rearm_classes(epfd, accepted, WEPOLL_EX_REARM_READ) != 0 ||
+        epoll_rearm_classes(epfd, accepted, WEPOLL_EX_REARM_WRITE) != 0) {
+        fprintf(stderr,
+                "explicit-rearm: duplex ack failed errno=%d\n", errno);
+        goto fail;
+    }
+    n = wait_one(epfd, 1000, &events, NULL);
+    if (n != 1 || (events & EPOLLOUT) == 0 ||
+        (events & EPOLLIN) != 0 ||
+        wait_one(epfd, 50, &events, NULL) != 0) {
+        fprintf(stderr,
+                "explicit-rearm: writable ack n=%d events=0x%08lx\n",
+                n, (unsigned long)events);
+        goto fail;
+    }
+
+    event.data.u64++;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, accepted, &event) != 0) {
+        fprintf(stderr, "explicit-rearm: MOD failed errno=%d\n", errno);
+        goto fail;
+    }
+    n = wait_one(epfd, 1000, &events, NULL);
+    if (n != 1 || (events & EPOLLOUT) == 0 ||
+        wait_one(epfd, 50, &events, NULL) != 0) {
+        fprintf(stderr,
+                "explicit-rearm: MOD did not reset disarms n=%d events=0x%08lx\n",
+                n, (unsigned long)events);
+        goto fail;
+    }
+    if (epoll_rearm(epfd, accepted) != 0) {
+        fprintf(stderr, "explicit-rearm: all-class ack failed errno=%d\n",
+                errno);
+        goto fail;
+    }
+    n = wait_one(epfd, 1000, &events, NULL);
+    if (n != 1 || (events & EPOLLOUT) == 0 ||
+        wait_one(epfd, 50, &events, NULL) != 0) {
+        fprintf(stderr,
+                "explicit-rearm: all-class redelivery n=%d events=0x%08lx\n",
+                n, (unsigned long)events);
+        goto fail;
+    }
+
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL) != 0) {
+        fprintf(stderr, "explicit-rearm: DEL failed errno=%d\n", errno);
+        goto fail;
+    }
+    registered = 0;
+    (void)wepoll_close(epfd);
+    closesocket(accepted);
+    closesocket(client);
+    closesocket(listener);
+    puts("explicit-rearm: directional, incomplete-drain, MOD, and DEL OK");
+    return 0;
+
+fail:
+    if (registered && epfd >= 0)
+        (void)epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL);
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return 1;
+}
+
+static int test_explicit_rearm_terminal(void)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    struct linger reset = { 1, 0 };
+    uint32_t events = 0;
+    int epfd = -1;
+    int registered = 0;
+    int n;
+
+    if (make_loopback_pair(&listener, &client, &accepted) != 0) {
+        return 1;
+    }
+    epfd = epoll_create_ex(0, WEPOLL_EX_CREATE_EXPLICIT_REARM);
+    if (epfd < 0) goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+    event.data.u64 = UINT64_C(0x4558505445524d);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0) goto fail;
+    registered = 1;
+    if (wait_one(epfd, 1000, &events, NULL) != 1 ||
+        (events & EPOLLOUT) == 0 ||
+        setsockopt(client, SOL_SOCKET, SO_LINGER,
+                   (const char *)&reset, (int)sizeof(reset)) == SOCKET_ERROR) {
+        goto fail;
+    }
+    closesocket(client);
+    client = INVALID_SOCKET;
+
+    n = wait_one(epfd, 2000, &events, NULL);
+    if (n != 1 ||
+        (events & (EPOLLERR | EPOLLHUP)) != (EPOLLERR | EPOLLHUP)) {
+        fprintf(stderr,
+                "explicit-terminal: reset n=%d events=0x%08lx errno=%d\n",
+                n, (unsigned long)events, errno);
+        goto fail;
+    }
+    if (wait_one(epfd, 100, &events, NULL) != 0) {
+        fputs("explicit-terminal: persistent reset redelivered\n", stderr);
+        goto fail;
+    }
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL) != 0) goto fail;
+    registered = 0;
+
+    (void)wepoll_close(epfd);
+    closesocket(accepted);
+    closesocket(listener);
+    puts("explicit-terminal: terminal delivery idled until DEL");
+    return 0;
+
+fail:
+    if (registered && epfd >= 0)
+        (void)epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL);
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return 1;
+}
+
+static int test_explicit_rearm_fin(void)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    char byte;
+    uint32_t events = 0;
+    int epfd = -1;
+    int registered = 0;
+    int n;
+
+    if (make_loopback_pair(&listener, &client, &accepted) != 0) {
+        return 1;
+    }
+    epfd = epoll_create_ex(0, WEPOLL_EX_CREATE_EXPLICIT_REARM);
+    if (epfd < 0) goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
+    event.data.u64 = UINT64_C(0x45585046494e0001);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0) goto fail;
+    registered = 1;
+    if (shutdown(client, SD_SEND) == SOCKET_ERROR) goto fail;
+
+    n = wait_one(epfd, 2000, &events, NULL);
+    if (n != 1 || (events & (EPOLLIN | EPOLLRDHUP)) !=
+                      (EPOLLIN | EPOLLRDHUP) ||
+        (events & (EPOLLERR | EPOLLHUP)) != 0 ||
+        recv(accepted, &byte, 1, 0) != 0 ||
+        wait_one(epfd, 100, &events, NULL) != 0) {
+        fprintf(stderr,
+                "explicit-fin: first EOF n=%d events=0x%08lx errno=%d\n",
+                n, (unsigned long)events, errno);
+        goto fail;
+    }
+
+    if (epoll_rearm_classes(epfd, accepted, WEPOLL_EX_REARM_READ) != 0) {
+        fprintf(stderr, "explicit-fin: read ack failed errno=%d\n", errno);
+        goto fail;
+    }
+    n = wait_one(epfd, 2000, &events, NULL);
+    if (n != 1 || (events & (EPOLLIN | EPOLLRDHUP)) !=
+                      (EPOLLIN | EPOLLRDHUP) ||
+        (events & (EPOLLERR | EPOLLHUP)) != 0 ||
+        wait_one(epfd, 100, &events, NULL) != 0) {
+        fprintf(stderr,
+                "explicit-fin: rearmed EOF n=%d events=0x%08lx errno=%d\n",
+                n, (unsigned long)events, errno);
+        goto fail;
+    }
+
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL) != 0) goto fail;
+    registered = 0;
+    (void)wepoll_close(epfd);
+    closesocket(accepted);
+    closesocket(client);
+    closesocket(listener);
+    puts("explicit-fin: graceful EOF follows read-class acknowledgement");
+    return 0;
+
+fail:
+    if (registered && epfd >= 0)
+        (void)epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL);
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return 1;
+}
+
+static int test_explicit_rearm_contract(void)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    HANDLE event_handle = NULL;
+    struct epoll_event event;
+    int epfd = -1;
+    int ordinary_epfd = -1;
+    int registered = 0;
+
+    errno = 0;
+    if (epoll_create1(WEPOLL_EX_CREATE_EXPLICIT_REARM) != -1 ||
+        errno != EINVAL ||
+        make_loopback_pair(&listener, &client, &accepted) != 0) {
+        goto fail;
+    }
+    epfd = epoll_create_ex(0, WEPOLL_EX_CREATE_EXPLICIT_REARM);
+    ordinary_epfd = epoll_create1(0);
+    event_handle = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (epfd < 0 || ordinary_epfd < 0 || event_handle == NULL) goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != -1 ||
+        errno != EINVAL) {
+        goto fail;
+    }
+    event.events = EPOLLIN | EPOLLET | EPOLLEXCLUSIVE;
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != -1 ||
+        errno != EINVAL) {
+        goto fail;
+    }
+    event.events = EPOLLIN | EPOLLET;
+    errno = 0;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, (epoll_fd_t)event_handle,
+                  &event) != -1 || errno != EOPNOTSUPP) {
+        goto fail;
+    }
+
+    event.events = EPOLLIN;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0) goto fail;
+    registered = 1;
+    errno = 0;
+    if (epoll_rearm_classes(epfd, accepted, WEPOLL_EX_REARM_READ) != -1 ||
+        errno != EOPNOTSUPP ||
+        epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL) != 0) {
+        goto fail;
+    }
+    registered = 0;
+
+    event.events = EPOLLIN | EPOLLET;
+    if (epoll_ctl(ordinary_epfd, EPOLL_CTL_ADD, accepted, &event) != 0) {
+        goto fail;
+    }
+    registered = 2;
+    errno = 0;
+    if (epoll_rearm_classes(ordinary_epfd, accepted,
+                            WEPOLL_EX_REARM_READ) != -1 ||
+        errno != EOPNOTSUPP) {
+        goto fail;
+    }
+    errno = 0;
+    if (epoll_rearm_classes(ordinary_epfd, accepted, 0) != -1 ||
+        errno != EINVAL) {
+        goto fail;
+    }
+    if (epoll_ctl(ordinary_epfd, EPOLL_CTL_DEL, accepted, NULL) != 0) {
+        goto fail;
+    }
+    registered = 0;
+
+    (void)wepoll_close(ordinary_epfd);
+    (void)wepoll_close(epfd);
+    CloseHandle(event_handle);
+    closesocket(accepted);
+    closesocket(client);
+    closesocket(listener);
+    puts("explicit-contract: create and registration boundaries OK");
+    return 0;
+
+fail:
+    if (registered == 1 && epfd >= 0)
+        (void)epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL);
+    if (registered == 2 && ordinary_epfd >= 0)
+        (void)epoll_ctl(ordinary_epfd, EPOLL_CTL_DEL, accepted, NULL);
+    if (ordinary_epfd >= 0) (void)wepoll_close(ordinary_epfd);
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (event_handle != NULL) CloseHandle(event_handle);
     if (accepted != INVALID_SOCKET) closesocket(accepted);
     if (client != INVALID_SOCKET) closesocket(client);
     if (listener != INVALID_SOCKET) closesocket(listener);
@@ -1598,6 +2010,14 @@ static int run_mode(const char *mode)
         return test_same_epfd_et_single_wake();
     if (strcmp(mode, "writable") == 0)
         return test_edge_writable_no_spin();
+    if (strcmp(mode, "explicit-rearm") == 0)
+        return test_explicit_rearm_directional();
+    if (strcmp(mode, "explicit-terminal") == 0)
+        return test_explicit_rearm_terminal();
+    if (strcmp(mode, "explicit-fin") == 0)
+        return test_explicit_rearm_fin();
+    if (strcmp(mode, "explicit-contract") == 0)
+        return test_explicit_rearm_contract();
     if (strcmp(mode, "exclusive-mod") == 0)
         return test_exclusive_mod_rejected();
     if (strcmp(mode, "exclusive-wake") == 0)
@@ -1629,7 +2049,9 @@ int main(int argc, char **argv)
     WSADATA wsa;
     int failures = 0;
     const char *modes[] = {
-        "readable", "same-epfd-et", "writable", "exclusive-mod",
+        "readable", "same-epfd-et", "writable", "explicit-rearm",
+        "explicit-terminal", "explicit-fin", "explicit-contract",
+        "exclusive-mod",
         "exclusive-wake",
         "exclusive-et", "exclusive-mixed", "ordinary-multi",
         "ordinary-prearmed", "exclusive-disjoint", "exclusive-scale",

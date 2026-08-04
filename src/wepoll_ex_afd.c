@@ -156,6 +156,7 @@ static int ep_afd_poll_key_claim(ep_sock_t *sock, HANDLE base_target,
 
         for (;;) {
             HANDLE duplicate = NULL;
+            int force_collision;
 
             if (!DuplicateHandle(process,
                                  base_target,
@@ -169,8 +170,15 @@ static int ep_afd_poll_key_claim(ep_sock_t *sock, HANDLE base_target,
                 break;
             }
 
+            /* Fault builds can model arbitrary handle-table reuse without
+             * depending on the allocator selecting a particular freed
+             * numeric slot.  Ordinary builds compile this branch away. */
+            force_collision =
+                ep_fault_hit_through(EP_FAULT_AFD_KEY_FORCE_COLLISION) != 0;
+
             AcquireSRWLockExclusive(&g_afd_poll_key_lock);
-            if (!ep_afd_poll_key_is_active_locked(duplicate)) {
+            if (!force_collision &&
+                !ep_afd_poll_key_is_active_locked(duplicate)) {
                 ep_afd_poll_key_insert_locked(sock, duplicate);
                 ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
                 *duplicated_out = 1;

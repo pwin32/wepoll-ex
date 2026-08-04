@@ -92,6 +92,33 @@ int ep_fault_hit(ep_fault_point_t point)
     return -1;
 }
 
+int ep_fault_hit_through(ep_fault_point_t point)
+{
+    uint64_t bit;
+    uint64_t ordinal;
+    uint64_t fail_at;
+    int error;
+    ep_fault_slot_t *slot;
+
+    if (!ep_fault_point_valid(point))
+        return 0;
+
+    bit = UINT64_C(1) << (unsigned int)point;
+    if ((atomic_load_explicit(&g_fault_mask, memory_order_acquire) & bit) == 0)
+        return 0;
+
+    slot = &g_fault_slots[point];
+    ordinal = atomic_fetch_add_explicit(&slot->hits, 1,
+                                        memory_order_relaxed) + 1;
+    fail_at = atomic_load_explicit(&slot->fail_at, memory_order_relaxed);
+    if (ordinal > fail_at)
+        return 0;
+
+    error = atomic_load_explicit(&slot->error, memory_order_relaxed);
+    ep_set_errno(error);
+    return -1;
+}
+
 uint64_t ep_fault_hits(ep_fault_point_t point)
 {
     if (!ep_fault_point_valid(point)) {

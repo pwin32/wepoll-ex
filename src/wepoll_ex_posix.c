@@ -956,8 +956,14 @@ static int posix_wait_ex(int epfd, struct epoll_event_ex *events,
 
 WEPOLL_EX_API int epoll_create_ex(int size, int flags)
 {
-    if (size < 0 || (flags & ~EPOLL_CLOEXEC) != 0) {
+    if (size < 0 ||
+        (flags & ~(EPOLL_CLOEXEC |
+                   WEPOLL_EX_CREATE_EXPLICIT_REARM)) != 0) {
         errno = EINVAL;
+        return -1;
+    }
+    if ((flags & WEPOLL_EX_CREATE_EXPLICIT_REARM) != 0) {
+        errno = EOPNOTSUPP;
         return -1;
     }
 
@@ -1081,6 +1087,15 @@ WEPOLL_EX_API int epoll_rearm(int epfd, int fd)
     port_release(p);
     if (result != 0) errno = saved_errno;
     return result;
+}
+
+WEPOLL_EX_API int epoll_rearm_classes(int epfd, int fd, uint32_t classes)
+{
+    (void)epfd;
+    (void)fd;
+    (void)classes;
+    errno = EOPNOTSUPP;
+    return -1;
 }
 
 WEPOLL_EX_API int epoll_fd_count(int epfd)
@@ -1272,6 +1287,7 @@ int  ep_port_modify(ep_port_t *p, SOCKET f, uint32_t e, uint32_t fl,
                     epoll_data_t d, void *c)       { (void)p;(void)f;(void)e;(void)fl;(void)d;(void)c; errno=ENOSYS; return -1; }
 int  ep_port_unregister(ep_port_t *p, SOCKET f)    { (void)p;(void)f; errno=ENOSYS; return -1; }
 int  ep_port_rearm(ep_port_t *p, SOCKET f)         { (void)p;(void)f; errno=ENOSYS; return -1; }
+int  ep_port_rearm_classes(ep_port_t *p, SOCKET f, uint32_t c) { (void)p;(void)f;(void)c; errno=ENOSYS; return -1; }
 int  ep_port_wake(ep_port_t *p)                    { (void)p; errno=ENOSYS; return -1; }
 int  ep_port_wait(ep_port_t *p, epoll_event_ex *o, int m, int t, const sigset_t *s)
                                                     { (void)p;(void)o;(void)m;(void)t;(void)s; errno=ENOSYS; return -1; }

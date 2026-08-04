@@ -52,7 +52,7 @@ static void fixture_close(state_fixture_t *fixture)
     }
 }
 
-static int fixture_open(state_fixture_t *fixture)
+static int fixture_open_with_flags(state_fixture_t *fixture, int flags)
 {
     struct sockaddr_in address;
     int address_length = (int)sizeof(address);
@@ -81,7 +81,7 @@ static int fixture_open(state_fixture_t *fixture)
     }
     fixture->server = accept(fixture->listener, NULL, NULL);
     if (fixture->server == INVALID_SOCKET ||
-        ep_port_create(0, 0, &fixture->port) != 0) {
+        ep_port_create(0, flags, &fixture->port) != 0) {
         goto fail;
     }
     return 0;
@@ -89,6 +89,11 @@ static int fixture_open(state_fixture_t *fixture)
 fail:
     fixture_close(fixture);
     return -1;
+}
+
+static int fixture_open(state_fixture_t *fixture)
+{
+    return fixture_open_with_flags(fixture, 0);
 }
 
 static int fixture_open_udp(state_fixture_t *fixture)
@@ -3030,6 +3035,131 @@ cleanup:
     return result;
 }
 
+static int test_explicit_rearm_state(void)
+{
+    static const uint64_t value = UINT64_C(0x455850524541524d);
+    state_fixture_t fixture;
+    epoll_event_ex event;
+    ep_sock_t *sock;
+    PNtDeviceIoControlFile original_submit = NULL;
+    uint32_t old_state;
+    int context;
+    int busy_error;
+    int busy_result;
+    int rearm_error;
+    int rearm_result;
+    int stub_installed = 0;
+    int state_ok;
+    int result = -1;
+
+    if (fixture_open_with_flags(
+            &fixture, WEPOLL_EX_CREATE_EXPLICIT_REARM) != 0) {
+        return -1;
+    }
+    if (register_events(&fixture, EPOLLOUT | EPOLLET, EPOLLET,
+                        value, &context) != 0) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(fixture.port, &event, 1, 1000, NULL) != 1 ||
+        event.events != EPOLLOUT || event.data.u64 != value ||
+        event.user_ctx != &context) {
+        goto cleanup;
+    }
+    sock = fixture_sock(&fixture);
+    if (sock == NULL) goto cleanup;
+
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    old_state = atomic_load_explicit(&sock->state, memory_order_relaxed);
+    state_ok = fixture.port->explicit_rearm != 0 &&
+        sock->explicit_disarmed_classes == WEPOLL_EX_REARM_WRITE &&
+        sock->observed_events == EPOLLOUT && sock->needs_rearm != 0 &&
+        fixture.port->needs_rearm_count == 1 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        ep_port_worklists_valid_locked(fixture.port);
+    if (state_ok) {
+        atomic_store_explicit(&sock->ready_queued, 1,
+                              memory_order_relaxed);
+        atomic_store_explicit(&sock->state, EP_SOCK_READY,
+                              memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok) goto cleanup;
+
+    errno = 0;
+    busy_result = ep_port_rearm_classes(
+        fixture.port, fixture.server, WEPOLL_EX_REARM_WRITE);
+    busy_error = errno;
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok = busy_result == -1 && busy_error == EBUSY &&
+        sock->explicit_disarmed_classes == WEPOLL_EX_REARM_WRITE &&
+        sock->observed_events == EPOLLOUT && sock->needs_rearm != 0 &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) != 0;
+    atomic_store_explicit(&sock->ready_queued, 0, memory_order_relaxed);
+    atomic_store_explicit(&sock->state, old_state, memory_order_relaxed);
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok) goto cleanup;
+
+    original_submit = g_ntdll.NtDeviceIoControlFile;
+    counted_submit_delegate = submit_failure_stub;
+    InterlockedExchange(&counted_submit_calls, 0);
+    g_ntdll.NtDeviceIoControlFile = counted_submit_stub;
+    stub_installed = 1;
+    atomic_store_explicit(&fixture.port->waiter_active, 1,
+                          memory_order_release);
+    errno = 0;
+    rearm_result = ep_port_rearm_classes(
+        fixture.port, fixture.server, WEPOLL_EX_REARM_WRITE);
+    rearm_error = errno;
+    atomic_store_explicit(&fixture.port->waiter_active, 0,
+                          memory_order_release);
+    g_ntdll.NtDeviceIoControlFile = original_submit;
+    stub_installed = 0;
+
+    pthread_mutex_lock(&fixture.port->fd_table_lock);
+    state_ok = rearm_result == -1 && rearm_error == EACCES &&
+        InterlockedCompareExchange(&counted_submit_calls, 0, 0) == 1 &&
+        sock->explicit_disarmed_classes == WEPOLL_EX_REARM_WRITE &&
+        sock->observed_events == EPOLLOUT && sock->needs_rearm != 0 &&
+        fixture.port->needs_rearm_count == 1 &&
+        fixture.port->rearm_head == sock &&
+        fixture.port->rearm_tail == sock &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        atomic_load_explicit(&sock->state,
+                             memory_order_relaxed) == old_state &&
+        ep_port_worklists_valid_locked(fixture.port);
+    pthread_mutex_unlock(&fixture.port->fd_table_lock);
+    if (!state_ok ||
+        ep_port_rearm_classes(fixture.port, fixture.server,
+                              WEPOLL_EX_REARM_WRITE) != 0) {
+        goto cleanup;
+    }
+
+    memset(&event, 0, sizeof(event));
+    if (ep_port_wait(fixture.port, &event, 1, 1000, NULL) != 1 ||
+        event.events != EPOLLOUT || event.data.u64 != value ||
+        event.user_ctx != &context) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    atomic_store_explicit(&fixture.port->waiter_active, 0,
+                          memory_order_release);
+    if (stub_installed) {
+        g_ntdll.NtDeviceIoControlFile = original_submit;
+    }
+    fixture_close(&fixture);
+    return result;
+}
+
 static int test_pending_metadata_mod(void)
 {
     static const uint64_t old_value = UINT64_C(0x4142434445464748);
@@ -4771,6 +4901,8 @@ int main(int argc, char **argv)
         result = test_failed_mod_rollback();
     } else if (strcmp(argv[1], "failed-rearm") == 0) {
         result = test_failed_rearm_rollback();
+    } else if (strcmp(argv[1], "explicit-rearm-state") == 0) {
+        result = test_explicit_rearm_state();
     } else if (strcmp(argv[1], "pending-metadata-mod") == 0) {
         result = test_pending_metadata_mod();
     } else if (strcmp(argv[1], "pending-narrowing-mod") == 0) {

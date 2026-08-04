@@ -430,6 +430,8 @@ static int test_afd_key_fallback(void)
     PNtDeviceIoControlFile original_submit = NULL;
     DWORD baseline_handles = 0;
     DWORD handles_after = 0;
+    const char *failure_stage = "initialization";
+    size_t failure_index = 0;
     int stub_installed = 0;
     int result = -1;
     const uint32_t failed_old_mask = UINT32_C(0x5a5a);
@@ -439,9 +441,11 @@ static int test_afd_key_fallback(void)
     memset(g_afd_key_captured, 0, sizeof(g_afd_key_captured));
     port.afd = (HANDLE)(uintptr_t)1;
     ep_fault_reset();
+    failure_stage = "global-init";
     if (ep_global_init() != 0)
         goto cleanup;
 
+    failure_stage = "socket-create";
     socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (socket_fd == INVALID_SOCKET)
         goto cleanup;
@@ -455,21 +459,29 @@ static int test_afd_key_fallback(void)
     g_afd_key_capture_count = 0;
     g_afd_key_capture_invalid = 0;
 
+    failure_stage = "first-submit";
     if (ep_afd_poll_submit(&socks[0], AFD_POLL_RECEIVE, NULL) != 0 ||
         g_afd_key_capture_count != 1 || g_afd_key_capture_invalid ||
         !afd_key_owner_valid(&socks[0], g_afd_key_captured[0])) {
         goto cleanup;
     }
+    failure_stage = "baseline-handle-count";
     if (!GetProcessHandleCount(GetCurrentProcess(), &baseline_handles))
         goto cleanup;
 
-    /* Leave nine duplicate target slots deliberately unreserved.  Every new
-     * claim must walk all stale active keys and still capture a distinct one.
-     * The submit stub's errno proves the reservation fault remains optional
-     * bookkeeping rather than leaking its injected error. */
+    /* Leave nine duplicate target slots deliberately unreserved.  Force the
+     * first i duplicate candidates through the collision path so this covers
+     * fallback traversal and both scratch-array capacities independently of
+     * Windows handle-allocation policy.  The submit stub's errno proves the
+     * reservation fault remains optional bookkeeping rather than leaking its
+     * injected error. */
     for (size_t i = 1; i < AFD_KEY_OWNER_COUNT; i++) {
+        failure_stage = "owner-submit";
+        failure_index = i;
         ep_fault_reset();
-        if (ep_fault_configure(EP_FAULT_AFD_KEY_RESERVATION,
+        if (ep_fault_configure(EP_FAULT_AFD_KEY_FORCE_COLLISION,
+                               i, EEXIST) != 0 ||
+            ep_fault_configure(EP_FAULT_AFD_KEY_RESERVATION,
                                1, EACCES) != 0) {
             goto cleanup;
         }
@@ -488,17 +500,22 @@ static int test_afd_key_fallback(void)
         }
     }
 
+    failure_stage = "owner-handle-count";
     if (!GetProcessHandleCount(GetCurrentProcess(), &handles_after) ||
         handles_after != baseline_handles) {
         goto cleanup;
     }
 
-    /* Nine collisions make the scratch array grow from eight to sixteen.
-     * Fail that second growth: the current duplicate and all eight retained
-     * duplicates must close, the candidate must remain wholly unowned, and
-     * the established owners must remain unchanged. */
+    /* Force nine collisions so the scratch array must grow from eight to
+     * sixteen.  Fail that second growth: the current duplicate and all eight
+     * retained duplicates must close, the candidate must remain wholly
+     * unowned, and the established owners must remain unchanged. */
+    failure_stage = "growth-failure";
+    failure_index = AFD_KEY_OWNER_COUNT;
     ep_fault_reset();
-    if (ep_fault_configure(EP_FAULT_AFD_KEY_COLLISION_GROW,
+    if (ep_fault_configure(EP_FAULT_AFD_KEY_FORCE_COLLISION,
+                           9, EEXIST) != 0 ||
+        ep_fault_configure(EP_FAULT_AFD_KEY_COLLISION_GROW,
                            2, ENOSPC) != 0) {
         goto cleanup;
     }
@@ -506,6 +523,7 @@ static int test_afd_key_fallback(void)
     if (ep_afd_poll_submit(&socks[AFD_KEY_OWNER_COUNT],
                            AFD_POLL_SEND, NULL) != -1 ||
         errno != ENOSPC ||
+        ep_fault_hits(EP_FAULT_AFD_KEY_FORCE_COLLISION) != 9 ||
         ep_fault_hits(EP_FAULT_AFD_KEY_COLLISION_GROW) != 2 ||
         g_afd_key_capture_count != AFD_KEY_OWNER_COUNT ||
         atomic_load_explicit(&socks[AFD_KEY_OWNER_COUNT].poll_status,
@@ -514,11 +532,14 @@ static int test_afd_key_fallback(void)
         !afd_key_released(&socks[AFD_KEY_OWNER_COUNT])) {
         goto cleanup;
     }
+    failure_stage = "growth-failure-handle-count";
     if (!GetProcessHandleCount(GetCurrentProcess(), &handles_after) ||
         handles_after != baseline_handles) {
         goto cleanup;
     }
+    failure_stage = "growth-failure-owner-validation";
     for (size_t i = 0; i < AFD_KEY_OWNER_COUNT; i++) {
+        failure_index = i;
         if (!afd_key_owner_valid(&socks[i], g_afd_key_captured[i]))
             goto cleanup;
     }
@@ -526,6 +547,8 @@ static int test_afd_key_fallback(void)
     /* A clean retry must walk the still-owned keys and capture one more
      * distinct target, demonstrating that failure inserted no dangling key
      * and removed none of the preceding owners. */
+    failure_stage = "retry-submit";
+    failure_index = AFD_KEY_OWNER_COUNT;
     ep_fault_reset();
     if (ep_fault_configure(EP_FAULT_AFD_KEY_RESERVATION,
                            1, EACCES) != 0) {
@@ -542,12 +565,15 @@ static int test_afd_key_fallback(void)
                              g_afd_key_captured[AFD_KEY_OWNER_COUNT])) {
         goto cleanup;
     }
+    failure_stage = "retry-uniqueness";
     for (size_t i = 0; i < AFD_KEY_OWNER_COUNT; i++) {
+        failure_index = i;
         if (g_afd_key_captured[i] ==
             g_afd_key_captured[AFD_KEY_OWNER_COUNT]) {
             goto cleanup;
         }
     }
+    failure_stage = "retry-handle-count";
     if (!GetProcessHandleCount(GetCurrentProcess(), &handles_after) ||
         handles_after != baseline_handles) {
         goto cleanup;
@@ -555,6 +581,27 @@ static int test_afd_key_fallback(void)
     result = 0;
 
 cleanup:
+    if (result != 0) {
+        fprintf(stderr,
+                "afd-key-fallback stage=%s index=%zu captured=%d invalid=%d "
+                "baseline=%lu after=%lu candidate-status=%d "
+                "candidate-events=%lu candidate-owned=%u fault-hits=%zu\n",
+                failure_stage,
+                failure_index,
+                g_afd_key_capture_count,
+                g_afd_key_capture_invalid,
+                (unsigned long)baseline_handles,
+                (unsigned long)handles_after,
+                (int)atomic_load_explicit(
+                    &socks[AFD_KEY_OWNER_COUNT].poll_status,
+                    memory_order_relaxed),
+                (unsigned long)socks[AFD_KEY_OWNER_COUNT]
+                    .submitted_afd_events,
+                (unsigned int)socks[AFD_KEY_OWNER_COUNT]
+                    .afd_poll_key_owned,
+                (size_t)ep_fault_hits(
+                    EP_FAULT_AFD_KEY_COLLISION_GROW));
+    }
     if (stub_installed)
         g_ntdll.NtDeviceIoControlFile = original_submit;
     ep_fault_reset();

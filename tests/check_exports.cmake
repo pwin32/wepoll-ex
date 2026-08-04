@@ -26,6 +26,7 @@ if(WEPOLL_EX_EXPORT_FORMAT STREQUAL "ELF")
         epoll_fd_count
         epoll_pwait2_ex
         epoll_rearm
+        epoll_rearm_classes
         epoll_wait_ex
         wepoll_close
         wepoll_ex_get_capabilities
@@ -95,6 +96,7 @@ elseif(WEPOLL_EX_EXPORT_FORMAT STREQUAL "PE")
         epoll_pwait2
         epoll_pwait2_ex
         epoll_rearm
+        epoll_rearm_classes
         epoll_wait
         epoll_wait_ex
         wepoll_close

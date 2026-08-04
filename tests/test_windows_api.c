@@ -170,7 +170,8 @@ static void test_operational_stats(void)
         WEPOLL_EX_CAP_EXCLUSIVE_PROCESS_LOCAL |
         WEPOLL_EX_CAP_WAKE_STANDARD_WAIT |
         WEPOLL_EX_CAP_WAKE_EXTENDED_WAIT |
-        WEPOLL_EX_CAP_VIRTUAL_EPOLL_DESCRIPTOR;
+        WEPOLL_EX_CAP_VIRTUAL_EPOLL_DESCRIPTOR |
+        WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM;
     wepoll_ex_capabilities capabilities;
     wepoll_ex_global_stats global_stats;
     wepoll_ex_stats stats;

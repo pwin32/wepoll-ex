@@ -17,15 +17,29 @@ unsupported because its basic waits bypass the wrapper. Per-port diagnostics
 now count wake requests/coalescing/returns and current-TCP `WSAPoll` probe
 fallbacks so later performance changes can be evidence-driven.
 
+The next compatibility slice adds an opt-in Windows socket edge-ownership
+mode. `epoll_create_ex(..., WEPOLL_EX_CREATE_EXPLICIT_REARM)` makes delivered
+READ/WRITE classes dormant until `epoll_rearm_classes()` acknowledges the
+application drain; terminal delivery disarms every class. Undelivered
+directions remain covered by AFD, incomplete drains redeliver once per
+acknowledgement, pending-mask expansion shares MOD's cancellation-race refresh,
+MOD clears all disarms, and DEL handles fully idle registrations. The
+capability is reported as `WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM`; POSIX reports
+the extension unsupported. ET with ONESHOT/EXCLUSIVE and non-socket ET remain
+outside the initial mode, which also requires DEL-before-closesocket(). The
+native nginx 1.31.3 module still needs read/write acknowledgements after the
+actual handler, including posted-event dispatch, so the checked-in adapter
+remains level-triggered.
+
 Qualification for this slice used Windows 10.0.19044.1826 with MSYS2 MinGW
 GCC 16.1.0 and Release `-O2 -Wall -Wextra -Wpedantic -Werror` builds. The
 combined, static-only, shared-only, strict combined, strict shared,
-synchronized combined, and synchronized shared lanes contained 184, 182, 103,
-184, 103, 184, and 103 CTest entries. Their passed/skipped counts were 183/1,
-181/1, 102/1, 183/1, 102/1, 179/5, and 98/5; the skips are the documented
+synchronized combined, and synchronized shared lanes contained 189, 187, 107,
+189, 107, 189, and 107 CTest entries. Their passed/skipped counts were 188/1,
+186/1, 106/1, 188/1, 106/1, 184/5, and 102/5; the skips are the documented
 environment-dependent IPv4 UDP/ICMP case plus four synchronized-lifetime
-native-reuse identity cases. Focused repeats passed 95/95 in combined/static/
-strict/synchronized builds and 57/57 in shared-only builds. Linux/WSL GCC
+native-reuse identity cases. Focused repeats passed 100/100 in combined/static/
+strict/synchronized builds and 61/61 in shared-only builds. Linux/WSL GCC
 14.2.0 strict Release passed 5/5 for both native and forced-fallback
 `epoll_pwait2`, five repeats each of the API, large-wait, and pool lanes, and
 4/4 under ASan/UBSan.

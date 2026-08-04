@@ -24,8 +24,8 @@ and becomes eligible again after a newly submitted AFD request proves the
 level inactive by remaining pending. This is useful but is not a Linux kernel
 edge queue.
 
-The preferred nginx-facing improvement is a separately opted-in explicit
-rearm contract:
+The first nginx-facing library slice now provides a separately opted-in
+explicit rearm contract:
 
 1. delivery disarms the selected readiness classes;
 2. the application drains its socket operations to `WSAEWOULDBLOCK`;
@@ -33,10 +33,21 @@ rearm contract:
    registration; and
 4. a fresh AFD submission begins the next observation generation.
 
-The design must define duplex read/write ownership, readiness arriving during
-handler execution, MOD and DEL races, terminal FIN/reset delivery, and
-interaction with `EPOLLONESHOT`. Until those rules and their nginx regressions
-exist, the checked-in nginx adapter remains level-triggered.
+`WEPOLL_EX_CREATE_EXPLICIT_REARM` selects it per Windows port, and
+`epoll_rearm_classes()` acknowledges READ, WRITE, or TERMINAL ownership.
+Delivered read/write classes stay disabled while undelivered directions remain
+in the AFD request. Terminal delivery disables every class; MOD clears all
+disarms; pending-mask expansion uses the existing cancellation-losing refresh
+path; and DEL retires idle or pending state. The initial contract is socket
+only, rejects ET with ONESHOT or EXCLUSIVE, requires DEL-before-closesocket(),
+and is reported by `WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM`.
+
+Library regressions cover duplex independence, incomplete drains, pending AFD
+mask expansion, terminal idling, MOD reset, and DEL. The remaining work is the
+nginx handler integration itself: rearm must occur after the real accept,
+read, or write handler drains, including after `NGX_POST_EVENTS` dispatch.
+Until those nginx regressions exist, the checked-in adapter remains
+level-triggered. See `docs/NGINX_NATIVE_EPOLL_PORT.md`.
 
 ### Wait notification
 

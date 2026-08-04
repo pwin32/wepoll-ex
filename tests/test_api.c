@@ -660,6 +660,15 @@ static void test_extension_api(void)
     }
     PASS();
 
+    TEST("POSIX reports explicit edge rearm unsupported");
+    errno = 0;
+    if (epoll_rearm_classes(-1, -1, WEPOLL_EX_REARM_ALL) != -1 ||
+        errno != EOPNOTSUPP) {
+        FAIL("POSIX explicit rearm support boundary");
+        return;
+    }
+    PASS();
+
     TEST("versioned operational statistics report the POSIX contract");
     wepoll_ex_stats stats;
     wepoll_ex_global_stats global_stats;
@@ -785,6 +794,14 @@ static void test_create_ex_and_timeout_validation(void)
     epfd = epoll_create_ex(0, EPOLL_CLOEXEC | 0x40000000);
     if (epfd != -1 || errno != EINVAL) {
         FAIL("unknown flag should return EINVAL");
+        if (epfd >= 0) wepoll_close(epfd);
+        return;
+    }
+
+    errno = 0;
+    epfd = epoll_create_ex(0, WEPOLL_EX_CREATE_EXPLICIT_REARM);
+    if (epfd != -1 || errno != EOPNOTSUPP) {
+        FAIL("POSIX explicit-rearm create should return EOPNOTSUPP");
         if (epfd >= 0) wepoll_close(epfd);
         return;
     }

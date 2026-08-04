@@ -337,6 +337,10 @@ WEPOLL_EX_API int epoll_create(int size)
 
 WEPOLL_EX_API int epoll_create1(int flags)
 {
+    if ((flags & ~EPOLL_CLOEXEC) != 0) {
+        ep_set_errno(EINVAL);
+        return -1;
+    }
     return epoll_create_ex(0, flags);
 }
 
@@ -345,7 +349,9 @@ WEPOLL_EX_API int epoll_create_ex(int size, int flags)
     ep_port_t *port = NULL;
     int fd;
 
-    if (size < 0 || (flags & ~EPOLL_CLOEXEC) != 0) {
+    if (size < 0 ||
+        (flags & ~(EPOLL_CLOEXEC |
+                   WEPOLL_EX_CREATE_EXPLICIT_REARM)) != 0) {
         ep_set_errno(EINVAL);
         return -1;
     }
@@ -624,6 +630,30 @@ WEPOLL_EX_API int epoll_rearm(int epfd, epoll_fd_t fd)
     return result;
 }
 
+WEPOLL_EX_API int epoll_rearm_classes(int epfd, epoll_fd_t fd,
+                                      uint32_t classes)
+{
+    epfd_entry_t *entry = epfd_require(epfd);
+    int result;
+
+    if (entry == NULL) {
+        return -1;
+    }
+    if (fd == EPOLL_FD_INVALID) {
+        epfd_put(entry);
+        ep_set_errno(EBADF);
+        return -1;
+    }
+    if (classes == 0 || (classes & ~WEPOLL_EX_REARM_ALL) != 0) {
+        epfd_put(entry);
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+    result = ep_port_rearm_classes(entry->port, (SOCKET)fd, classes);
+    epfd_put(entry);
+    return result;
+}
+
 WEPOLL_EX_API int epoll_fd_count(int epfd)
 {
     epfd_entry_t *entry = epfd_require(epfd);
@@ -697,7 +727,8 @@ WEPOLL_EX_API int wepoll_ex_get_capabilities(
                      WEPOLL_EX_CAP_EXCLUSIVE_PROCESS_LOCAL |
                      WEPOLL_EX_CAP_WAKE_STANDARD_WAIT |
                      WEPOLL_EX_CAP_WAKE_EXTENDED_WAIT |
-                     WEPOLL_EX_CAP_VIRTUAL_EPOLL_DESCRIPTOR;
+                     WEPOLL_EX_CAP_VIRTUAL_EPOLL_DESCRIPTOR |
+                     WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM;
     return copy_versioned_snapshot(capabilities, capabilities_size,
                                    &snapshot, sizeof(snapshot));
 }

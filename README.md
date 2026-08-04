@@ -18,7 +18,9 @@ platform-specific regression test.
 The archive `nginx-1.31.3.tar.gz` is reference material only. It is deliberately
 not part of the tracked source and is not evidence that the adapter builds.
 See [`docs/NGINX_INTEGRATION.md`](docs/NGINX_INTEGRATION.md) for the current
-validation checklist.
+validation checklist and
+[`docs/NGINX_NATIVE_EPOLL_PORT.md`](docs/NGINX_NATIVE_EPOLL_PORT.md) for the
+native Linux module's portability boundary.
 
 ## Architecture at a glance
 
@@ -121,9 +123,9 @@ Windows-engine implementation.
 
 The header [`include/wepoll_ex.h`](include/wepoll_ex.h) declares
 `epoll_create_ex`, `epoll_ctl_ctx`, `epoll_wait_ex`, `epoll_pwait2_ex`,
-`epoll_ctl_batch`, `epoll_drain`, `epoll_rearm`, `epoll_fd_count`, version
-helpers, capability/socket-lifetime/statistics queries, `wepoll_ex_wake`, and
-`wepoll_close`.
+`epoll_ctl_batch`, `epoll_drain`, `epoll_rearm`, `epoll_rearm_classes`,
+`epoll_fd_count`, version helpers, capability/socket-lifetime/statistics
+queries, `wepoll_ex_wake`, and `wepoll_close`.
 `epoll_ctl_batch` applies operations in order and best-effort rolls back ADDs;
 it is not transactional.
 
@@ -178,10 +180,29 @@ particular, Linux's `EPIOCSPARAMS` and `EPIOCGPARAMS` epoll busy-poll ioctls are
 not available on Windows. The POSIX build returns a native epoll fd and
 naturally inherits those ioctls when the host headers and kernel support them.
 
+Windows `epoll_create_ex()` also accepts
+`WEPOLL_EX_CREATE_EXPLICIT_REARM`.  Socket `EPOLLET` delivery on such a port
+disarms the returned read or write readiness class until
+`epoll_rearm_classes()` acknowledges that the application drained it to
+`WSAEWOULDBLOCK`; a terminal `EPOLLERR`/`EPOLLHUP` delivery disarms every
+class.  Other directions remain natively armed, avoiding repeated observation
+of nginx-style continuously writable registrations.  Rearming an
+incompletely drained class immediately reports its still-true level once and
+disarms it again.  MOD clears all disarms, `epoll_rearm()` acknowledges all
+classes, and DEL works while the registration is idle or pending.
+
+This explicit contract is socket-only and initially rejects ET combined with
+`EPOLLONESHOT` or `EPOLLEXCLUSIVE`; it does not change ordinary observed-edge
+ports, pipe/waitable ET, or POSIX native epoll.  A fully disarmed registration
+may have no AFD request in flight, so the embedder must DEL before
+`closesocket()`.  Stock nginx's Linux module still needs handler-completion
+rearm hooks, especially for posted events; this is not a symbol-only port.
+
 Windows control calls classify the target before membership errors where Linux
 does: an invalid or closed target returns `EBADF`, a valid supported target
-that is not registered returns `ENOENT` for MOD, DEL, and `epoll_rearm()`, and
-a valid but unsupported object returns `EPERM`. ADD alone also reports
+that is not registered returns `ENOENT` for MOD, DEL, `epoll_rearm()`, and
+`epoll_rearm_classes()`, while a valid but unsupported object returns `EPERM`.
+ADD alone also reports
 registration eligibility failures such as missing HANDLE access (`EACCES`) or
 a Winsock provider-resolution error. Every operation other than numeric
 `EPOLL_CTL_DEL` snapshots one event value at entry; a null pointer returns
@@ -416,8 +437,9 @@ applicable; unsupported Windows-only counters are zero. These are diagnostics,
 not an atomic transactional view.
 
 `wepoll_ex_get_capabilities()` distinguishes native Linux edge queues from the
-Windows observed-edge filter, reports process-local exclusive arbitration,
-and identifies which wait families support `wepoll_ex_wake()`. Windows basic
+Windows observed-edge filter, reports the optional explicit edge-rearm
+contract and process-local exclusive arbitration, and identifies which wait
+families support `wepoll_ex_wake()`. Windows basic
 and extended waits consume one coalesced wake as an early zero-event return
 after ready events and pending errors. The POSIX wrapper reports wake
 unsupported because its basic waits are direct libc calls.

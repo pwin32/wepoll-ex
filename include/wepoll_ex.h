@@ -10,8 +10,9 @@
  *     extension family for diagnostics and per-registration context.
  *   - All public EPOLL* event flag bits exposed by Linux <sys/epoll.h> are
  *     present.
- *   - Windows implements EPOLLET (observed-edge) and ADD-time
- *     EPOLLEXCLUSIVE; non-null wait signal masks are accepted and ignored.
+ *   - Windows implements EPOLLET (observed-edge), an opt-in explicit edge
+ *     rearm mode, and ADD-time EPOLLEXCLUSIVE; non-null wait signal masks are
+ *     accepted and ignored.
  *   - Windows also accepts selected waitable HANDLEs and pipes in addition to
  *     sockets; waitable HANDLEs require SYNCHRONIZE access, while mutexes,
  *     disk files, and other unsupported types return EPERM.
@@ -221,6 +222,8 @@ typedef struct wepoll_ex_global_stats {
     (UINT64_C(1) << 6)
 #define WEPOLL_EX_CAP_VIRTUAL_EPOLL_DESCRIPTOR \
     (UINT64_C(1) << 7)
+#define WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM \
+    (UINT64_C(1) << 8)
 
 typedef struct wepoll_ex_capabilities {
     uint32_t version;
@@ -264,12 +267,32 @@ WEPOLL_EX_API int  epoll_pwait2(int epfd, struct epoll_event *events,
  * be Linux-portable and should be guarded with #ifdef WEPOLL_EX_H_.
  * ------------------------------------------------------------------------- */
 
-/* Same as epoll_create1, with an optional Windows capacity hint. A positive
- * size pre-grows the fd table and raises the initial AFD/ready pool capacity;
- * the hint is capped at 4096 and does not limit later registrations or resize
- * the fixed IOCP dequeue batch. Passing 0 uses defaults. POSIX accepts but
- * otherwise ignores the hint. The standard epoll_create() always ignores its
- * positive legacy size, matching Linux. */
+/* epoll_create_ex flags.  EXPLICIT_REARM is a Windows-only socket EPOLLET
+ * mode: delivery disarms the returned read/write/terminal readiness classes
+ * until epoll_rearm_classes() acknowledges that the application drained the
+ * corresponding operations.  A terminal delivery disarms every class while
+ * the application decides whether to close or deliberately rearm.  POSIX
+ * reports EOPNOTSUPP for this flag, and the Linux-compatible epoll_create1()
+ * entry point never accepts it. */
+#define WEPOLL_EX_CREATE_EXPLICIT_REARM 0x01000000
+
+/* Class mask accepted by epoll_rearm_classes().  READ includes ordinary,
+ * priority, and graceful peer-shutdown readiness; WRITE includes ordinary
+ * writable readiness; TERMINAL includes EPOLLERR/EPOLLHUP. */
+#define WEPOLL_EX_REARM_READ      (1U << 0)
+#define WEPOLL_EX_REARM_WRITE     (1U << 1)
+#define WEPOLL_EX_REARM_TERMINAL  (1U << 2)
+#define WEPOLL_EX_REARM_ALL       (WEPOLL_EX_REARM_READ | \
+                                   WEPOLL_EX_REARM_WRITE | \
+                                   WEPOLL_EX_REARM_TERMINAL)
+
+/* Same as epoll_create1, with an optional Windows capacity hint and the
+ * WEPOLL_EX_CREATE_* flags above. A positive size pre-grows the fd table and
+ * raises the initial AFD/ready pool capacity; the hint is capped at 4096 and
+ * does not limit later registrations or resize the fixed IOCP dequeue batch.
+ * Passing 0 uses defaults. POSIX accepts but otherwise ignores the hint. The
+ * standard epoll_create() always ignores its positive legacy size, matching
+ * Linux. */
 WEPOLL_EX_API int  epoll_create_ex(int size, int flags);
 
 /* epoll_ctl with an extra user_ctx pointer that will be surfaced in
@@ -322,9 +345,22 @@ WEPOLL_EX_API int  epoll_drain(int epfd, struct epoll_event *events,
                                int maxevents);
 
 /* Re-arm a tracked fd after an EPOLLONESHOT delivery while preserving its
- * saved event, data, and context.  Windows validates socket identity and is a
- * no-op when the oneshot has not fired; POSIX issues a native MOD. */
+ * saved event, data, and context.  On an explicit-rearm Windows port this is
+ * also shorthand for rearming every disarmed class of a socket EPOLLET
+ * registration.  Other Windows calls are a no-op when ONESHOT has not fired;
+ * POSIX issues a native MOD. */
 WEPOLL_EX_API int  epoll_rearm(int epfd, epoll_fd_t fd);
+
+/* Rearm selected readiness classes on a socket EPOLLET registration owned by
+ * a WEPOLL_EX_CREATE_EXPLICIT_REARM port.  The call is idempotent after the
+ * ready node has been returned by a wait.  It reports EBUSY while that node is
+ * still queued, and EOPNOTSUPP for other ports or registration kinds.  A
+ * successful MOD starts a fresh observation and clears every class disarm.
+ * Explicitly rearmed embedders must DEL before closesocket(), because a fully
+ * disarmed registration may intentionally have no native AFD poll in flight.
+ * POSIX reports EOPNOTSUPP. */
+WEPOLL_EX_API int  epoll_rearm_classes(int epfd, epoll_fd_t fd,
+                                       uint32_t classes);
 
 /* Return the number of registrations tracked by this extension.  Windows
  * counts registrations in the virtual epoll instance.  POSIX counts entries

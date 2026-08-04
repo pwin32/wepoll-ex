@@ -441,6 +441,10 @@ struct ep_sock {
      * that drop out of the latest AFD level snapshot so a later re-assert
      * can form a new edge. */
     uint32_t observed_events;
+    /* In explicit-rearm mode, readiness classes delivered to the caller stay
+     * disabled until the application acknowledges its drain with
+     * epoll_rearm_classes(). */
+    uint8_t explicit_disarmed_classes;
 
     /* Poll lifecycle.  The IO_STATUS_BLOCK is also used as the ApcContext
      * returned in the IOCP packet, so it must remain embedded until the
@@ -650,6 +654,7 @@ struct ep_port {
 
     /* Configuration snapshot. */
     int close_on_exec;
+    uint8_t explicit_rearm;
 
     /* Close/wait coordination.  A closing port cancels all outstanding AFD
      * polls and waits for their IOCP completions before storage is freed. */
@@ -725,10 +730,11 @@ extern ep_ntdll_t g_ntdll;
 /* ----------------------------------------------------------------------- */
 /* Deterministic internal fault injection.                                 */
 /*                                                                         */
-/* A configured point fails exactly once, on its Nth hit.  Production      */
-/* builds leave every point disabled; the initial mask check is then the   */
-/* only work performed by ep_fault_hit().  These symbols are intentionally  */
-/* absent from the public header and shared-library export surface.         */
+/* A configured point normally fails exactly once, on its Nth hit.         */
+/* ep_fault_hit_through() instead fails through the Nth hit so tests can    */
+/* deterministically force a bounded path.  Production builds compile both */
+/* checks away.  These symbols are intentionally absent from the public     */
+/* header and shared-library export surface.                                */
 /* ----------------------------------------------------------------------- */
 
 typedef enum ep_fault_point {
@@ -738,6 +744,7 @@ typedef enum ep_fault_point {
     EP_FAULT_AFD_SUBMIT,
     EP_FAULT_AFD_CANCEL,
     EP_FAULT_AFD_KEY_RESERVATION,
+    EP_FAULT_AFD_KEY_FORCE_COLLISION,
     EP_FAULT_AFD_KEY_COLLISION_GROW,
     EP_FAULT_ENDPOINT_IDENTITY,
     EP_FAULT_ENDPOINT_UNAVAILABLE,
@@ -759,12 +766,14 @@ int      ep_fault_configure(ep_fault_point_t point, uint64_t fail_at,
                             int error);
 void     ep_fault_reset(void);
 int      ep_fault_hit(ep_fault_point_t point);
+int      ep_fault_hit_through(ep_fault_point_t point);
 uint64_t ep_fault_hits(ep_fault_point_t point);
 #else
 /* Keep production and embedded builds free of fault-injection branches and
  * link dependencies.  The dedicated fault-test library enables the real
  * implementation for deterministic regression coverage. */
 #  define ep_fault_hit(point) ((void)(point), 0)
+#  define ep_fault_hit_through(point) ((void)(point), 0)
 #endif
 
 /* ----------------------------------------------------------------------- */
@@ -793,6 +802,7 @@ int  ep_port_modify(ep_port_t *port, SOCKET fd,
                     epoll_data_t data, void *ctx);
 int  ep_port_unregister(ep_port_t *port, SOCKET fd);
 int  ep_port_rearm(ep_port_t *port, SOCKET fd);
+int  ep_port_rearm_classes(ep_port_t *port, SOCKET fd, uint32_t classes);
 int  ep_port_wake(ep_port_t *port);
 
 int  ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,

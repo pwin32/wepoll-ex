@@ -1,5 +1,6 @@
 #include "wepoll_ex.h"
 
+#include <errno.h>
 #include <string.h>
 
 int main(void)
@@ -24,5 +25,22 @@ int main(void)
         return 3;
     }
 
-    return wepoll_close(epfd) == 0 ? 0 : 4;
+    errno = 0;
+#ifdef _WIN32
+    if (epoll_rearm_classes(epfd, EPOLL_FD_INVALID,
+                            WEPOLL_EX_REARM_ALL) != -1 ||
+        errno != EBADF) {
+        (void)wepoll_close(epfd);
+        return 4;
+    }
+#else
+    if (epoll_rearm_classes(epfd, EPOLL_FD_INVALID,
+                            WEPOLL_EX_REARM_ALL) != -1 ||
+        errno != EOPNOTSUPP) {
+        (void)wepoll_close(epfd);
+        return 4;
+    }
+#endif
+
+    return wepoll_close(epfd) == 0 ? 0 : 5;
 }
