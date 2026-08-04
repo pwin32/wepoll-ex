@@ -104,6 +104,11 @@ the nginx-embedded source build independent of a generated CMake header.
    skips stale generations. Lock acquisition is included in finite timeouts,
    and an early `WAIT_TIMEOUT` is retried against the absolute deadline. A
    zero-timeout call returns immediately if another waiter owns the drain.
+   A delivered LT registration is rearmed only after its ready node is
+   consumed, which places it behind already queued peers and rotates a ready
+   set larger than `maxevents` across successive waits. ET observation state
+   survives the serialized waiter handoff, so one transition on one epfd wakes
+   one waiter rather than being redelivered to the next waiter.
    After it acquires the lock, while internal packets keep arriving it
    processes at least 16 successful, nonempty IOCP dequeue batches before
    enforcing a 10 ms drain budget.
@@ -503,8 +508,10 @@ temporary fallback signal mask before unwinding.
   so thread-pool integration is outside this prototype's supported boundary.
 - Windows signal masks are opaque API placeholders. Non-null masks are
   accepted and ignored so portable `epoll_pwait*` call sites run; Windows has
-  no POSIX process signal mask to apply. Linux extended waits pass masks
-  atomically to native `epoll_pwait2` or the chunked `epoll_pwait` fallback.
+  no POSIX process signal mask to apply. Windows waits also have no POSIX
+  signal-interruption path and do not emulate signal-generated `EINTR`. Linux
+  extended waits pass masks atomically to native `epoll_pwait2` or the chunked
+  `epoll_pwait` fallback.
 - Windows `epoll_pwait2*` represents positive finite durations in upward-
   rounded 100-nanosecond timer units when high-resolution timers are available,
   with an upward-rounded millisecond IOCP backstop and transparent coarse
@@ -519,7 +526,12 @@ temporary fallback signal mask before unwinding.
   Because an `epfd` is a process-local integer rather than a kernel HANDLE,
   self-registration and nested-epoll attempts cannot always reproduce Linux's
   distinct `EINVAL` result and may instead classify as an invalid or unrelated
-  native target.
+  native target. The integer cannot be duplicated, inherited, passed as an OS
+  descriptor, or used with `fcntl` or `ioctl`. `EPOLL_CLOEXEC` is accepted for
+  compatibility, but all virtual epfds are process-local regardless. Linux's
+  `EPIOCSPARAMS`/`EPIOCGPARAMS` busy-poll ioctls therefore have no Windows
+  counterpart; the POSIX build exposes a native epoll fd and inherits host
+  ioctl support.
 - `SO_OOBINLINE` exposes urgent bytes as ordinary readable data without a
   separate `EPOLLPRI` bit on Windows.
 - `EPOLLWAKEUP` is accepted and ignored on Windows.

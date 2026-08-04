@@ -617,6 +617,181 @@ cleanup:
     return result;
 }
 
+static int test_round_robin(void)
+{
+    enum { READY_COUNT = 4 };
+    const uint64_t data_base = UINT64_C(0x524f554e4400);
+    tcp_pair_t pairs[READY_COUNT];
+    int seen[READY_COUNT] = { 0 };
+    int epfd = -1;
+    int registered = 0;
+    int result = -1;
+
+    for (int i = 0; i < READY_COUNT; i++) tcp_pair_init(&pairs[i]);
+    for (int i = 0; i < READY_COUNT; i++) {
+        if (make_tcp_pair(&pairs[i]) != 0 ||
+            send_normal(pairs[i].client, (char)('a' + i)) != 0) {
+            goto cleanup;
+        }
+    }
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        goto cleanup;
+    }
+    for (int i = 0; i < READY_COUNT; i++) {
+        if (ctl_socket(epfd, EPOLL_CTL_ADD, pairs[i].server, EPOLLIN,
+                       data_base + (uint64_t)i) != 0) {
+            goto cleanup;
+        }
+        registered++;
+    }
+
+    /* Every registration is already readable before ADD.  Give the eager
+     * AFD requests time to publish the complete persistent ready set before
+     * constraining each public wait to one event. */
+    Sleep(100);
+    for (int i = 0; i < READY_COUNT; i++) {
+        struct epoll_event output;
+        uint64_t index;
+        int count;
+
+        memset(&output, 0, sizeof(output));
+        count = epoll_wait(epfd, &output, 1, 2000);
+        if (count != 1 || output.events != EPOLLIN ||
+            output.data.u64 < data_base ||
+            output.data.u64 >= data_base + READY_COUNT) {
+            fprintf(stderr,
+                    "round-robin wait %d: count=%d errno=%d WSA=%d "
+                    "data=0x%llx events=0x%08lx\n",
+                    i, count, errno, WSAGetLastError(),
+                    (unsigned long long)output.data.u64,
+                    (unsigned long)output.events);
+            goto cleanup;
+        }
+        index = output.data.u64 - data_base;
+        if (seen[index]) {
+            fprintf(stderr,
+                    "round-robin repeated index %llu before full cycle\n",
+                    (unsigned long long)index);
+            goto cleanup;
+        }
+        seen[index] = 1;
+    }
+    for (int i = 0; i < READY_COUNT; i++) {
+        if (recv_normal(pairs[i].server, (char)('a' + i)) != 0) {
+            goto cleanup;
+        }
+    }
+    result = 0;
+
+cleanup:
+    for (int i = 0; i < registered; i++) {
+        if (ctl_socket(epfd, EPOLL_CTL_DEL, pairs[i].server, 0, 0) != 0) {
+            result = -1;
+        }
+    }
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    for (int i = 0; i < READY_COUNT; i++) tcp_pair_close(&pairs[i]);
+    if (result == 0) puts("round-robin: OK");
+    return result;
+}
+
+static int test_duplicate_registration(void)
+{
+    const uint64_t original_data = UINT64_C(0x4455504f524947);
+    const uint64_t duplicate_data = UINT64_C(0x445550434f5059);
+    tcp_pair_t pair;
+    WSAPROTOCOL_INFOW protocol_info;
+    SOCKET duplicate = INVALID_SOCKET;
+    u_long nonblocking = 1;
+    int epfd = -1;
+    int original_registered = 0;
+    int duplicate_registered = 0;
+    int saw_original = 0;
+    int saw_duplicate = 0;
+    int result = -1;
+
+    if (make_tcp_pair(&pair) != 0) {
+        return -1;
+    }
+    memset(&protocol_info, 0, sizeof(protocol_info));
+    if (WSADuplicateSocketW(pair.server, GetCurrentProcessId(),
+                            &protocol_info) == SOCKET_ERROR) {
+        goto cleanup;
+    }
+    duplicate = WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO,
+                           FROM_PROTOCOL_INFO, &protocol_info, 0,
+                           WSA_FLAG_OVERLAPPED);
+    if (duplicate == INVALID_SOCKET ||
+        ioctlsocket(duplicate, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+        goto cleanup;
+    }
+
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0 ||
+        ctl_socket(epfd, EPOLL_CTL_ADD, pair.server,
+                   EPOLLIN | EPOLLONESHOT, original_data) != 0) {
+        goto cleanup;
+    }
+    original_registered = 1;
+    if (ctl_socket(epfd, EPOLL_CTL_ADD, duplicate,
+                   EPOLLIN | EPOLLONESHOT, duplicate_data) != 0) {
+        goto cleanup;
+    }
+    duplicate_registered = 1;
+    if (epoll_fd_count(epfd) != 2 || send_normal(pair.client, 'd') != 0) {
+        goto cleanup;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        struct epoll_event output;
+        int count;
+
+        memset(&output, 0, sizeof(output));
+        count = epoll_wait(epfd, &output, 1, 2000);
+        if (count != 1 || output.events != EPOLLIN) {
+            fprintf(stderr,
+                    "duplicate registration wait %d: count=%d errno=%d "
+                    "WSA=%d data=0x%llx events=0x%08lx\n",
+                    i, count, errno, WSAGetLastError(),
+                    (unsigned long long)output.data.u64,
+                    (unsigned long)output.events);
+            goto cleanup;
+        }
+        if (output.data.u64 == original_data && !saw_original) {
+            saw_original = 1;
+        } else if (output.data.u64 == duplicate_data && !saw_duplicate) {
+            saw_duplicate = 1;
+        } else {
+            fprintf(stderr,
+                    "duplicate registration unexpected/repeated data "
+                    "0x%llx\n",
+                    (unsigned long long)output.data.u64);
+            goto cleanup;
+        }
+    }
+    if (!saw_original || !saw_duplicate ||
+        recv_normal(pair.server, 'd') != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (duplicate_registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, duplicate, 0, 0) != 0) {
+        result = -1;
+    }
+    if (original_registered &&
+        ctl_socket(epfd, EPOLL_CTL_DEL, pair.server, 0, 0) != 0) {
+        result = -1;
+    }
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (duplicate != INVALID_SOCKET) closesocket(duplicate);
+    tcp_pair_close(&pair);
+    if (result == 0) puts("duplicate-registration: OK");
+    return result;
+}
+
 static int run_oob_lt_case(uint32_t interest, uint32_t expected,
                            uint64_t data, const char *name,
                            int urgent_first)
@@ -1946,6 +2121,12 @@ static int run_mode(const char *mode)
     if (strcmp(mode, "inert-bits") == 0) {
         return test_inert_bits();
     }
+    if (strcmp(mode, "round-robin") == 0) {
+        return test_round_robin();
+    }
+    if (strcmp(mode, "duplicate-registration") == 0) {
+        return test_duplicate_registration();
+    }
     if (strcmp(mode, "oob-lt") == 0) {
         return test_oob_lt();
     }
@@ -2014,7 +2195,8 @@ static int run_mode(const char *mode)
     }
     fprintf(stderr,
             "usage: test_windows_socket_events "
-            "[aliases|inert-bits|oob-lt|oob-et|oob-oneshot|oob-mod|"
+            "[aliases|inert-bits|round-robin|duplicate-registration|"
+            "oob-lt|oob-et|oob-oneshot|oob-mod|"
             "oob-inline-lt|oob-inline-et|udp-v4|udp-v6|"
             "udp-readless-data|prewait-refresh|prewait-scale|"
             "udp-error|udp-error-v6|"

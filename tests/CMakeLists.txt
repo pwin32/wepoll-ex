@@ -318,6 +318,8 @@ else()
     foreach(_socket_event_mode IN ITEMS
             aliases
             inert-bits
+            round-robin
+            duplicate-registration
             oob-lt
             oob-et
             oob-oneshot
@@ -368,6 +370,7 @@ else()
 
     foreach(_edge_mode IN ITEMS
             readable
+            same-epfd-et
             writable
             exclusive-mod
             exclusive-wake

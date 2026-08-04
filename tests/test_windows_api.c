@@ -145,6 +145,11 @@ static void test_create_close(void)
         FAIL("double close should be EBADF");
         return;
     }
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0 || wepoll_close(epfd) != 0) {
+        FAIL("epoll_create1 should accept EPOLL_CLOEXEC");
+        return;
+    }
     epfd = epoll_create(INT_MAX);
     if (epfd < 0 || wepoll_close(epfd) != 0) {
         FAIL("epoll_create should ignore a large positive size");

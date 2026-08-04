@@ -143,6 +143,10 @@ fewer events than the supplied upper bound rather than monopolize the waiter
 while completions keep arriving. MOD and `epoll_rearm()` of an already selected
 registration defer their replacement generation to the next wait, which
 prevents that registration from appearing twice in the same logical result.
+When more level-ready registrations exist than `maxevents`, successive Windows
+waits rotate through the persistent ready set. Multiple waiters on one Windows
+epfd serialize ready-queue consumption; for an `EPOLLET` registration, one
+readiness transition wakes one waiter rather than being copied to every waiter.
 POSIX extension waits issue one native wait directly into the packed prefix of
 the caller's wider array, then expand the returned records backward in place.
 They can therefore fill beyond 4096 without proportional conversion storage or
@@ -162,6 +166,13 @@ The standard `epoll_create(size)` requires a positive argument but ignores its
 value, matching modern Linux. `epoll_create_ex(size, flags)` retains the size
 only as an extension hint: Windows caps the positive hint value at 4096, while
 POSIX accepts and ignores it. The hint is not a registration limit.
+Windows accepts `EPOLL_CLOEXEC`, but its epfds are process-local virtual
+integers rather than inheritable OS descriptors, so close-on-exec does not
+change their lifetime. A Windows epfd cannot be duplicated, inherited, passed
+as a HANDLE or CRT descriptor, or operated on with `fcntl` or `ioctl`. In
+particular, Linux's `EPIOCSPARAMS` and `EPIOCGPARAMS` epoll busy-poll ioctls are
+not available on Windows. The POSIX build returns a native epoll fd and
+naturally inherits those ioctls when the host headers and kernel support them.
 
 Windows control calls classify the target before membership errors where Linux
 does: an invalid or closed target returns `EBADF`, a valid supported target
@@ -330,8 +341,11 @@ local epoll instance receive matching readiness without retaining the socket
 or delaying native `closesocket()`/peer FIN, while the claim index admits at
 least one local exclusive instance and filters the rest. Windows
 `epoll_pwait*` accepts a non-null signal-mask pointer and ignores it (there is
-no POSIX process signal mask). Linux `epoll_pwait2_ex` applies a supplied mask
-atomically through the native wait or its chunked fallback. Positive finite
+no POSIX process signal mask). Windows waits do not emulate POSIX
+signal-driven interruption and therefore do not produce Linux-style `EINTR`
+from a signal or apply a supplied mask. Linux `epoll_pwait2_ex` applies a
+supplied mask atomically through the native wait or its chunked fallback.
+Positive finite
 Windows `epoll_pwait2*` waits request an optional high-resolution waitable
 timer using an upward-rounded 100-nanosecond duration while retaining an
 upward-rounded millisecond IOCP deadline as a safety backstop. Missing timer
@@ -366,7 +380,9 @@ exclusive-claim updates serialize through one process-wide mutex, and virtual
 epoll descriptors cannot be monitored or nested. Consequently, Windows cannot
 reproduce Linux's distinct self-registration and nested-epoll `EINVAL` cases;
 the virtual integer may instead classify as an invalid or unrelated native
-target.
+target. Virtual epfds also have no duplicate, inheritance, `fcntl`, `ioctl`,
+or epoll busy-poll configuration semantics; `EPOLL_CLOEXEC` is accepted only
+for source compatibility.
 
 On Linux, `epoll_fd_count()` reports registrations owned by the extension
 metadata, including successful `epoll_ctl_batch` operations. Native

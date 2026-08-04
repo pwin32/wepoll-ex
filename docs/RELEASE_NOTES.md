@@ -525,6 +525,34 @@ Native Linux and Windows regressions exercise ADD delivery, an inert-only MOD,
 and restoration of normal read interest. ADD-time `EPOLLEXCLUSIVE` retains its
 separate strict allowed-mask validation.
 
+The ready-set and descriptor-boundary audit adds native and Windows regressions
+for rotating a persistent ready set larger than `maxevents`, plus same-epfd ET
+waiters that require exactly one wake. The legacy WSL1 4.4 compatibility kernel
+exposes all ready descriptors in a full-size preflight but repeats the first
+descriptor for `maxevents == 1`; that host limitation is reported as a focused
+skip while conforming Linux kernels exercise the rotation assertion. Windows
+also directly tests `EPOLL_CLOEXEC` acceptance and two distinct
+`WSADuplicateSocketW` descriptors for one endpoint registered in the same epfd.
+The documentation now makes the architectural boundary explicit: virtual
+Windows epfds are process-local integers with no duplication, inheritance,
+`fcntl`, `ioctl`, or busy-poll `EPIOCSPARAMS`/`EPIOCGPARAMS` semantics, and
+Windows waits neither apply signal masks nor emulate signal-generated `EINTR`.
+The POSIX build retains native descriptor and host-ioctl behavior.
+
+The August 4, 2026 ready-set and descriptor-boundary qualification used
+Windows 10.0.19044, MSYS2 MinGW GCC 16.1, and
+`-O2 -Wall -Wextra -Wpedantic -Werror`. The seven lanes completed 183
+combined best-effort (182 passed/1 skip), 181 static-only (180/1), 103
+shared-only (102/1), 183 strict combined (182/1), 103 strict shared-only
+(102/1), 183 synchronized combined (178/5), and 103 synchronized shared-only
+(98/5) CTest entries. The general skip was the host-dependent UDP/ICMP probe;
+synchronized lanes also skipped the four native-reuse identity cases covered
+by their DEL-before-close contract. Three repeats of every applicable focused
+lane passed: 94 tests in internal-capable builds and 57 tests in shared-only
+builds. This included persistent ready-set rotation, same-epfd ET single-wake
+behavior, direct `EPOLL_CLOEXEC` acceptance, and independent ONESHOT delivery
+for two duplicated socket descriptors referencing one endpoint.
+
 The August 1, 2026 eager-socket-ADD, racing-MOD, current-terminal, and
 synchronous-pipe-fallback qualification used Windows 10.0.19044, MSYS2 MinGW
 GCC 15.2, and

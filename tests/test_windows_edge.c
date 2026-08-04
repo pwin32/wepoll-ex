@@ -13,6 +13,7 @@
 
 #define EXCLUSIVE_SCALE_REGISTRATIONS 129
 #define MULTI_WAITERS 4
+#define SAME_EPFD_ET_WAITERS 2
 #define EXCLUSIVE_MIXED_ORDINARY 2
 #define MULTI_WAIT_TIMEOUT_MS 1000
 
@@ -187,6 +188,141 @@ fail:
     if (client != INVALID_SOCKET) closesocket(client);
     if (listener != INVALID_SOCKET) closesocket(listener);
     return 1;
+}
+
+static int test_same_epfd_et_single_wake(void)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    const uint64_t data = UINT64_C(0x455453494e474c45);
+    struct epoll_event event;
+    multi_wait_context_t contexts[SAME_EPFD_ET_WAITERS];
+    HANDLE started[SAME_EPFD_ET_WAITERS];
+    HANDLE threads[SAME_EPFD_ET_WAITERS];
+    int epfd = -1;
+    int registered = 0;
+    int all_threads_done = 0;
+    int result = 1;
+    int winners = 0;
+    char byte;
+    int i;
+
+    memset(contexts, 0, sizeof(contexts));
+    memset(started, 0, sizeof(started));
+    memset(threads, 0, sizeof(threads));
+    if (make_loopback_pair(&listener, &client, &accepted) != 0) {
+        fputs("same-epfd-et: pair setup failed\n", stderr);
+        goto done;
+    }
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        fprintf(stderr, "same-epfd-et: epoll_create1 failed errno=%d\n",
+                errno);
+        goto done;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLET;
+    event.data.u64 = data;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0) {
+        fprintf(stderr, "same-epfd-et: ADD failed errno=%d\n", errno);
+        goto done;
+    }
+    registered = 1;
+
+    for (i = 0; i < SAME_EPFD_ET_WAITERS; i++) {
+        started[i] = CreateEventW(NULL, TRUE, FALSE, NULL);
+        contexts[i].epfd = epfd;
+        contexts[i].started = started[i];
+        contexts[i].result = -2;
+        if (started[i] == NULL) {
+            fprintf(stderr,
+                    "same-epfd-et: start event %d failed error=%lu\n",
+                    i, (unsigned long)GetLastError());
+            goto done;
+        }
+        threads[i] = CreateThread(NULL, 0, multi_wait_thread,
+                                  &contexts[i], 0, NULL);
+        if (threads[i] == NULL) {
+            fprintf(stderr,
+                    "same-epfd-et: waiter %d failed error=%lu\n",
+                    i, (unsigned long)GetLastError());
+            goto done;
+        }
+    }
+    if (WaitForMultipleObjects(SAME_EPFD_ET_WAITERS, started, TRUE,
+                               2000) != WAIT_OBJECT_0) {
+        fputs("same-epfd-et: waiters did not start\n", stderr);
+        goto done;
+    }
+    Sleep(50);
+    if (send(client, "e", 1, 0) != 1) {
+        fprintf(stderr, "same-epfd-et: send failed WSA=%d\n",
+                WSAGetLastError());
+        goto done;
+    }
+    if (WaitForMultipleObjects(SAME_EPFD_ET_WAITERS, threads, TRUE,
+                               MULTI_WAIT_TIMEOUT_MS + 2000) !=
+        WAIT_OBJECT_0) {
+        fputs("same-epfd-et: bounded waiters hung\n", stderr);
+        goto done;
+    }
+    all_threads_done = 1;
+    for (i = 0; i < SAME_EPFD_ET_WAITERS; i++) {
+        if (contexts[i].result == 1) {
+            if (contexts[i].event.events != EPOLLIN ||
+                contexts[i].event.data.u64 != data) {
+                fprintf(stderr,
+                        "same-epfd-et: waiter %d event mismatch "
+                        "events=%u data=%llu errno=%d\n",
+                        i, contexts[i].event.events,
+                        (unsigned long long)contexts[i].event.data.u64,
+                        contexts[i].error);
+                goto done;
+            }
+            winners++;
+        } else if (contexts[i].result != 0) {
+            fprintf(stderr,
+                    "same-epfd-et: waiter %d result=%d errno=%d\n",
+                    i, contexts[i].result, contexts[i].error);
+            goto done;
+        }
+    }
+    if (winners != 1 || recv(accepted, &byte, 1, 0) != 1 || byte != 'e') {
+        fprintf(stderr,
+                "same-epfd-et: expected one winner, observed %d\n",
+                winners);
+        goto done;
+    }
+    result = 0;
+
+done:
+    if (registered && epfd >= 0 &&
+        epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL) == 0) {
+        registered = 0;
+    }
+    if (!all_threads_done && epfd >= 0) {
+        (void)wepoll_close(epfd);
+        epfd = -1;
+    }
+    for (i = 0; i < SAME_EPFD_ET_WAITERS; i++) {
+        if (threads[i] != NULL &&
+            WaitForSingleObject(threads[i], 5000) != WAIT_OBJECT_0) {
+            (void)TerminateThread(threads[i], 1);
+        }
+        if (threads[i] != NULL) CloseHandle(threads[i]);
+        if (started[i] != NULL) CloseHandle(started[i]);
+    }
+    if (registered && epfd >= 0 &&
+        epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL) != 0) {
+        result = 1;
+    }
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    if (result == 0) puts("same-epfd-et: exactly one waiter woke");
+    return result;
 }
 
 static int test_edge_writable_no_spin(void)
@@ -1458,6 +1594,8 @@ static int run_mode(const char *mode)
 {
     if (strcmp(mode, "readable") == 0)
         return test_edge_readable();
+    if (strcmp(mode, "same-epfd-et") == 0)
+        return test_same_epfd_et_single_wake();
     if (strcmp(mode, "writable") == 0)
         return test_edge_writable_no_spin();
     if (strcmp(mode, "exclusive-mod") == 0)
@@ -1491,7 +1629,8 @@ int main(int argc, char **argv)
     WSADATA wsa;
     int failures = 0;
     const char *modes[] = {
-        "readable", "writable", "exclusive-mod", "exclusive-wake",
+        "readable", "same-epfd-et", "writable", "exclusive-mod",
+        "exclusive-wake",
         "exclusive-et", "exclusive-mixed", "ordinary-multi",
         "ordinary-prearmed", "exclusive-disjoint", "exclusive-scale",
         "exclusive-invalid", "pwait-sigmask", "wakeup-flag"

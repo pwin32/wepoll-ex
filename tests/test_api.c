@@ -28,16 +28,19 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
+#include <sys/utsname.h>
 #include <signal.h>
 #include <assert.h>
 
 static int tests_passed = 0;
 static int tests_failed = 0;
+static int tests_skipped = 0;
 static volatile sig_atomic_t sigusr1_seen = 0;
 
 #define TEST(name)  do { printf("  [test] %-40s ", name); fflush(stdout); } while (0)
 #define PASS()      do { printf("OK\n");   tests_passed++; } while (0)
 #define FAIL(why)   do { printf("FAIL: %s (errno=%d %s)\n", why, errno, strerror(errno)); tests_failed++; } while (0)
+#define SKIP(why)   do { printf("SKIP: %s\n", why); tests_skipped++; } while (0)
 
 static void sigusr1_handler(int signal_number)
 {
@@ -318,6 +321,111 @@ static void test_basic_event(void)
 cleanup:
     wepoll_close(epfd);
     close(pair[0]); close(pair[1]);
+}
+
+/* --------------------------------------------------------------------- */
+/* A bounded wait must rotate through a larger persistent ready set.     */
+/* --------------------------------------------------------------------- */
+
+static void test_ready_set_round_robin(void)
+{
+    enum { READY_COUNT = 4 };
+    int read_fds[READY_COUNT];
+    int write_fds[READY_COUNT];
+    int seen[READY_COUNT] = { 0 };
+    int epfd = -1;
+    struct epoll_event event;
+    struct epoll_event output;
+
+    TEST("successive bounded waits round-robin a larger ready set");
+    for (int i = 0; i < READY_COUNT; i++) {
+        read_fds[i] = -1;
+        write_fds[i] = -1;
+    }
+
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        return;
+    }
+    for (int i = 0; i < READY_COUNT; i++) {
+        int pipe_fds[2];
+        if (pipe(pipe_fds) != 0) {
+            FAIL("pipe");
+            goto cleanup;
+        }
+        read_fds[i] = pipe_fds[0];
+        write_fds[i] = pipe_fds[1];
+        memset(&event, 0, sizeof(event));
+        event.events = EPOLLIN;
+        event.data.u32 = (uint32_t)i + 1;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, read_fds[i], &event) != 0 ||
+            write(write_fds[i], "r", 1) != 1) {
+            FAIL("ADD/write");
+            goto cleanup;
+        }
+    }
+
+    {
+        struct epoll_event ready[READY_COUNT];
+        int count = epoll_wait(epfd, ready, READY_COUNT, 1000);
+
+        if (count != READY_COUNT) {
+            FAIL("ready-set preflight count");
+            goto cleanup;
+        }
+        for (int i = 0; i < count; i++) {
+            if (ready[i].events != EPOLLIN || ready[i].data.u32 == 0 ||
+                ready[i].data.u32 > (uint32_t)READY_COUNT ||
+                seen[ready[i].data.u32 - 1]) {
+                FAIL("ready-set preflight event");
+                goto cleanup;
+            }
+            seen[ready[i].data.u32 - 1] = 1;
+        }
+        memset(seen, 0, sizeof(seen));
+    }
+
+    for (int i = 0; i < READY_COUNT; i++) {
+        memset(&output, 0, sizeof(output));
+        int count = epoll_wait(epfd, &output, 1, 1000);
+        if (count != 1 || output.events != EPOLLIN ||
+            output.data.u32 == 0 ||
+            output.data.u32 > (uint32_t)READY_COUNT ||
+            seen[output.data.u32 - 1]) {
+            struct utsname host;
+            int legacy_wsl1 = count == 1 && output.events == EPOLLIN &&
+                output.data.u32 > 0 &&
+                output.data.u32 <= (uint32_t)READY_COUNT &&
+                seen[output.data.u32 - 1] && uname(&host) == 0 &&
+                strncmp(host.release, "4.4.0-", 6) == 0 &&
+                strstr(host.release, "Microsoft") != NULL;
+
+            if (legacy_wsl1) {
+                SKIP("legacy WSL1 host epoll lacks ready-list rotation");
+                goto cleanup;
+            }
+            fprintf(stderr,
+                    "round-robin wait %d: count=%d events=0x%08x "
+                    "token=%u seen=%d\n",
+                    i, count, count > 0 ? output.events : 0,
+                    count > 0 ? output.data.u32 : 0,
+                    count > 0 && output.data.u32 > 0 &&
+                            output.data.u32 <= (uint32_t)READY_COUNT
+                        ? seen[output.data.u32 - 1] : -1);
+            FAIL("ready-set rotation");
+            goto cleanup;
+        }
+        seen[output.data.u32 - 1] = 1;
+    }
+    PASS();
+
+cleanup:
+    if (epfd >= 0) wepoll_close(epfd);
+    for (int i = 0; i < READY_COUNT; i++) {
+        if (read_fds[i] >= 0) close(read_fds[i]);
+        if (write_fds[i] >= 0) close(write_fds[i]);
+    }
 }
 
 /* --------------------------------------------------------------------- */
@@ -1669,6 +1777,126 @@ static int sleep_milliseconds(long milliseconds)
     return 0;
 }
 
+typedef struct same_epfd_et_wait_context {
+    int                epfd;
+    atomic_int        *ready;
+    atomic_int        *go;
+    struct epoll_event event;
+    int                result;
+    int                error;
+} same_epfd_et_wait_context_t;
+
+static void *same_epfd_et_wait_thread(void *opaque)
+{
+    same_epfd_et_wait_context_t *context = opaque;
+
+    atomic_fetch_add_explicit(context->ready, 1, memory_order_release);
+    while (!atomic_load_explicit(context->go, memory_order_acquire)) {
+        sched_yield();
+    }
+    errno = 0;
+    context->result = epoll_wait(context->epfd, &context->event, 1, 500);
+    context->error = errno;
+    return NULL;
+}
+
+static void test_same_epfd_et_wakes_one_waiter(void)
+{
+    enum { WAITER_COUNT = 2 };
+    const uint64_t data = UINT64_C(0x455457414b45);
+    int pair[2] = { -1, -1 };
+    int epfd = -1;
+    struct epoll_event event;
+    same_epfd_et_wait_context_t contexts[WAITER_COUNT];
+    pthread_t threads[WAITER_COUNT];
+    atomic_int ready = 0;
+    atomic_int go = 0;
+    int created = 0;
+
+    TEST("same-epfd EPOLLET readiness wakes only one waiter");
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        FAIL("socketpair");
+        return;
+    }
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        FAIL("epoll_create1");
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLET;
+    event.data.u64 = data;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair[0], &event) != 0) {
+        FAIL("EPOLL_CTL_ADD");
+        goto cleanup;
+    }
+
+    memset(contexts, 0, sizeof(contexts));
+    for (; created < WAITER_COUNT; created++) {
+        contexts[created].epfd = epfd;
+        contexts[created].ready = &ready;
+        contexts[created].go = &go;
+        contexts[created].result = -2;
+        int thread_error = pthread_create(&threads[created], NULL,
+                                          same_epfd_et_wait_thread,
+                                          &contexts[created]);
+        if (thread_error != 0) {
+            errno = thread_error;
+            break;
+        }
+    }
+    if (created != WAITER_COUNT) {
+        atomic_store_explicit(&go, 1, memory_order_release);
+        for (int i = 0; i < created; i++) pthread_join(threads[i], NULL);
+        FAIL("pthread_create");
+        goto cleanup;
+    }
+    if (wait_atomic_at_least(&ready, WAITER_COUNT, 2000) != 0) {
+        atomic_store_explicit(&go, 1, memory_order_release);
+        for (int i = 0; i < WAITER_COUNT; i++) {
+            pthread_join(threads[i], NULL);
+        }
+        FAIL("waiters did not start");
+        goto cleanup;
+    }
+    atomic_store_explicit(&go, 1, memory_order_release);
+    if (sleep_milliseconds(50) != 0 || write(pair[1], "e", 1) != 1) {
+        for (int i = 0; i < WAITER_COUNT; i++) {
+            pthread_join(threads[i], NULL);
+        }
+        FAIL("trigger readiness");
+        goto cleanup;
+    }
+    for (int i = 0; i < WAITER_COUNT; i++) pthread_join(threads[i], NULL);
+
+    int winners = 0;
+    for (int i = 0; i < WAITER_COUNT; i++) {
+        if (contexts[i].result == 1) {
+            if (contexts[i].event.events != EPOLLIN ||
+                contexts[i].event.data.u64 != data) {
+                errno = contexts[i].error;
+                FAIL("winner event mismatch");
+                goto cleanup;
+            }
+            winners++;
+        } else if (contexts[i].result != 0) {
+            errno = contexts[i].error;
+            FAIL("waiter result");
+            goto cleanup;
+        }
+    }
+    if (winners != 1) {
+        FAIL("expected exactly one woken waiter");
+        goto cleanup;
+    }
+    PASS();
+
+cleanup:
+    if (epfd >= 0) wepoll_close(epfd);
+    if (pair[0] >= 0) close(pair[0]);
+    if (pair[1] >= 0) close(pair[1]);
+}
+
 typedef struct cancel_wait_context {
     int        epfd;
     atomic_int started;
@@ -2674,6 +2902,7 @@ int main(void)
     test_invalid_args();
     test_wait_maxevents_bounds();
     test_basic_event();
+    test_ready_set_round_robin();
     test_double_add();
     test_del_noent();
     test_edge_triggered();
@@ -2690,6 +2919,7 @@ int main(void)
     test_rearm_preserves_registration();
     test_drain_and_batch();
     test_invalid_and_closed_descriptors();
+    test_same_epfd_et_wakes_one_waiter();
     test_cancel_blocking_extended_wait();
     test_close_wakes_blocking_extended_wait();
     test_context_change_during_wait_is_not_stale();
@@ -2700,6 +2930,7 @@ int main(void)
     test_stale_close_preserves_reused_fd();
 
     printf("\n");
-    printf("Summary: %d passed, %d failed\n", tests_passed, tests_failed);
+    printf("Summary: %d passed, %d skipped, %d failed\n",
+           tests_passed, tests_skipped, tests_failed);
     return tests_failed ? 1 : 0;
 }
