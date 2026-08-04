@@ -431,6 +431,61 @@ static void ep_port_fail_iocp_post(ep_port_t *port, DWORD win_error)
     }
 }
 
+int ep_port_wake(ep_port_t *port)
+{
+    DWORD win_error = ERROR_SUCCESS;
+    int error;
+    int expected = 0;
+
+    if (port == NULL) {
+        ep_set_errno(EFAULT);
+        return -1;
+    }
+    if (atomic_load_explicit(&port->closing, memory_order_acquire) ||
+        atomic_load_explicit(&port->iocp_closed, memory_order_acquire)) {
+        ep_set_errno(EBADF);
+        return -1;
+    }
+
+    atomic_fetch_add_explicit(&port->wake_requests, 1,
+                              memory_order_relaxed);
+    if (!atomic_compare_exchange_strong_explicit(
+            &port->wake_pending, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) {
+        atomic_fetch_add_explicit(&port->wake_coalesced, 1,
+                                  memory_order_relaxed);
+        return 0;
+    }
+
+    /* Always queue one control packet for the pending transition.  A future
+     * waiter may otherwise begin after the active-waiter observation and
+     * sleep despite the pending bit.  Coalescing bounds this to one packet
+     * until a wait consumes the request. */
+    if (ep_port_post_iocp(port, 0, NULL, EP_FAULT_IOCP_POST,
+                          &win_error)) {
+        return 0;
+    }
+
+    atomic_store_explicit(&port->wake_pending, 0, memory_order_release);
+    error = atomic_load_explicit(&port->closing, memory_order_acquire)
+        ? EBADF : ep_winerr_to_errno(win_error);
+    if (error == 0) error = EIO;
+    ep_port_fail_iocp_post(port, win_error);
+    ep_set_errno(error);
+    return -1;
+}
+
+static int ep_port_take_wake(ep_port_t *port)
+{
+    if (atomic_exchange_explicit(&port->wake_pending, 0,
+                                 memory_order_acq_rel) == 0) {
+        return 0;
+    }
+    atomic_fetch_add_explicit(&port->wake_returns, 1,
+                              memory_order_relaxed);
+    return 1;
+}
+
 static int ep_aux_post_completion(ep_sock_t *sock, NTSTATUS status)
 {
     DWORD error = ERROR_SUCCESS;
@@ -860,6 +915,7 @@ static int ep_socket_poll_current(ep_sock_t *sock, short *revents_out)
     memset(&item, 0, sizeof(item));
     item.fd = sock->fd;
     item.events = POLLRDNORM | POLLWRNORM;
+    sock->port->tcp_current_level_probes++;
     if (WSAPoll(&item, 1, 0) == SOCKET_ERROR ||
         (item.revents & POLLNVAL) != 0) {
         goto done;
@@ -915,6 +971,7 @@ static void ep_socket_merge_current_levels(ep_sock_t *sock,
             *delivered |= write_interest;
         }
     } else {
+        sock->port->tcp_current_level_fallbacks++;
         if ((read_interest & ~*delivered) != 0 &&
             ep_socket_select_ready(sock->fd, 0) > 0) {
             *delivered |= read_interest;
@@ -1915,7 +1972,17 @@ int ep_port_get_stats(ep_port_t *port, wepoll_ex_stats *stats)
         atomic_load_explicit(&port->iocp_post_failures,
                              memory_order_relaxed);
     stats->zero_timeout_budget_hits = port->zero_timeout_budget_hits;
+    stats->tcp_current_level_probes = port->tcp_current_level_probes;
+    stats->tcp_current_level_fallbacks =
+        port->tcp_current_level_fallbacks;
     pthread_mutex_unlock(&port->fd_table_lock);
+
+    stats->wake_requests = atomic_load_explicit(
+        &port->wake_requests, memory_order_relaxed);
+    stats->wake_coalesced = atomic_load_explicit(
+        &port->wake_coalesced, memory_order_relaxed);
+    stats->wake_returns = atomic_load_explicit(
+        &port->wake_returns, memory_order_relaxed);
 
     stats->ready_queue_depth = atomic_load_explicit(
         &port->ready_queue.queued, memory_order_relaxed);
@@ -3895,6 +3962,10 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     atomic_init(&port->waiter_active, 0);
     atomic_init(&port->active_wait_epoch, 0);
     atomic_init(&port->waiter_coalescing, 0);
+    atomic_init(&port->wake_pending, 0);
+    atomic_init(&port->wake_requests, 0);
+    atomic_init(&port->wake_coalesced, 0);
+    atomic_init(&port->wake_returns, 0);
     atomic_init(&port->closing, 0);
     atomic_init(&port->iocp_closed, 0);
     atomic_init(&port->iocp_post_error, 0);
@@ -5344,6 +5415,13 @@ static int ep_port_wait_timeout_impl(ep_port_t *port, void *out,
             wait_ms = EP_DEFERRED_REARM_RETRY_MS;
             deferred_rearm_wait = 1;
         }
+        if (atomic_load_explicit(&port->wake_pending,
+                                 memory_order_acquire)) {
+            /* Poll queued completions once before consuming the wake so an
+             * already-posted socket event or error retains priority. */
+            wait_ms = 0;
+            deferred_rearm_wait = 0;
+        }
 
         ULONG removed = 0;
         if (ep_fault_hit(EP_FAULT_IOCP_DEQUEUE) != 0) {
@@ -5363,6 +5441,10 @@ static int ep_port_wait_timeout_impl(ep_port_t *port, void *out,
                 break;
             }
             if (error == WAIT_TIMEOUT) {
+                if (ep_port_take_wake(port)) {
+                    result = 0;
+                    break;
+                }
                 if (deferred_rearm_wait) {
                     pthread_mutex_lock(&port->fd_table_lock);
                     ep_port_release_deferred_rearms_locked(port);
@@ -5384,6 +5466,10 @@ static int ep_port_wait_timeout_impl(ep_port_t *port, void *out,
             break;
         }
         if (removed == 0) {
+            if (ep_port_take_wake(port)) {
+                result = 0;
+                break;
+            }
             if (!ep_wait_expired(port, &wait_state)) {
                 continue;
             }
@@ -5504,6 +5590,10 @@ coalesce:
             post_error = ep_port_take_iocp_post_error(port);
             ep_set_errno(post_error != 0 ? post_error : EBADF);
             result = -1;
+            break;
+        }
+        if (ep_port_take_wake(port)) {
+            result = 0;
             break;
         }
         if (timeout_packet && ep_wait_expired(port, &wait_state)) {

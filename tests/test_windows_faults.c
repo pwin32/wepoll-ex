@@ -1316,6 +1316,40 @@ cleanup:
     return result;
 }
 
+static int test_wake_post(void)
+{
+    ep_port_t *port = NULL;
+    wepoll_ex_stats stats;
+    int result = -1;
+
+    ep_fault_reset();
+    if (ep_port_create(0, 0, &port) != 0 ||
+        ep_fault_configure(EP_FAULT_IOCP_POST, 1, EIO) != 0) {
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (ep_port_wake(port) != -1 || errno != EIO ||
+        ep_fault_hits(EP_FAULT_IOCP_POST) != 1 ||
+        atomic_load_explicit(&port->wake_pending,
+                             memory_order_acquire) != 0 ||
+        atomic_load_explicit(&port->closing,
+                             memory_order_acquire) == 0 ||
+        atomic_load_explicit(&port->iocp_closed,
+                             memory_order_acquire) == 0 ||
+        ep_port_get_stats(port, &stats) != 0 ||
+        stats.wake_requests != 1 || stats.wake_coalesced != 0 ||
+        stats.wake_returns != 0 || stats.asynchronous_errors == 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    return result;
+}
+
 /* A synchronous AFD success is converted into an internal IOCP packet only
  * when a waiter is active.  Exercise the packet-post failure rollback so an
  * ADD does not strand a pending count or an AFD key after the port is
@@ -2243,6 +2277,7 @@ static const fault_test_case_t g_tests[] = {
     { "endpoint-closed-token-loss", test_endpoint_closed_after_token_loss },
     { "iocp-create", test_iocp_create },
     { "iocp-post", test_iocp_post },
+    { "wake-post", test_wake_post },
     { "iocp-post-immediate-socket", test_iocp_post_immediate_socket },
     { "iocp-dequeue", test_iocp_dequeue },
     { "aux-closed-iocp", test_aux_closed_iocp_retire },
@@ -2308,7 +2343,7 @@ int main(int argc, char **argv)
             "afd-cancel|"
             "endpoint-identity|"
             "endpoint-policy|endpoint-closed-token-loss|iocp-create|"
-            "iocp-post|iocp-dequeue|"
+            "iocp-post|wake-post|iocp-dequeue|"
             "aux-closed-iocp|aux-post|aux-post-immediate|ready-node-alloc|"
             "waitable-ready-node-alloc|waitable-zero-disarm|"
             "aux-waitable-disarm|"

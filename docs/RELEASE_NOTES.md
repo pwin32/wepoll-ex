@@ -6,6 +6,30 @@ This is an experimental preview of the extended epoll-shaped API, the Windows
 IOCP/AFD backend, the Linux development wrapper, and the optional nginx 1.31.3
 adapter. The API and ABI may change before a stable release.
 
+On August 4, 2026, compatibility follow-up work began with a documented nginx
+and Linux-semantic roadmap. A versioned capability query now distinguishes
+native Linux edge queues from Windows observed-edge filtering, process-local
+exclusive arbitration, signal-mask behavior, and native versus virtual epoll
+descriptors. Windows also exposes a coalesced cross-thread wait wakeup:
+`wepoll_ex_wake()` makes a basic or extended wait return zero after ready
+events and pending errors have priority. POSIX reports the operation
+unsupported because its basic waits bypass the wrapper. Per-port diagnostics
+now count wake requests/coalescing/returns and current-TCP `WSAPoll` probe
+fallbacks so later performance changes can be evidence-driven.
+
+Qualification for this slice used Windows 10.0.19044.1826 with MSYS2 MinGW
+GCC 16.1.0 and Release `-O2 -Wall -Wextra -Wpedantic -Werror` builds. The
+combined, static-only, shared-only, strict combined, strict shared,
+synchronized combined, and synchronized shared lanes contained 184, 182, 103,
+184, 103, 184, and 103 CTest entries. Their passed/skipped counts were 183/1,
+181/1, 102/1, 183/1, 102/1, 179/5, and 98/5; the skips are the documented
+environment-dependent IPv4 UDP/ICMP case plus four synchronized-lifetime
+native-reuse identity cases. Focused repeats passed 95/95 in combined/static/
+strict/synchronized builds and 57/57 in shared-only builds. Linux/WSL GCC
+14.2.0 strict Release passed 5/5 for both native and forced-fallback
+`epoll_pwait2`, five repeats each of the API, large-wait, and pool lanes, and
+4/4 under ASan/UBSan.
+
 The earlier July 23, 2026 validation run used Windows 10.0.19044 with MSYS2
 MinGW GCC 15.2, plus Linux/WSL builds with GCC 14.2 and Clang 19.1. Strict
 MinGW CTest then passed 40 combined, 39 static-only, and 12 shared-only entries;

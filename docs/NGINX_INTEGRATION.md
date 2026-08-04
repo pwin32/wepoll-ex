@@ -24,6 +24,14 @@ optional `notify` action unset and does not claim thread-pool support on
 Windows. A configuration that requires `thread_pool` must use a separately
 validated platform/backend.
 
+The library now exposes a coalesced `wepoll_ex_wake()` primitive for a future
+notification bridge. It wakes a Windows basic or extended wait with a
+zero-event return after ordinary readiness and pending errors have priority;
+the nginx module must still own and dispatch the pending handler queue. The
+current adapter does not enable `notify`, because stock nginx 1.31.3 rejects
+the required Win32 thread-pool configuration and a bare wake is not itself a
+handler-delivery contract.
+
 The addon compiles wepoll-ex with its Windows 8+ API assumptions even though
 stock nginx 1.31.3 headers advertise an older Win32 target. Treat Windows 8 or
 later (`_WIN32_WINNT=0x0602`) as the current minimum for this experiment.
@@ -36,6 +44,10 @@ connection's current descriptor and instance before dispatch. Registrations
 must remain level-triggered on Windows unless a separate, tested drain/rearm
 state machine is implemented; copying nginx's Linux `EPOLLET` mask is
 incorrect.
+
+The staged work needed to qualify explicit edge rearming, notification,
+lifetime ownership, error bridging, probe optimization, and multiworker
+behavior is tracked in `docs/COMPATIBILITY_ROADMAP.md`.
 
 Abortive TCP reset delivery now guarantees both `EPOLLERR` and `EPOLLHUP`.
 The adapter's existing terminal-event path treats either bit as readable and

@@ -122,7 +122,8 @@ Windows-engine implementation.
 The header [`include/wepoll_ex.h`](include/wepoll_ex.h) declares
 `epoll_create_ex`, `epoll_ctl_ctx`, `epoll_wait_ex`, `epoll_pwait2_ex`,
 `epoll_ctl_batch`, `epoll_drain`, `epoll_rearm`, `epoll_fd_count`, version
-helpers, socket-lifetime policy and statistics queries, and `wepoll_close`.
+helpers, capability/socket-lifetime/statistics queries, `wepoll_ex_wake`, and
+`wepoll_close`.
 `epoll_ctl_batch` applies operations in order and best-effort rolls back ADDs;
 it is not transactional.
 
@@ -409,10 +410,20 @@ Select the Windows policy at configure time with
 `wepoll_ex_get_stats()` and `wepoll_ex_get_global_stats()` copy versioned,
 size-prefixed operational snapshots. Windows exposes registration, queue,
 pool, stale-event, identity, asynchronous-error, drain-budget, quarantine,
-reaper, and close-timeout counters. Linux reports its extension-owned
-registration count and marks the socket policy not applicable; unsupported
-Windows-only counters are zero. These are diagnostics, not an atomic
-transactional view.
+reaper, close-timeout, wait-wake, and current-TCP-probe counters. Linux reports
+its extension-owned registration count and marks the socket policy not
+applicable; unsupported Windows-only counters are zero. These are diagnostics,
+not an atomic transactional view.
+
+`wepoll_ex_get_capabilities()` distinguishes native Linux edge queues from the
+Windows observed-edge filter, reports process-local exclusive arbitration,
+and identifies which wait families support `wepoll_ex_wake()`. Windows basic
+and extended waits consume one coalesced wake as an early zero-event return
+after ready events and pending errors. The POSIX wrapper reports wake
+unsupported because its basic waits are direct libc calls.
+
+The prioritized follow-up work and nginx qualification gates are recorded in
+[`docs/COMPATIBILITY_ROADMAP.md`](docs/COMPATIBILITY_ROADMAP.md).
 
 ## Repository layout
 

@@ -525,6 +525,7 @@ else()
                 provider-base
                 iocp-create
                 iocp-post
+                wake-post
                 iocp-post-immediate-socket
                 iocp-dequeue
                 aux-closed-iocp

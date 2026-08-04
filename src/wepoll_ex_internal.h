@@ -665,6 +665,13 @@ struct ep_port {
      * operations then queue rearm work for the next wait instead of creating
      * a second generation that the same coalescing drain could return. */
     _Atomic int waiter_coalescing;
+    /* One application-requested early wait return.  Requests coalesce while
+     * this bit remains set; ready events and asynchronous errors take
+     * priority, leaving the wake pending for a later wait. */
+    _Atomic int wake_pending;
+    _Atomic uint64_t wake_requests;
+    _Atomic uint64_t wake_coalesced;
+    _Atomic uint64_t wake_returns;
     _Atomic int closing;
     _Atomic int iocp_closed;
     _Atomic int iocp_post_error;
@@ -686,6 +693,8 @@ struct ep_port {
     uint64_t identity_failures;
     uint64_t asynchronous_errors;
     uint64_t zero_timeout_budget_hits;
+    uint64_t tcp_current_level_probes;
+    uint64_t tcp_current_level_fallbacks;
     int async_error;
     uint64_t close_drain_timeout_ms;
     uint64_t quarantine_drain_timeout_ms;
@@ -784,6 +793,7 @@ int  ep_port_modify(ep_port_t *port, SOCKET fd,
                     epoll_data_t data, void *ctx);
 int  ep_port_unregister(ep_port_t *port, SOCKET fd);
 int  ep_port_rearm(ep_port_t *port, SOCKET fd);
+int  ep_port_wake(ep_port_t *port);
 
 int  ep_port_wait(ep_port_t *port, epoll_event_ex *out, int maxevents,
                   int timeout_ms, const wepoll_sigset_t *sigmask);

@@ -666,8 +666,8 @@ WEPOLL_EX_API int wepoll_ex_get_socket_lifetime_policy(void)
 #endif
 }
 
-static int copy_stats_snapshot(void *destination, size_t destination_size,
-                               const void *snapshot, size_t snapshot_size)
+static int copy_versioned_snapshot(void *destination, size_t destination_size,
+                                   const void *snapshot, size_t snapshot_size)
 {
     size_t prefix_size = sizeof(uint32_t) * 2;
 
@@ -683,6 +683,23 @@ static int copy_stats_snapshot(void *destination, size_t destination_size,
     memcpy(destination, snapshot,
            destination_size < snapshot_size ? destination_size : snapshot_size);
     return 0;
+}
+
+WEPOLL_EX_API int wepoll_ex_get_capabilities(
+    wepoll_ex_capabilities *capabilities, size_t capabilities_size)
+{
+    wepoll_ex_capabilities snapshot;
+
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.version = WEPOLL_EX_CAPABILITIES_VERSION;
+    snapshot.struct_size = (uint32_t)sizeof(snapshot);
+    snapshot.flags = WEPOLL_EX_CAP_OBSERVED_EDGE_FILTER |
+                     WEPOLL_EX_CAP_EXCLUSIVE_PROCESS_LOCAL |
+                     WEPOLL_EX_CAP_WAKE_STANDARD_WAIT |
+                     WEPOLL_EX_CAP_WAKE_EXTENDED_WAIT |
+                     WEPOLL_EX_CAP_VIRTUAL_EPOLL_DESCRIPTOR;
+    return copy_versioned_snapshot(capabilities, capabilities_size,
+                                   &snapshot, sizeof(snapshot));
 }
 
 WEPOLL_EX_API int wepoll_ex_get_stats(int epfd, wepoll_ex_stats *stats,
@@ -701,7 +718,8 @@ WEPOLL_EX_API int wepoll_ex_get_stats(int epfd, wepoll_ex_stats *stats,
     result = ep_port_get_stats(entry->port, &snapshot);
     epfd_put(entry);
     if (result != 0) return -1;
-    return copy_stats_snapshot(stats, stats_size, &snapshot, sizeof(snapshot));
+    return copy_versioned_snapshot(stats, stats_size,
+                                   &snapshot, sizeof(snapshot));
 }
 
 WEPOLL_EX_API int wepoll_ex_get_global_stats(
@@ -714,7 +732,21 @@ WEPOLL_EX_API int wepoll_ex_get_global_stats(
         return -1;
     }
     ep_get_global_stats(&snapshot);
-    return copy_stats_snapshot(stats, stats_size, &snapshot, sizeof(snapshot));
+    return copy_versioned_snapshot(stats, stats_size,
+                                   &snapshot, sizeof(snapshot));
+}
+
+WEPOLL_EX_API int wepoll_ex_wake(int epfd)
+{
+    epfd_entry_t *entry = epfd_require(epfd);
+    int result;
+
+    if (entry == NULL) {
+        return -1;
+    }
+    result = ep_port_wake(entry->port);
+    epfd_put(entry);
+    return result;
 }
 
 WEPOLL_EX_API int wepoll_close(int epfd)

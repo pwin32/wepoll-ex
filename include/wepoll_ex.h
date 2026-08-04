@@ -181,6 +181,11 @@ typedef struct wepoll_ex_stats {
     uint64_t identity_failures;
     uint64_t asynchronous_errors;
     uint64_t zero_timeout_budget_hits;
+    uint64_t wake_requests;
+    uint64_t wake_coalesced;
+    uint64_t wake_returns;
+    uint64_t tcp_current_level_probes;
+    uint64_t tcp_current_level_fallbacks;
 } wepoll_ex_stats;
 
 typedef struct wepoll_ex_global_stats {
@@ -192,6 +197,37 @@ typedef struct wepoll_ex_global_stats {
     uint64_t api_close_timeouts;
     uint64_t active_quarantines;
 } wepoll_ex_global_stats;
+
+/* Versioned compile/runtime capability snapshot.  These flags describe the
+ * selected backend's public semantics, not merely whether an EPOLL* constant
+ * is accepted.  In particular, native and observed edge delivery are kept
+ * distinct, and a process-local exclusive implementation is reported
+ * explicitly instead of being presented as cross-process Linux behavior. */
+#define WEPOLL_EX_CAPABILITIES_VERSION 1U
+
+#define WEPOLL_EX_CAP_NATIVE_EDGE_QUEUE \
+    (UINT64_C(1) << 0)
+#define WEPOLL_EX_CAP_OBSERVED_EDGE_FILTER \
+    (UINT64_C(1) << 1)
+#define WEPOLL_EX_CAP_EXCLUSIVE_PROCESS_LOCAL \
+    (UINT64_C(1) << 2)
+#define WEPOLL_EX_CAP_WAKE_STANDARD_WAIT \
+    (UINT64_C(1) << 3)
+#define WEPOLL_EX_CAP_WAKE_EXTENDED_WAIT \
+    (UINT64_C(1) << 4)
+#define WEPOLL_EX_CAP_ATOMIC_SIGNAL_MASK_WAIT \
+    (UINT64_C(1) << 5)
+#define WEPOLL_EX_CAP_NATIVE_EPOLL_DESCRIPTOR \
+    (UINT64_C(1) << 6)
+#define WEPOLL_EX_CAP_VIRTUAL_EPOLL_DESCRIPTOR \
+    (UINT64_C(1) << 7)
+
+typedef struct wepoll_ex_capabilities {
+    uint32_t version;
+    uint32_t struct_size;
+    uint64_t flags;       /* WEPOLL_EX_CAP_* */
+    uint64_t reserved[2];
+} wepoll_ex_capabilities;
 
 /* ---------------------------------------------------------------------------
  * Core Linux-compatible API.
@@ -305,6 +341,10 @@ WEPOLL_EX_API uint32_t wepoll_ex_version(void);
 WEPOLL_EX_API const char *wepoll_ex_version_string(void);
 WEPOLL_EX_API int wepoll_ex_get_socket_lifetime_policy(void);
 
+/* Copy the versioned capability snapshot for the selected backend. */
+WEPOLL_EX_API int wepoll_ex_get_capabilities(
+    wepoll_ex_capabilities *capabilities, size_t capabilities_size);
+
 /* Copy a versioned operational snapshot into caller-provided storage.  The
  * supplied size must contain at least the version and struct_size prefix. */
 WEPOLL_EX_API int wepoll_ex_get_stats(int epfd,
@@ -312,6 +352,14 @@ WEPOLL_EX_API int wepoll_ex_get_stats(int epfd,
                                       size_t stats_size);
 WEPOLL_EX_API int wepoll_ex_get_global_stats(
     wepoll_ex_global_stats *stats, size_t stats_size);
+
+/* Request one coalesced early return from a wait on this epoll instance.
+ * Windows basic and extended waits return zero after already-ready events and
+ * pending errors have taken priority.  Multiple requests before observation
+ * coalesce into one return.  The POSIX wrapper does not intercept the host's
+ * basic epoll wait family and therefore returns EOPNOTSUPP; callers must check
+ * WEPOLL_EX_CAP_WAKE_* before using this extension. */
+WEPOLL_EX_API int wepoll_ex_wake(int epfd);
 
 /* Close an epoll fd created by epoll_create / epoll_create1 /
  * epoll_create_ex.  On POSIX this normally behaves like close(); tracked

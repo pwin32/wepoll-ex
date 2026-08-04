@@ -603,6 +603,12 @@ cleanup:
 
 static void test_extension_api(void)
 {
+    const uint64_t expected_capabilities =
+        WEPOLL_EX_CAP_NATIVE_EDGE_QUEUE |
+        WEPOLL_EX_CAP_ATOMIC_SIGNAL_MASK_WAIT |
+        WEPOLL_EX_CAP_NATIVE_EPOLL_DESCRIPTOR;
+    wepoll_ex_capabilities capabilities;
+    uint32_t capabilities_prefix[2] = { 0, 0 };
     static const char version_prefix[] =
         "wepoll-ex " WEPOLL_EX_VERSION_STRING " ";
 
@@ -619,6 +625,37 @@ static void test_extension_api(void)
     uint32_t vn = wepoll_ex_version();
     if (vn != WEPOLL_EX_VERSION_NUMBER) {
         FAIL("version number mismatch");
+        return;
+    }
+    PASS();
+
+    TEST("capability query reports the native POSIX contract");
+    if (wepoll_ex_get_capabilities(&capabilities,
+                                   sizeof(capabilities)) != 0 ||
+        capabilities.version != WEPOLL_EX_CAPABILITIES_VERSION ||
+        capabilities.struct_size != sizeof(capabilities) ||
+        capabilities.flags != expected_capabilities ||
+        wepoll_ex_get_capabilities(
+            (wepoll_ex_capabilities *)capabilities_prefix,
+            sizeof(capabilities_prefix)) != 0 ||
+        capabilities_prefix[0] != WEPOLL_EX_CAPABILITIES_VERSION ||
+        capabilities_prefix[1] != sizeof(capabilities)) {
+        FAIL("capability snapshot");
+        return;
+    }
+    errno = 0;
+    if (wepoll_ex_get_capabilities(&capabilities,
+                                   sizeof(uint32_t)) != -1 ||
+        errno != EINVAL) {
+        FAIL("capability size validation");
+        return;
+    }
+    PASS();
+
+    TEST("POSIX reports explicit wait wake unsupported");
+    errno = 0;
+    if (wepoll_ex_wake(-1) != -1 || errno != EOPNOTSUPP) {
+        FAIL("POSIX wake support boundary");
         return;
     }
     PASS();

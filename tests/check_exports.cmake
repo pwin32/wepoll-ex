@@ -28,11 +28,13 @@ if(WEPOLL_EX_EXPORT_FORMAT STREQUAL "ELF")
         epoll_rearm
         epoll_wait_ex
         wepoll_close
+        wepoll_ex_get_capabilities
         wepoll_ex_get_global_stats
         wepoll_ex_get_socket_lifetime_policy
         wepoll_ex_get_stats
         wepoll_ex_version
-        wepoll_ex_version_string)
+        wepoll_ex_version_string
+        wepoll_ex_wake)
 
     execute_process(
         COMMAND "${WEPOLL_EX_NM}"
@@ -96,11 +98,13 @@ elseif(WEPOLL_EX_EXPORT_FORMAT STREQUAL "PE")
         epoll_wait
         epoll_wait_ex
         wepoll_close
+        wepoll_ex_get_capabilities
         wepoll_ex_get_global_stats
         wepoll_ex_get_socket_lifetime_policy
         wepoll_ex_get_stats
         wepoll_ex_version
-        wepoll_ex_version_string)
+        wepoll_ex_version_string
+        wepoll_ex_wake)
 
     execute_process(
         COMMAND "${WEPOLL_EX_OBJDUMP}" -p "${WEPOLL_EX_BINARY}"

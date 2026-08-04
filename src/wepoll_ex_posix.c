@@ -1109,8 +1109,8 @@ WEPOLL_EX_API int wepoll_ex_get_socket_lifetime_policy(void)
     return WEPOLL_EX_SOCKET_LIFETIME_NOT_APPLICABLE;
 }
 
-static int copy_stats_snapshot(void *destination, size_t destination_size,
-                               const void *snapshot, size_t snapshot_size)
+static int copy_versioned_snapshot(void *destination, size_t destination_size,
+                                   const void *snapshot, size_t snapshot_size)
 {
     size_t prefix_size = sizeof(uint32_t) * 2;
 
@@ -1127,6 +1127,21 @@ static int copy_stats_snapshot(void *destination, size_t destination_size,
     memcpy(destination, snapshot,
            destination_size < snapshot_size ? destination_size : snapshot_size);
     return 0;
+}
+
+WEPOLL_EX_API int wepoll_ex_get_capabilities(
+    wepoll_ex_capabilities *capabilities, size_t capabilities_size)
+{
+    wepoll_ex_capabilities snapshot;
+
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.version = WEPOLL_EX_CAPABILITIES_VERSION;
+    snapshot.struct_size = (uint32_t)sizeof(snapshot);
+    snapshot.flags = WEPOLL_EX_CAP_NATIVE_EDGE_QUEUE |
+                     WEPOLL_EX_CAP_ATOMIC_SIGNAL_MASK_WAIT |
+                     WEPOLL_EX_CAP_NATIVE_EPOLL_DESCRIPTOR;
+    return copy_versioned_snapshot(capabilities, capabilities_size,
+                                   &snapshot, sizeof(snapshot));
 }
 
 WEPOLL_EX_API int wepoll_ex_get_stats(int epfd, wepoll_ex_stats *stats,
@@ -1151,7 +1166,8 @@ WEPOLL_EX_API int wepoll_ex_get_stats(int epfd, wepoll_ex_stats *stats,
     snapshot.active_registrations = p->count;
     pthread_mutex_unlock(&p->lock);
     port_release(p);
-    return copy_stats_snapshot(stats, stats_size, &snapshot, sizeof(snapshot));
+    return copy_versioned_snapshot(stats, stats_size,
+                                   &snapshot, sizeof(snapshot));
 }
 
 WEPOLL_EX_API int wepoll_ex_get_global_stats(
@@ -1166,7 +1182,15 @@ WEPOLL_EX_API int wepoll_ex_get_global_stats(
     memset(&snapshot, 0, sizeof(snapshot));
     snapshot.version = WEPOLL_EX_STATS_VERSION;
     snapshot.struct_size = (uint32_t)sizeof(snapshot);
-    return copy_stats_snapshot(stats, stats_size, &snapshot, sizeof(snapshot));
+    return copy_versioned_snapshot(stats, stats_size,
+                                   &snapshot, sizeof(snapshot));
+}
+
+WEPOLL_EX_API int wepoll_ex_wake(int epfd)
+{
+    (void)epfd;
+    errno = EOPNOTSUPP;
+    return -1;
 }
 
 WEPOLL_EX_API int wepoll_close(int epfd)
@@ -1248,6 +1272,7 @@ int  ep_port_modify(ep_port_t *p, SOCKET f, uint32_t e, uint32_t fl,
                     epoll_data_t d, void *c)       { (void)p;(void)f;(void)e;(void)fl;(void)d;(void)c; errno=ENOSYS; return -1; }
 int  ep_port_unregister(ep_port_t *p, SOCKET f)    { (void)p;(void)f; errno=ENOSYS; return -1; }
 int  ep_port_rearm(ep_port_t *p, SOCKET f)         { (void)p;(void)f; errno=ENOSYS; return -1; }
+int  ep_port_wake(ep_port_t *p)                    { (void)p; errno=ENOSYS; return -1; }
 int  ep_port_wait(ep_port_t *p, epoll_event_ex *o, int m, int t, const sigset_t *s)
                                                     { (void)p;(void)o;(void)m;(void)t;(void)s; errno=ENOSYS; return -1; }
 void ep_sock_handle_completion(ep_sock_t *s, DWORD b, NTSTATUS st) { (void)s;(void)b;(void)st; }
