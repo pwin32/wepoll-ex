@@ -90,8 +90,12 @@ channel. The remaining cross-loop candidates are intentionally conditional:
 ### Socket lifetime ownership
 
 The existing best-effort, strict, and synchronized policies remain distinct.
-A production nginx profile should qualify synchronized mode only after every
-core and third-party path is proven to issue DEL before `closesocket()`.
+A synchronized nginx profile should qualify every included source path before
+deployment. The exact nginx 1.31.3 HTTP/mail/stream/OpenSSL tree and checked-in
+addon now pass `scripts/audit-nginx-close-paths.py`, and runtime close snapshots
+finish with zero live registrations and zero active quarantines. Every future
+third-party addon must be supplied as another scanner root; absent binary or
+source modules are not covered.
 `wepoll_ex_close_socket()` now performs DEL against one specified epfd and then
 closes the socket, accepting an already absent registration after validating
 the target. It neither retains a duplicate nor changes peer-FIN behavior. A
@@ -141,6 +145,13 @@ fallbacks. Optimization follows evidence: retain the AFD-only fast path when
 the completion is unambiguous, probe mixed-direction or terminal-race cases,
 and evaluate batched qualification before changing correctness behavior.
 
+The nginx explicit-rearm comparison now supplies application-level evidence.
+Ten paired tiny-response runs measured edge 8.64% below level at the paired
+median. Counters showed approximately one READ acknowledgement per request and
+zero WRITE rearms, so a batched class-acknowledgement API is a concrete future
+optimization candidate. It must define partial failure, stale registration,
+and per-entry error behavior before becoming a public API.
+
 ### Exclusive wake scope
 
 Windows `EPOLLEXCLUSIVE` arbitration is process-local and shared only by one
@@ -187,7 +198,9 @@ The built-in nginx experiment now covers accepting, HTTP keep-alive, TLS,
 upstream proxying, read and write backpressure, graceful FIN, abortive reset,
 direct client write-half-close, posted dispatch, reload, graceful worker exit,
 and multiple workers. Proxied client write-half-close is an identified stock
-Win32 nginx baseline because it fails in both level and edge modes. Remaining
-release gates are an audit of relevant third-party close paths and separate
-level/explicit-rearm performance measurements with probe, wake, and lifecycle
-counters recorded.
+Win32 nginx baseline because it fails in both level and edge modes. The exact
+configured source set passes the close scanner and clean runtime teardown, and
+the level/explicit-rearm comparison records probe, wake, delivery, rearm, and
+lifecycle diagnostics. Future addons and toolchain/provider targets remain
+separate deployment qualifications rather than unfinished evidence for this
+source set.

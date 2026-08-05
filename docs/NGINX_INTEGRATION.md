@@ -73,6 +73,7 @@ events {
     worker_connections 1024;
     wepoll_events 512;
     wepoll_edge on;
+    wepoll_close_audit on;
 }
 ```
 
@@ -80,6 +81,10 @@ events {
 nginx's posted queues. It exists to qualify the delayed ownership path and may
 add overhead; it is not required for ordinary edge operation. A worker logs
 READ/WRITE/terminal delivery and READ/WRITE rearm counters at process exit.
+`wepoll_close_audit on` is the default in both modes. It reports live
+registrations and ownership queues before port close, then reports global
+quarantine/lifecycle state after `wepoll_close()`. See
+`docs/NGINX_CLOSE_PATH_AUDIT.md` for the exact invariant.
 
 The staged work needed to qualify explicit edge rearming, notification,
 lifetime ownership, error bridging, probe optimization, and multiworker
@@ -107,7 +112,14 @@ at ADD; use it only because nginx's close path removes the registration before
 `closesocket()`. Every core and third-party module must preserve that
 DEL-before-close ordering. Third-party modules must not directly close a
 registered socket; whole-port process teardown is safe when no later socket
-reuse is possible.
+reuse is possible. Audit every addon source root before selecting synchronized
+mode:
+
+```sh
+python3 scripts/audit-nginx-close-paths.py \
+  --module-root nginx \
+  /path/to/nginx-1.31.3
+```
 
 `wepoll_ex_close_socket()` is available to a future adapter revision that can
 route final socket ownership through one close hook. It performs DEL against
@@ -149,7 +161,11 @@ The `wepoll_events` directive is restricted to a positive value that fits the
 
 3. Compare `ngx_event_module_t`, `ngx_event_actions_t`, module lifecycle,
    event flags, and Windows event-selection code with the exact headers.
-4. Configure nginx with the addon, then compile it with nginx's own Makefile.
+4. Run `scripts/audit-nginx-close-paths.py` against the extracted tree and
+   every addon source root. Do not use synchronized lifetime if the audit finds
+   a raw module `ngx_close_socket()`, `closesocket()`, or
+   `ngx_free_connection()` retirement.
+5. Configure nginx with the addon, then compile it with nginx's own Makefile.
    Leave the lifetime environment unset for best-effort mode, or select strict
    or synchronized deliberately:
 
@@ -168,16 +184,16 @@ The `wepoll_events` directive is restricted to a positive value that fits the
 
    The tracked `nginx/config` hook uses Windows-style paths so native
    `mingw32-make` can track addon dependencies.
-5. For a minimal end-to-end check, build nginx with HTTP (disabling optional
+6. For a minimal end-to-end check, build nginx with HTTP (disabling optional
    PCRE-dependent rewrite/gzip modules), configure `events { use wepoll; }`,
    and request a static loopback resource. This has passed locally with nginx
    1.31.3 and the requested MSYS2 GCC toolchain.
-6. Build nginx with the requested MinGW shell, record compiler/OS versions and
+7. Build nginx with the requested MinGW shell, record compiler/OS versions and
    the selected lifetime mode, run `nginx -t`, and exercise level mode before
    enabling edge mode. Stock Win32 nginx's `master_process off` path is a stub
    that handles hard stop only, so use normal master/worker mode for quit and
    reload testing.
-7. Run the standard-library endurance client against the already-running HTTP
+8. Run the standard-library endurance client against the already-running HTTP
    or HTTPS endpoint. It mixes normal requests, verified persistent keep-alive,
    slow partial headers, abortive client resets, client write-half-close, and
    opt-in response backpressure. The default is bounded; `--long` and
@@ -203,13 +219,24 @@ The `wepoll_events` directive is restricted to a positive value that fits the
    only for a disposable self-signed test endpoint. On stock Win32 nginx,
    `--reload-settle 0.75` avoids sending the first health request while a worker
    can still be inside its up-to-500 ms event wait and retiring.
-8. Run edge mode once normally and once with `wepoll_edge_post_events on`.
+9. Run edge mode once normally and once with `wepoll_edge_post_events on`.
    Confirm the worker-exit summary contains nonzero READ and WRITE delivery and
    rearm counts. This proves the test crossed the explicit ownership path rather
    than passing solely through an idle or level-triggered worker.
-9. Only after functional tests pass, collect latency or throughput data with a
-   reproducible workload. `bench_windows` measures the library directly; nginx
-   throughput remains a separate end-to-end measurement.
+10. Only after functional tests pass, run a balanced paired comparison. Keep
+    worker count, response, compiler flags, connection count, and client
+    threads identical; vary only `wepoll_edge on`:
+
+    ```sh
+    python3 scripts/nginx-h2load-compare.py \
+      --pairs 10 --duration 8 --warmup-duration 3 \
+      --connections 64 --threads 2 --pause-ms 750 \
+      http://127.0.0.1:LEVEL_PORT/bench \
+      http://127.0.0.1:EDGE_PORT/bench
+    ```
+
+    `bench_windows` measures the library directly; this script measures the
+    complete nginx/client path and rejects incomplete or non-2xx runs.
 
 ## Explicit-rearm qualification snapshot
 
@@ -249,12 +276,46 @@ client write-half-close failed identically in level and edge modes in the tested
 stock nginx configuration. It is recorded as an nginx/Win32 proxy baseline,
 while direct static and TLS write-half-close remain covered.
 
-This snapshot qualifies the tested built-in HTTP, TLS, and proxy paths. It does
-not audit arbitrary third-party modules for DEL-before-close, implement Linux
-file AIO or eventfd notification, establish cross-process `EPOLLEXCLUSIVE`, or
-make a throughput claim.
+The source close audit covered 168 nginx/addon files, 29 proper
+`ngx_close_connection()` calls, and zero unreviewed raw module retirements.
+Graceful level and edge workers then reported `active:0`, empty ownership
+queues, no stale/identity/asynchronous errors, and zero lifecycle quarantines.
+One final port-level AFD cancellation was pending in each mode and was drained
+by `wepoll_close()`; it was not attached to a live registration.
 
-## Local throughput snapshot
+This snapshot qualifies the tested built-in HTTP, TLS, proxy, and checked-in
+addon paths. A future third-party addon must be supplied to the source scanner;
+unknown binary modules remain outside the evidence. Linux file AIO/eventfd
+notification, cross-process `EPOLLEXCLUSIVE`, and local-shutdown interposition
+remain separate integration work.
+
+## Level versus explicit-rearm performance snapshot
+
+On August 5, 2026, the same nginx 1.31.3 source and synchronized wepoll-ex
+addon were rebuilt with MinGW GCC 16.1.0 at `-O2 -Werror`. Two one-worker
+servers used identical 43-byte `empty_gif` configurations; the only event-mode
+difference was `wepoll_edge on`. nghttp2 h2load 1.64.0 ran from WSL1 on an
+8-logical-CPU Intel Core i5-8300H with 64 HTTP/1.1 keep-alive connections, two
+client threads, a three-second warmup per mode, and ten alternating eight-second
+pairs. Every request completed with a 2xx response and there were no failures,
+errors, or timeouts.
+
+Level mode measured a 50,397 requests/s median and 51,007 requests/s mean.
+Explicit-rearm edge measured a 44,937 requests/s median and 44,975 requests/s
+mean. The paired edge delta had a -8.64% median, -11.63% mean, -17.83% p10,
+-5.91% p90, -37.21% minimum, and -4.46% maximum. The wide minimum is one local
+outlier; the paired median is the primary result.
+
+Across setup, warmups, and the recorded pairs, the edge worker logged 3,815,354
+READ deliveries, 3,811,214 READ rearms, 4,213 WRITE deliveries, and zero WRITE
+rearms. That rules out a continuously writable rearm loop: on this
+tiny-response workload, the measured cost is the explicit READ acknowledgement
+and fresh AFD observation performed for nearly every request. The result is a
+local worst-case event-rate measurement, not a portable capacity claim. Larger
+responses, TLS, proxying, and network latency may amortize different costs and
+retain their separate correctness/endurance qualification.
+
+## Historical local throughput snapshot
 
 On July 23, 2026, a disposable nginx 1.31.3/MinGW GCC 15.2 loopback build was
 tested with one worker, `empty_gif`, 32 HTTP/1.1 keep-alive connections, and

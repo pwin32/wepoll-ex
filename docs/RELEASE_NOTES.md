@@ -96,9 +96,29 @@ direct and forced-posted HTTP/TLS traffic, 8 MiB static and proxy backpressure,
 abortive reset, direct write-half-close, two workers, repeated reload, and
 graceful worker cleanup. Nonzero READ/WRITE rearm counters prove the explicit
 ownership path ran. Proxied client write-half-close failed identically in level
-and edge modes and is retained as a stock Win32 nginx baseline. Arbitrary
-third-party close paths, native file AIO/notify, local-shutdown interposition,
-and controlled throughput comparisons remain outside this qualification.
+and edge modes and is retained as a stock Win32 nginx baseline.
+
+The final August 5 nginx qualification adds a default-on
+`wepoll_close_audit` worker-exit snapshot and the repeatable
+`scripts/audit-nginx-close-paths.py` source gate. The exact nginx 1.31.3 HTTP,
+mail, stream, and OpenSSL event sources plus the checked-in addon covered 168
+files, 29 proper `ngx_close_connection()` retirements, and zero unreviewed raw
+module closes/frees. Level and edge graceful exits reported zero live
+registrations, empty ownership queues, no stale/identity/asynchronous errors,
+and zero quarantined, irrecoverable, timed-out, or active ports after close.
+One final cancellation-losing AFD request was reported and drained by port
+close after the last registration had already been deleted.
+
+`scripts/nginx-h2load-compare.py` adds balanced alternating-order warmups,
+strict result parsing, paired deltas, and JSON records. A synchronized `-O2`
+GCC 16.1.0 nginx build serving a 43-byte response completed ten eight-second
+pairs with 64 HTTP/1.1 keep-alive connections and no failed requests. Edge
+measured 44,937 requests/s versus level's 50,397 requests/s at the median; the
+paired edge median was -8.64%. Edge counters showed about one READ rearm per
+request, 4,213 WRITE deliveries, and zero WRITE rearms, ruling out a writable
+rearm loop. Native file AIO/notify, local-shutdown interposition, unknown addons
+not supplied to the scanner, and cross-process exclusive behavior remain
+outside this qualification.
 
 Qualification for this slice used Windows 10.0.19044.1826 with MSYS2 MinGW
 GCC 16.1.0 and Release `-O2 -Wall -Wextra -Wpedantic -Werror` builds. The

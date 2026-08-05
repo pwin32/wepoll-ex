@@ -166,9 +166,14 @@ These are candidates, not promises:
 
 The end-to-end explicit-rearm nginx experiment now covers accept, posted
 events, TLS, proxy backpressure, FIN/reset, reload, graceful worker exit, and
-the stock built-in close paths exercised by those workloads. The next useful
-steps are a third-party close-path audit and controlled level-versus-edge
-measurements, not another unconditional epoll flag.
+the stock built-in close paths exercised by those workloads. The exact nginx
+HTTP/mail/stream/OpenSSL sources and checked-in addon now pass a repeatable raw
+close scanner, and graceful workers report zero live registrations and zero
+active quarantines. A ten-pair tiny-response comparison measured explicit
+rearm 8.64% below level mode at the paired median, with approximately one READ
+rearm per request and no WRITE rearm loop. Future work should target measured
+acknowledgement batching or a demonstrated integration gap, not another
+unconditional epoll flag.
 
 The resulting source-porting surface and the remaining non-drop-in descriptor
 boundaries are summarized in `WINDOWS_PORTING.md`.

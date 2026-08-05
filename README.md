@@ -225,7 +225,13 @@ shutdown readiness only in the specified underlying port (including its
 virtual aliases). Stock nginx's Linux module still needs handler-completion
 rearm hooks, especially for posted events; this is not a symbol-only port. The
 checked-in nginx adapter supplies those hooks behind `wepoll_edge on`, while
-retaining level-triggered operation as its default.
+retaining level-triggered operation as its default. `wepoll_close_audit on`
+(also the default) reports live registration/queue state before worker port
+close and lifecycle quarantine state afterward. Audit every included addon
+with `scripts/audit-nginx-close-paths.py`; compare identical running level and
+edge endpoints with `scripts/nginx-h2load-compare.py`. The exact source audit,
+runtime invariant, and measured tiny-response overhead are recorded in
+`docs/NGINX_CLOSE_PATH_AUDIT.md` and `docs/NGINX_INTEGRATION.md`.
 
 Windows control calls classify the target before membership errors where Linux
 does: an invalid or closed target returns `EBADF`, a valid supported target

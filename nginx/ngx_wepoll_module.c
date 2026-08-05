@@ -32,6 +32,7 @@ typedef struct {
     ngx_uint_t  events;
     ngx_flag_t  edge;
     ngx_flag_t  edge_post_events;
+    ngx_flag_t  close_audit;
 } ngx_wepoll_conf_t;
 
 typedef struct {
@@ -98,6 +99,13 @@ static ngx_command_t ngx_wepoll_commands[] = {
       offsetof(ngx_wepoll_conf_t, edge_post_events),
       NULL },
 
+    { ngx_string("wepoll_close_audit"),
+      NGX_EVENT_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      0,
+      offsetof(ngx_wepoll_conf_t, close_audit),
+      NULL },
+
       ngx_null_command
 };
 
@@ -113,6 +121,7 @@ static ngx_uint_t                      ngx_wepoll_state_count;
 static ngx_uint_t                      ngx_wepoll_pending_count;
 static ngx_uint_t                      ngx_wepoll_edge_enabled;
 static ngx_uint_t                      ngx_wepoll_edge_post_events;
+static ngx_uint_t                      ngx_wepoll_close_audit;
 static ngx_uint_t                      ngx_wepoll_port_edge;
 static ngx_uint_t                      ngx_wepoll_missing_edge_flag_logged;
 static uint64_t                        ngx_wepoll_edge_read_deliveries;
@@ -913,6 +922,7 @@ ngx_wepoll_init(ngx_cycle_t *cycle, ngx_msec_t timer)
 
     ngx_wepoll_edge_enabled = wcf->edge;
     ngx_wepoll_edge_post_events = wcf->edge_post_events;
+    ngx_wepoll_close_audit = wcf->close_audit;
     if (ngx_wepoll_edge_post_events && !ngx_wepoll_edge_enabled) {
         ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
                       "wepoll_edge_post_events requires wepoll_edge on");
@@ -1015,6 +1025,49 @@ ngx_wepoll_init(ngx_cycle_t *cycle, ngx_msec_t timer)
 static void
 ngx_wepoll_done(ngx_cycle_t *cycle)
 {
+    ngx_uint_t       audit_failed, audit_level;
+    wepoll_ex_global_stats global_stats;
+    wepoll_ex_stats  stats;
+
+    if (ngx_wepoll_epfd != -1 && ngx_wepoll_close_audit) {
+        ngx_memzero(&stats, sizeof(stats));
+        if (wepoll_ex_get_stats(ngx_wepoll_epfd, &stats, sizeof(stats)) == -1) {
+            ngx_wepoll_log_errno(cycle->log, "wepoll_ex_get_stats", -1);
+
+        } else {
+            /* A port may still own one cancellation-losing AFD request after
+             * its final registration has been DEL'ed.  wepoll_close() drains
+             * that port-level request; it is not a socket close-path leak. */
+            audit_failed = stats.active_registrations != 0 ||
+                           stats.rearm_queue_depth != 0 ||
+                           stats.oneshot_probe_queue_depth != 0 ||
+                           stats.ready_queue_depth != 0;
+            audit_level = ngx_exiting && !ngx_terminate && audit_failed
+                          ? NGX_LOG_ALERT : NGX_LOG_NOTICE;
+
+            ngx_log_error(audit_level, cycle->log, 0,
+                          "wepoll_ex: close audit %s policy:%ui "
+                          "active:%uL pending:%uL rearm:%uL probes:%uL "
+                          "ready:%uL stale:%uL identity:%uL async:%uL "
+                          "wake:%uL/%uL/%uL tcp-probe:%uL/%uL",
+                          audit_failed ? "dirty" : "clean",
+                          (ngx_uint_t) stats.socket_lifetime_policy,
+                          stats.active_registrations,
+                          stats.pending_polls,
+                          stats.rearm_queue_depth,
+                          stats.oneshot_probe_queue_depth,
+                          stats.ready_queue_depth,
+                          stats.stale_events_dropped,
+                          stats.identity_failures,
+                          stats.asynchronous_errors,
+                          stats.wake_requests,
+                          stats.wake_coalesced,
+                          stats.wake_returns,
+                          stats.tcp_current_level_probes,
+                          stats.tcp_current_level_fallbacks);
+        }
+    }
+
     if (ngx_wepoll_edge_enabled) {
         ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
                       "wepoll_ex: edge summary read deliveries:%uL "
@@ -1032,6 +1085,29 @@ ngx_wepoll_done(ngx_cycle_t *cycle)
             ngx_wepoll_log_errno(cycle->log, "wepoll_close", -1);
         }
         ngx_wepoll_epfd = -1;
+    }
+    if (ngx_wepoll_close_audit) {
+        ngx_memzero(&global_stats, sizeof(global_stats));
+        if (wepoll_ex_get_global_stats(&global_stats, sizeof(global_stats))
+            == -1)
+        {
+            ngx_wepoll_log_errno(cycle->log,
+                                 "wepoll_ex_get_global_stats", -1);
+
+        } else {
+            audit_level = ngx_exiting && !ngx_terminate &&
+                          global_stats.active_quarantines != 0
+                          ? NGX_LOG_ALERT : NGX_LOG_NOTICE;
+            ngx_log_error(audit_level, cycle->log, 0,
+                          "wepoll_ex: lifecycle audit quarantined:%uL "
+                          "reaped:%uL irrecoverable:%uL timeouts:%uL "
+                          "active:%uL",
+                          global_stats.quarantined_ports,
+                          global_stats.reaped_ports,
+                          global_stats.irrecoverable_ports,
+                          global_stats.api_close_timeouts,
+                          global_stats.active_quarantines);
+        }
     }
     if (ngx_wepoll_events != NULL) {
         ngx_free(ngx_wepoll_events);
@@ -1052,6 +1128,7 @@ ngx_wepoll_done(ngx_cycle_t *cycle)
     ngx_wepoll_pending_count = 0;
     ngx_wepoll_edge_enabled = 0;
     ngx_wepoll_edge_post_events = 0;
+    ngx_wepoll_close_audit = 0;
     ngx_wepoll_port_edge = 0;
     ngx_wepoll_missing_edge_flag_logged = 0;
     ngx_wepoll_edge_read_deliveries = 0;
@@ -1079,6 +1156,7 @@ ngx_wepoll_create_conf(ngx_cycle_t *cycle)
     wcf->events = NGX_CONF_UNSET_UINT;
     wcf->edge = NGX_CONF_UNSET;
     wcf->edge_post_events = NGX_CONF_UNSET;
+    wcf->close_audit = NGX_CONF_UNSET;
     return wcf;
 }
 
@@ -1091,5 +1169,6 @@ ngx_wepoll_init_conf(ngx_cycle_t *cycle, void *conf)
     ngx_conf_init_uint_value(wcf->events, 512);
     ngx_conf_init_value(wcf->edge, 0);
     ngx_conf_init_value(wcf->edge_post_events, 0);
+    ngx_conf_init_value(wcf->close_audit, 1);
     return NGX_CONF_OK;
 }

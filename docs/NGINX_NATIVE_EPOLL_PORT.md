@@ -174,19 +174,32 @@ descriptors.
 Explicit rearm removes repeated observation of a continuously writable class
 while preserving native AFD coverage for the other directions.  It should
 reduce the main avoidable overhead in an nginx-style duplex ET registration,
-but no throughput claim follows from the mechanism alone.  Extra cancellation
-is possible when a handler rearms one direction while another direction has a
-narrow pending request, and established TCP delivery may still use the
-current-level `WSAPoll` qualification needed for FIN/reset races.
+but it adds one explicit acknowledgement for each drained readiness class.
+Extra cancellation is possible when a handler rearms one direction while
+another direction has a narrow pending request, and established TCP delivery
+may still use the current-level `WSAPoll` qualification needed for FIN/reset
+races.
+
+A controlled ten-pair local `empty_gif` comparison measured the edge adapter
+8.64% below level mode at the paired median. The edge worker performed about
+one READ rearm per completed request and zero WRITE rearms, so the difference
+was not a writable readiness loop; it was the fixed per-request ownership
+handoff on an intentionally tiny response. A future batch acknowledgement API
+could reduce epfd lookup and lock traffic when one wait returns many drained
+connections, but it would be a new public contract and requires its own
+failure/partial-progress semantics and regression matrix.
 
 The checked-in adapter has now covered accept draining, HTTP keep-alive, TLS,
 upstream proxying, read/write backpressure, graceful FIN, abortive reset,
 direct client write-half-close, posted events, reload, graceful worker exit,
 and multiple workers in bounded loopback tests. Proxied client write-half-close
 failed identically in level and edge modes and remains a stock Win32 nginx
-baseline rather than an edge-specific pass. Arbitrary third-party close paths
-still require an audit, and level versus explicit-rearm throughput must be
-measured separately with probe, wake, and lifecycle diagnostics recorded.
+baseline rather than an edge-specific pass. The nginx 1.31.3 HTTP/mail/stream/
+OpenSSL sources and checked-in addon passed the close-path scanner, while
+runtime level and edge workers exited with zero live registrations and zero
+active quarantines. Any future addon must be supplied to that scanner; unknown
+binary modules remain outside the evidence. The exact audit and performance
+method are in `NGINX_CLOSE_PATH_AUDIT.md` and `NGINX_INTEGRATION.md`.
 
 The broader nginx/libuv/Mio/Asio comparison and the reasons for not treating
 native completion facilities as epoll flags are recorded in

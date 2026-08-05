@@ -11,6 +11,8 @@
  * operation remains the default.  `wepoll_edge on` opts into the separately
  * qualified explicit-rearm EPOLLET contract, and
  * `wepoll_edge_post_events on` forces posted dispatch for qualification.
+ * `wepoll_close_audit on` (the default) reports registration and ownership
+ * queue state before port close and lifecycle quarantine state afterward.
  *
  * Event data stores nginx's connection pointer plus its instance bit.  Edge
  * mode additionally stores stable per-connection adapter state in user_ctx so
