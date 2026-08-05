@@ -2,8 +2,8 @@
 
 ## Scope
 
-This audit was performed on August 4, 2026 against the exact reference
-archives stored beside the repository:
+This audit was performed on August 4, 2026 and revisited on August 5, 2026
+against the exact reference archives stored beside the repository:
 
 - `nginx-1.31.3.tar.gz` (`nginx` 1.31.3);
 - `libuv-v1.52.1.tar.gz` (libuv 1.52.1);
@@ -23,10 +23,10 @@ Windows IOCP/AFD implementations that are more integrated than an epoll shim.
 
 | Source | Native pattern | Useful wepoll-ex mapping | Remaining boundary |
 | --- | --- | --- | --- |
-| nginx 1.31.3 | Duplex socket ET, eventfd notify/AIO, pointer plus instance bit | Explicit readiness-class rearm; tagged wake for control notify | Handler-completion rearm, DEL-before-close, file AIO, multi-process exclusive behavior |
+| nginx 1.31.3 | Duplex socket ET, eventfd notify/AIO, pointer plus instance bit | Explicit readiness-class rearm; tagged wake for control notify; close helper | Handler-completion rearm, file AIO, multi-process exclusive behavior |
 | libuv 1.52.1 | Linux LT epoll with queued changes; native Windows IOCP/AFD | Tagged wake for an epoll-shaped experiment; existing LT semantics | Replacing libuv's Windows backend would lose native completion integration |
-| Mio 1.2.2 | Unix ET plus eventfd; Windows AFD disarm/rearm plus tagged IOCP wake | Explicit class rearm closely matches `WouldBlock` ownership; tagged wake matches its Waker | Unix selector cloning needs a virtual epfd alias; named-pipe IOCP is separate |
-| Boost.Asio 1.38.2 | Socket ET, dynamic write MOD, persistent eventfd interrupter | Observed ET works; explicit rearm can avoid writable resampling; tagged wake replaces the interrupter side channel | Handler changes, DEL-before-close, timer/file completion integration |
+| Mio 1.2.2 | Unix ET plus eventfd; Windows AFD disarm/rearm plus tagged IOCP wake | Explicit class rearm closely matches `WouldBlock` ownership; tagged wake matches its Waker; virtual aliases match selector cloning | Named-pipe IOCP is separate; the alias is not a native descriptor |
+| Boost.Asio 1.38.2 | Socket ET, dynamic write MOD, persistent eventfd interrupter | Observed ET works; explicit rearm can avoid writable resampling; tagged wake replaces the interrupter side channel | Handler changes, timer/file completion integration |
 
 ## nginx 1.31.3
 
@@ -83,11 +83,12 @@ disarmed, and the I/O wrapper rearms after an operation reaches
 `epoll_rearm_classes()` for that direction. Mio's Windows Waker posts a tagged
 IOCP completion, which maps directly to `wepoll_ex_wake_event()`.
 
-A source-oriented port of Mio's Unix selector would still encounter two
-structural gaps. Windows virtual epfds cannot currently be cloned or aliased,
-and Mio's Windows named-pipe support uses a separate completion path rather
-than socket readiness. Neither gap should be hidden behind ordinary
-`epoll_create1()` or socket registrations.
+A source-oriented port of Mio's Unix selector can now use
+`wepoll_ex_dup()` for its same-process selector-clone lifetime. The aliases
+share one port and final close owns destruction, but they remain virtual
+integers rather than native duplicable descriptors. Mio's Windows named-pipe
+support still uses a separate completion path rather than socket readiness;
+that boundary should not be hidden behind ordinary socket registrations.
 
 ## Boost.Asio 1.38.2
 
@@ -105,11 +106,6 @@ after its operation reaches `WouldBlock`. A tagged wake can replace the
 persistent eventfd interrupter. Waitable HANDLE ET now has a regression for
 Asio's exact persistent-ready plus MOD-retrigger behavior.
 
-Asio's Linux close paths may omit DEL when the descriptor is already closing.
-A synchronized Windows integration must change that ordering. Native Windows
-IOCP remains the preferred Asio backend when the goal is full completion-based
-integration rather than source compatibility with the epoll reactor.
-
 ## Improvements selected from the audit
 
 The following library work is implemented and regression-tested:
@@ -124,17 +120,23 @@ The following library work is implemented and regression-tested:
    MOD-retrigger pattern without resetting the ready level.
 4. Fault injection verifies that a failed tagged IOCP post clears pending wake
    state and makes the port fail through the existing fatal-post path.
+5. `wepoll_ex_dup()` supplies a virtual selector alias with shared readiness
+   and final-close ownership, covering Mio's process-local clone requirement
+   without claiming native descriptor semantics.
+6. `wepoll_ex_close_socket()` performs one-port DEL-before-close ordering
+   without retaining the socket; multi-port ownership remains explicit.
+7. Explicit readiness-class rearm now composes with `EPOLLONESHOT`; partial
+   acknowledgement keeps the one-shot disabled and the final class starts the
+   next generation.
+8. `wepoll_ex_get_last_error_info()` distinguishes portable errno, exact native
+   Win32/Winsock/NTSTATUS sources, and canonical Winsock equivalents.
+9. The opt-in `wepoll_ex::epoll_compat` package target exposes an isolated
+   Windows `<sys/epoll.h>` include path for source-oriented builds.
 
 ## Remaining candidates
 
 These are candidates, not promises:
 
-- Add a close-aware registration handle or helper only if an embedder can use
-  it consistently. It must not silently retain sockets or change peer-FIN
-  behavior.
-- Add an explicit virtual-epfd alias/clone API if a real port needs Mio's Unix
-  `try_clone()` contract. The aliases would share one port and close it only
-  after the final reference.
 - Prototype a supplemental/double-buffered AFD request for interest expansion,
   inspired by libuv, only after cancellation and probe counters show a useful
   bottleneck. It increases request, provider-handle, and close complexity.
@@ -148,3 +150,6 @@ The highest-value next step is an end-to-end explicit-rearm nginx experiment,
 not another unconditional epoll flag. It must qualify accept, posted events,
 TLS, proxy backpressure, FIN/reset, reload, graceful quit, and every close path
 before performance comparisons are meaningful.
+
+The resulting source-porting surface and the remaining non-drop-in descriptor
+boundaries are summarized in `WINDOWS_PORTING.md`.

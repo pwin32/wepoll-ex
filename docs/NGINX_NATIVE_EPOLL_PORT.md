@@ -52,15 +52,20 @@ as MOD.
 
 `epoll_rearm()` is an all-class shorthand on such a registration.  A successful
 MOD clears all class disarms and starts a fresh observation.  DEL retires an
-idle or pending registration normally.  `EPOLLONESHOT` and `EPOLLEXCLUSIVE`
-cannot be combined with socket ET on an explicit-rearm port in this initial
-contract; pipe and generic waitable ET are also outside its scope.  POSIX does
-not emulate the extension and reports `EOPNOTSUPP`.
+idle or pending registration normally. `EPOLLONESHOT` can be combined with
+socket ET on an explicit-rearm port: acknowledging only some classes from a
+fired delivery keeps the one-shot disabled, and acknowledging the final class
+starts its next generation. `EPOLLEXCLUSIVE` remains incompatible; pipe and
+generic waitable ET are also outside this contract. POSIX does not emulate the
+extension and reports `EOPNOTSUPP`.
 
 A terminal delivery can leave no native poll in flight.  Explicit-rearm users
 must therefore complete `EPOLL_CTL_DEL` before `closesocket()`.  This matches
 the synchronized lifetime profile intended for an nginx experiment, but every
 core and third-party close path still needs qualification.
+`wepoll_ex_close_socket()` can centralize DEL-then-close for a socket owned by
+one epfd; it does not remove registrations from other ports or discover nginx
+objects that bypass the chosen close wrapper.
 
 ## Notification bridge
 
@@ -96,6 +101,14 @@ Using this facility is more than changing `epoll_create`, `epoll_ctl`, and
 6. the control notify path must use a tagged wake or another Windows primitive;
    optional Linux file AIO and native epoll-fd close assumptions still need
    separate Windows implementations.
+
+The build can retain nginx's `<sys/epoll.h>` include through the opt-in
+`wepoll_ex::epoll_compat` target, but that removes only a source-level include
+edit. `wepoll_ex_dup()` can supply same-process shared epfd aliases if nginx
+code needs them; it is not a native descriptor and cannot satisfy inheritance,
+`fcntl`, or `ioctl` assumptions. `wepoll_ex_get_last_error_info()` can bridge a
+failed wepoll-ex control operation into nginx logging without guessing whether
+the normalized errno originated as Win32, Winsock, or NTSTATUS.
 
 Those changes can be localized around nginx's event lifecycle, but they are
 semantic changes rather than symbol aliases.  The checked-in

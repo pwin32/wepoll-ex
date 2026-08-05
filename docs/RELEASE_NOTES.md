@@ -44,15 +44,34 @@ same-mask-MOD interrupter pattern. The audit also records conditional future
 work—virtual epfd aliases and supplemental AFD requests—without claiming that
 wepoll-ex should replace libuv, Mio, or Asio's native Windows IOCP backends.
 
+On August 5, 2026, five opt-in porting bridges were added from that audit.
+Windows packages can export an isolated `wepoll_ex::epoll_compat` target whose
+include root supplies `<sys/epoll.h>` without making the ordinary library target
+shadow platform headers. `wepoll_ex_close_socket()` performs one-port
+DEL-before-`closesocket()` ordering without retaining a socket;
+`wepoll_ex_dup()` creates a same-process virtual epfd alias whose registrations,
+waits, readiness, and final-close lifetime are shared. Explicit readiness-class
+rearm now composes with `EPOLLONESHOT`: partial acknowledgement keeps the fired
+one-shot disabled and the final class starts its next generation, with injected
+submission-failure coverage for exact state/worklist rollback.
+`wepoll_ex_get_last_error_info()` adds a per-thread versioned channel that
+distinguishes portable errno, exact Win32/Winsock/NTSTATUS sources, and marked
+canonical Winsock equivalents. New capability bits advertise all four runtime
+contracts. POSIX supplies the close helper and portable error record, directs
+callers to native `dup()` instead of the virtual-alias extension, and does not
+install the Windows compatibility header target. The remaining non-drop-in
+descriptor and completion boundaries are documented in
+`docs/WINDOWS_PORTING.md`.
+
 Qualification for this slice used Windows 10.0.19044.1826 with MSYS2 MinGW
 GCC 16.1.0 and Release `-O2 -Wall -Wextra -Wpedantic -Werror` builds. The
 combined, static-only, shared-only, strict combined, strict shared,
-synchronized combined, and synchronized shared lanes contained 190, 188, 108,
-190, 108, 190, and 108 CTest entries. Their passed/skipped counts were 189/1,
-187/1, 107/1, 189/1, 107/1, 185/5, and 103/5; the skips are the documented
+synchronized combined, and synchronized shared lanes contained 193, 191, 109,
+193, 109, 193, and 109 CTest entries. Their passed/skipped counts were 192/1,
+190/1, 108/1, 192/1, 108/1, 188/5, and 104/5; the skips are the documented
 environment-dependent IPv4 UDP/ICMP case plus four synchronized-lifetime
-native-reuse identity cases. Focused repeats passed 100/100 in combined/static/
-strict/synchronized builds and 61/61 in shared-only builds. Linux/WSL GCC
+native-reuse identity cases. Focused repeats passed 103/103 in combined/static/
+strict/synchronized builds and 62/62 in shared-only builds. Linux/WSL GCC
 14.2.0 strict Release passed 5/5 for both native and forced-fallback
 `epoll_pwait2`, five repeats each of the API, large-wait, and pool lanes, and
 4/4 under ASan/UBSan.

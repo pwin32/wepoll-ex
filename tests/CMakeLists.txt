@@ -243,6 +243,7 @@ else()
                 failed-mod
                 failed-rearm
                 explicit-rearm-state
+                explicit-oneshot-rearm-state
                 pending-metadata-mod
                 pending-narrowing-mod
                 pending-expansion-mod
@@ -376,6 +377,7 @@ else()
             explicit-rearm
             explicit-terminal
             explicit-fin
+            explicit-oneshot
             explicit-contract
             exclusive-mod
             exclusive-wake
@@ -517,6 +519,7 @@ else()
 
         foreach(_fault_mode IN ITEMS
                 framework
+                error-info-native
                 pool-init
                 pool-grow
                 afd-open

@@ -874,7 +874,7 @@ static int ep_handle_wait_access(HANDLE handle)
         handle, (ULONG)ObjectBasicInformation, &info, (ULONG)sizeof(info),
         &return_length);
     if (status < 0) {
-        ep_set_errno(ep_winerr_to_errno(ep_ntstatus_to_winerr(status)));
+        ep_set_ntstatus_error(status);
         return 0;
     }
     return (info.GrantedAccess & SYNCHRONIZE) != 0 ? 1 : -2;
@@ -906,7 +906,7 @@ static int ep_handle_waitability(HANDLE handle, DWORD file_type,
             handle, (ULONG)ObjectTypeInformation, storage,
             (ULONG)sizeof(storage), &return_length);
         if (status < 0) {
-            ep_set_errno(ep_winerr_to_errno(ep_ntstatus_to_winerr(status)));
+            ep_set_ntstatus_error(status);
             return 0;
         }
         type_info = (PUBLIC_OBJECT_TYPE_INFORMATION *)storage;
@@ -1404,7 +1404,7 @@ static int ep_waitable_register_locked(ep_sock_t *sock)
             sock,
             INFINITE,
             WT_EXECUTEONLYONCE | WT_EXECUTEINWAITTHREAD)) {
-        ep_set_errno(ep_winerr_to_errno(GetLastError()));
+        ep_set_win32_error(GetLastError());
         return -1;
     }
     sock->wait_registration = registration;
@@ -1430,7 +1430,7 @@ static int ep_waitable_unregister_locked(ep_sock_t *sock)
         DWORD error = GetLastError();
         if (error != ERROR_INVALID_HANDLE) {
             ep_aux_wait_callback_idle(sock);
-            ep_set_errno(ep_winerr_to_errno(error));
+            ep_set_win32_error(error);
             return -1;
         }
     }
@@ -1451,7 +1451,7 @@ static int ep_pipe_query_access(HANDLE handle, uint8_t *access_out)
         handle, (ULONG)ObjectBasicInformation, &info, (ULONG)sizeof(info),
         &return_length);
     if (status < 0) {
-        ep_set_errno(ep_winerr_to_errno(ep_ntstatus_to_winerr(status)));
+        ep_set_ntstatus_error(status);
         return -1;
     }
     if ((info.GrantedAccess &
@@ -1981,7 +1981,7 @@ static int ep_pipe_delete_timer_locked(ep_sock_t *sock)
         DWORD error = GetLastError();
         if (error != ERROR_INVALID_HANDLE) {
             ep_aux_wait_callback_idle(sock);
-            ep_set_errno(ep_winerr_to_errno(error));
+            ep_set_win32_error(error);
             return -1;
         }
     }
@@ -1999,7 +1999,7 @@ static int ep_pipe_schedule_locked(ep_sock_t *sock, uint32_t level)
     }
     if (level != 0) {
         if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
-            ep_set_errno(ep_winerr_to_errno(GetLastError()));
+            ep_set_win32_error(GetLastError());
             return -1;
         }
         return 0;
@@ -2008,7 +2008,7 @@ static int ep_pipe_schedule_locked(ep_sock_t *sock, uint32_t level)
      * while armed; completion re-evaluates readiness. */
     if (!CreateTimerQueueTimer(&timer, NULL, ep_pipe_timer_callback, sock,
                               1, 0, WT_EXECUTEONLYONCE)) {
-        ep_set_errno(ep_winerr_to_errno(GetLastError()));
+        ep_set_win32_error(GetLastError());
         return -1;
     }
     sock->wait_registration = timer;
@@ -2515,6 +2515,17 @@ static void ep_sock_set_oneshot_fired_locked(ep_sock_t *sock, int fired)
         sock->oneshot_fired = 0;
         port->oneshot_fired_count--;
     }
+}
+
+static void ep_sock_restore_worklist_state_locked(ep_sock_t *sock,
+                                                  uint8_t needs_rearm,
+                                                  uint8_t oneshot_fired)
+{
+    assert(!(needs_rearm && oneshot_fired));
+    ep_sock_set_needs_rearm_locked(sock, 0);
+    ep_sock_set_oneshot_fired_locked(sock, 0);
+    ep_sock_set_needs_rearm_locked(sock, needs_rearm);
+    ep_sock_set_oneshot_fired_locked(sock, oneshot_fired);
 }
 
 int ep_port_worklists_valid_locked(const ep_port_t *port)
@@ -3091,7 +3102,7 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated,
              * ready node represents it.  Replay ownership before touching the
              * HANDLE again so a later signal/count cannot overtake it. */
             if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
-                ep_set_errno(ep_winerr_to_errno(GetLastError()));
+                ep_set_win32_error(GetLastError());
                 return -1;
             }
             ep_sock_set_needs_rearm_locked(sock, 0);
@@ -3122,7 +3133,7 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated,
                 ep_set_errno(EBADF);
                 return 1;
             }
-            ep_set_errno(ep_winerr_to_errno(error));
+            ep_set_win32_error(error);
             return -1;
         }
         if (wait_result != WAIT_OBJECT_0 && may_consume) {
@@ -3136,7 +3147,7 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated,
         }
         if (wait_result == WAIT_OBJECT_0) {
             if (!ep_aux_post_completion(sock, STATUS_SUCCESS)) {
-                ep_set_errno(ep_winerr_to_errno(GetLastError()));
+                ep_set_win32_error(GetLastError());
                 return -1;
             }
         } else if (ep_waitable_register_locked(sock) != 0) {
@@ -3277,7 +3288,7 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated,
                                       memory_order_relaxed);
                 ep_sock_set_needs_rearm_locked(sock, 1);
                 ep_port_fail_iocp_post(port, post_error);
-                ep_set_errno(ep_winerr_to_errno(post_error));
+                ep_set_win32_error(post_error);
                 return -1;
             }
         }
@@ -4100,7 +4111,7 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     }
     port->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (port->iocp == NULL) {
-        ep_set_errno(ep_winerr_to_errno(GetLastError()));
+        ep_set_win32_error(GetLastError());
         goto fail;
     }
     port->iocp_post_handle = port->iocp;
@@ -4146,7 +4157,9 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
 
 fail:
     {
-        int saved_errno = ep_last_err();
+        wepoll_ex_error_info saved_error;
+
+        ep_get_last_error_info(&saved_error);
         if (port->afd != NULL) {
             CloseHandle(port->afd);
         }
@@ -4180,7 +4193,7 @@ fail:
             pthread_mutex_destroy(&port->fd_table_lock);
         }
         free(port);
-        ep_set_errno(saved_errno);
+        ep_restore_last_error_info(&saved_error);
         return -1;
     }
 }
@@ -4290,7 +4303,7 @@ static int ep_port_drain_pending_until(ep_port_t *port, uint64_t deadline)
         if (!ok) {
             DWORD error = GetLastError();
             if (error == WAIT_TIMEOUT) continue;
-            ep_set_errno(ep_winerr_to_errno(error));
+            ep_set_win32_error(error);
             return -1;
         }
         for (ULONG i = 0; i < removed; i++) {
@@ -4634,7 +4647,7 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
             ep_set_errno(EOPNOTSUPP);
             return -1;
         }
-        if ((flags & (EPOLLONESHOT | EPOLLEXCLUSIVE)) != 0) {
+        if ((flags & EPOLLEXCLUSIVE) != 0) {
             ep_afd_pool_give(&port->afd_info_pool, sock->afd_info);
             free(sock);
             pthread_mutex_unlock(&port->fd_table_lock);
@@ -4689,15 +4702,21 @@ int ep_port_register(ep_port_t *port, SOCKET fd,
                                 memory_order_acquire)))) {
         int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
         if (submit_result < 0) {
+            wepoll_ex_error_info saved_error;
+
+            ep_get_last_error_info(&saved_error);
             ep_fd_table_remove(port, sock);
             ep_sock_free_locked(port, sock);
             pthread_mutex_unlock(&port->fd_table_lock);
+            ep_restore_last_error_info(&saved_error);
             return -1;
         }
         if (submit_result > 0) {
-            int saved_errno = ep_last_err();
+            wepoll_ex_error_info saved_error;
+
+            ep_get_last_error_info(&saved_error);
             pthread_mutex_unlock(&port->fd_table_lock);
-            ep_set_errno(saved_errno);
+            ep_restore_last_error_info(&saved_error);
             return -1;
         }
     }
@@ -4768,11 +4787,6 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
         if (sock->kind != EP_REG_SOCKET) {
             pthread_mutex_unlock(&port->fd_table_lock);
             ep_set_errno(EOPNOTSUPP);
-            return -1;
-        }
-        if ((flags & EPOLLONESHOT) != 0) {
-            pthread_mutex_unlock(&port->fd_table_lock);
-            ep_set_errno(EINVAL);
             return -1;
         }
     }
@@ -4934,13 +4948,17 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
                               memory_order_acquire)) {
         int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
         if (submit_result > 0) {
-            int saved_errno = ep_last_err();
+            wepoll_ex_error_info saved_error;
+
+            ep_get_last_error_info(&saved_error);
             pthread_mutex_unlock(&port->fd_table_lock);
-            ep_set_errno(saved_errno);
+            ep_restore_last_error_info(&saved_error);
             return -1;
         }
         if (submit_result < 0) {
-            int saved_errno = ep_last_err();
+            wepoll_ex_error_info saved_error;
+
+            ep_get_last_error_info(&saved_error);
             sock->user_events = old_user_events;
             sock->user_flags = old_user_flags;
             sock->user_data = old_user_data;
@@ -4949,8 +4967,8 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
             sock->observed_events = old_observed_events;
             sock->explicit_disarmed_classes =
                 old_explicit_disarmed_classes;
-            ep_sock_set_oneshot_fired_locked(sock, old_oneshot_fired);
-            ep_sock_set_needs_rearm_locked(sock, old_needs_rearm);
+            ep_sock_restore_worklist_state_locked(
+                sock, old_needs_rearm, old_oneshot_fired);
             sock->pipe_terminal_delivered = old_pipe_terminal_delivered;
             sock->et_holdoff = old_et_holdoff;
             sock->udp_readless_receive_parked =
@@ -4969,7 +4987,7 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
             atomic_store_explicit(&sock->state, old_state,
                                   memory_order_relaxed);
             pthread_mutex_unlock(&port->fd_table_lock);
-            ep_set_errno(saved_errno);
+            ep_restore_last_error_info(&saved_error);
             return -1;
         }
     }
@@ -5030,14 +5048,18 @@ static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
     uint8_t old_disarmed = sock->explicit_disarmed_classes;
     uint8_t new_disarmed = old_disarmed & (uint8_t)~classes;
     uint8_t old_needs_rearm = sock->needs_rearm;
+    uint8_t old_oneshot_fired = sock->oneshot_fired;
     uint8_t old_et_holdoff = sock->et_holdoff;
     uint8_t old_udp_readless_receive_parked =
         sock->udp_readless_receive_parked;
+    uint32_t old_pending_events = sock->pending_events;
     uint32_t old_observed_events = sock->observed_events;
     uint32_t old_state = atomic_load_explicit(&sock->state,
                                                memory_order_relaxed);
+    uint64_t old_generation = sock->generation;
     uint32_t new_afd_events;
     uint32_t poll_status;
+    int rearm_oneshot;
     int pending_poll_covers_request = 0;
 
     if (atomic_load_explicit(&sock->ready_queued,
@@ -5049,10 +5071,30 @@ static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
         return 0;
     }
 
+    rearm_oneshot = sock->oneshot_fired && new_disarmed == 0;
+
     if ((classes & (EP_READINESS_CLASS_READ |
                     EP_READINESS_CLASS_TERMINAL)) != 0) {
         /* A read/terminal acknowledgement starts a fresh receive-error
          * qualification opportunity for connected UDP sockets. */
+        sock->udp_readless_receive_parked = 0;
+    }
+    if (sock->oneshot_fired && !rearm_oneshot) {
+        /* The application has acknowledged only part of an EPOLLONESHOT
+         * delivery.  Record that ownership transfer, but keep the one-shot
+         * disabled and leave the socket without a native request until every
+         * delivered class has been acknowledged. */
+        sock->explicit_disarmed_classes = new_disarmed;
+        ep_readiness_filter_classes(&sock->observed_events, classes);
+        sock->et_holdoff = 0;
+        atomic_fetch_add_explicit(&port->generation, 1,
+                                  memory_order_relaxed);
+        return 0;
+    }
+    if (rearm_oneshot) {
+        /* A complete one-shot acknowledgement starts a clean observation
+         * generation, matching MOD/epoll_rearm rather than preserving any
+         * connected-UDP parked state from the fired generation. */
         sock->udp_readless_receive_parked = 0;
     }
     new_afd_events = ep_sock_afd_events_for_state_locked(
@@ -5061,7 +5103,16 @@ static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
     poll_status = atomic_load_explicit(&sock->poll_status,
                                        memory_order_relaxed);
     if (poll_status == EP_POLL_PENDING) {
-        if ((new_afd_events & ~sock->submitted_afd_events) == 0) {
+        if (rearm_oneshot) {
+            /* A fired one-shot should normally be idle.  If cancellation is
+             * still settling, never adopt that older request as the fresh
+             * one-shot generation. */
+            if (ep_sock_cancel_locked(sock) != 0) {
+                sock->udp_readless_receive_parked =
+                    old_udp_readless_receive_parked;
+                return -1;
+            }
+        } else if ((new_afd_events & ~sock->submitted_afd_events) == 0) {
             pending_poll_covers_request = 1;
         } else if (ep_sock_cancel_locked(sock) != 0) {
             sock->udp_readless_receive_parked =
@@ -5071,7 +5122,20 @@ static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
     }
 
     sock->explicit_disarmed_classes = new_disarmed;
-    ep_readiness_filter_classes(&sock->observed_events, classes);
+    if (rearm_oneshot) {
+        sock->pending_events = 0;
+        sock->observed_events = 0;
+        ep_sock_set_oneshot_fired_locked(sock, 0);
+        sock->generation = ++port->next_sock_generation;
+        if (port->next_sock_generation == 0) {
+            port->next_sock_generation = 1;
+            sock->generation = 1;
+        }
+        atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,
+                              memory_order_relaxed);
+    } else {
+        ep_readiness_filter_classes(&sock->observed_events, classes);
+    }
     sock->et_holdoff = 0;
     if (!pending_poll_covers_request) {
         ep_sock_set_needs_rearm_locked(sock, new_afd_events != 0);
@@ -5086,23 +5150,28 @@ static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
         int submit_result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
 
         if (submit_result > 0) {
-            int saved_errno = ep_last_err();
+            wepoll_ex_error_info saved_error;
 
-            ep_set_errno(saved_errno);
+            ep_get_last_error_info(&saved_error);
+            ep_restore_last_error_info(&saved_error);
             return -1;
         }
         if (submit_result < 0) {
-            int saved_errno = ep_last_err();
+            wepoll_ex_error_info saved_error;
 
+            ep_get_last_error_info(&saved_error);
             sock->explicit_disarmed_classes = old_disarmed;
+            sock->pending_events = old_pending_events;
             sock->observed_events = old_observed_events;
-            ep_sock_set_needs_rearm_locked(sock, old_needs_rearm);
+            ep_sock_restore_worklist_state_locked(
+                sock, old_needs_rearm, old_oneshot_fired);
             sock->et_holdoff = old_et_holdoff;
             sock->udp_readless_receive_parked =
                 old_udp_readless_receive_parked;
+            sock->generation = old_generation;
             atomic_store_explicit(&sock->state, old_state,
                                   memory_order_relaxed);
-            ep_set_errno(saved_errno);
+            ep_restore_last_error_info(&saved_error);
             return -1;
         }
     }
@@ -5233,15 +5302,19 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
         result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
     }
     if (result > 0) {
-        int saved_errno = ep_last_err();
+        wepoll_ex_error_info saved_error;
+
+        ep_get_last_error_info(&saved_error);
         result = -1;
-        ep_set_errno(saved_errno);
+        ep_restore_last_error_info(&saved_error);
     } else if (result < 0) {
-        int saved_errno = ep_last_err();
+        wepoll_ex_error_info saved_error;
+
+        ep_get_last_error_info(&saved_error);
         sock->pending_events = old_pending_events;
         sock->observed_events = old_observed_events;
-        ep_sock_set_oneshot_fired_locked(sock, old_oneshot_fired);
-        ep_sock_set_needs_rearm_locked(sock, old_needs_rearm);
+        ep_sock_restore_worklist_state_locked(
+            sock, old_needs_rearm, old_oneshot_fired);
         sock->pipe_terminal_delivered = old_pipe_terminal_delivered;
         sock->et_holdoff = old_et_holdoff;
         sock->udp_readless_receive_parked =
@@ -5259,7 +5332,7 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
                               memory_order_relaxed);
         atomic_store_explicit(&sock->state, old_state,
                               memory_order_relaxed);
-        ep_set_errno(saved_errno);
+        ep_restore_last_error_info(&saved_error);
     } else {
         atomic_fetch_add_explicit(&port->generation, 1,
                                   memory_order_relaxed);
@@ -5798,7 +5871,7 @@ static int ep_port_wait_timeout_impl(ep_port_t *port, void *out,
                 }
                 result = 0;
             } else {
-                ep_set_errno(ep_winerr_to_errno(error));
+                ep_set_win32_error(error);
                 result = -1;
             }
             break;

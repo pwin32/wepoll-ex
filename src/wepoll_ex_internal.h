@@ -842,6 +842,13 @@ int ep_port_worklists_valid_locked(const ep_port_t *port);
 /* errno shim. */
 void ep_set_errno(int e);
 int  ep_last_err(void);
+void ep_set_native_error(int portable_error, uint32_t native_domain,
+                         uint32_t native_code);
+void ep_set_win32_error(DWORD error);
+void ep_set_winsock_error(DWORD error);
+void ep_set_ntstatus_error(NTSTATUS status);
+void ep_get_last_error_info(wepoll_ex_error_info *error_info);
+void ep_restore_last_error_info(const wepoll_ex_error_info *error_info);
 
 /* Map NTSTATUS -> errno. */
 int  ep_status_to_errno(NTSTATUS s);

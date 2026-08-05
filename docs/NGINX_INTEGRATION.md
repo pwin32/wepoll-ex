@@ -75,9 +75,23 @@ DEL-before-close ordering. Third-party modules must not directly close a
 registered socket; whole-port process teardown is safe when no later socket
 reuse is possible.
 
+`wepoll_ex_close_socket()` is available to a future adapter revision that can
+route final socket ownership through one close hook. It performs DEL against
+one epfd before `closesocket()` and does not retain the socket. The current
+adapter keeps nginx's separate delete/close lifecycle because substituting the
+helper requires proving that no socket is registered in another port and that
+all third-party close paths use the same hook.
+
 `wepoll_close()` is required for the virtual epoll descriptor. The adapter must
 not call plain `close()` on it, and must coordinate teardown so no nginx event
 handler can use a context after the port has begun closing.
+
+For failed library control operations,
+`wepoll_ex_get_last_error_info()` can distinguish portable errno from an exact
+Win32, Winsock, or NTSTATUS source and from a canonical Winsock equivalent.
+The adapter currently continues to log its portable error path; any native
+logging bridge must query the record immediately on the same thread and honor
+the exact-source flag.
 
 The `wepoll_events` directive is restricted to a positive value that fits the
 `epoll_wait()` event-array and allocation limits; the default is 512.

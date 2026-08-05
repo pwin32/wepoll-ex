@@ -72,6 +72,47 @@ static int test_framework(void)
     return ep_fault_hits(EP_FAULT_PROVIDER_BASE) == 0 ? 0 : -1;
 }
 
+static int test_error_info_native(void)
+{
+    wepoll_ex_error_info info;
+
+    ep_set_winsock_error(WSAECONNRESET);
+    if (wepoll_ex_get_last_error_info(&info, sizeof(info)) != 0 ||
+        errno != ECONNRESET || info.portable_error != ECONNRESET ||
+        info.native_domain != WEPOLL_EX_NATIVE_ERROR_WINSOCK ||
+        info.native_code != WSAECONNRESET ||
+        info.winsock_error != WSAECONNRESET ||
+        (info.flags & (WEPOLL_EX_ERROR_NATIVE_EXACT |
+                       WEPOLL_EX_ERROR_WINSOCK_EQUIVALENT)) !=
+            (WEPOLL_EX_ERROR_NATIVE_EXACT |
+             WEPOLL_EX_ERROR_WINSOCK_EQUIVALENT)) {
+        return -1;
+    }
+
+    ep_set_win32_error(ERROR_ACCESS_DENIED);
+    if (wepoll_ex_get_last_error_info(&info, sizeof(info)) != 0 ||
+        errno != EACCES || info.portable_error != EACCES ||
+        info.native_domain != WEPOLL_EX_NATIVE_ERROR_WIN32 ||
+        info.native_code != ERROR_ACCESS_DENIED ||
+        info.winsock_error != WSAEACCES ||
+        (info.flags & (WEPOLL_EX_ERROR_NATIVE_EXACT |
+                       WEPOLL_EX_ERROR_WINSOCK_EQUIVALENT)) !=
+            (WEPOLL_EX_ERROR_NATIVE_EXACT |
+             WEPOLL_EX_ERROR_WINSOCK_EQUIVALENT)) {
+        return -1;
+    }
+
+    ep_set_ntstatus_error(STATUS_CANCELLED);
+    if (wepoll_ex_get_last_error_info(&info, sizeof(info)) != 0 ||
+        info.portable_error != ep_status_to_errno(STATUS_CANCELLED) ||
+        info.native_domain != WEPOLL_EX_NATIVE_ERROR_NTSTATUS ||
+        info.native_code != (uint32_t)STATUS_CANCELLED ||
+        (info.flags & WEPOLL_EX_ERROR_NATIVE_EXACT) == 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int test_pool_init_alloc(void)
 {
     ep_afd_pool_t pool;
@@ -2314,6 +2355,7 @@ typedef struct fault_test_case {
 
 static const fault_test_case_t g_tests[] = {
     { "framework", test_framework },
+    { "error-info-native", test_error_info_native },
     { "pool-init", test_pool_init_alloc },
     { "pool-grow", test_pool_growth },
     { "provider-base", test_provider_base },
@@ -2389,6 +2431,7 @@ int main(int argc, char **argv)
 
     fprintf(stderr,
             "usage: %s [all|framework|pool-init|pool-grow|provider-base|"
+            "error-info-native|"
             "afd-open|afd-submit|afd-submit-batch|afd-refresh-submit|"
             "afd-key-fallback|"
             "afd-cancel|"

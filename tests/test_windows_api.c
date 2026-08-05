@@ -172,7 +172,11 @@ static void test_operational_stats(void)
         WEPOLL_EX_CAP_WAKE_EXTENDED_WAIT |
         WEPOLL_EX_CAP_VIRTUAL_EPOLL_DESCRIPTOR |
         WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM |
-        WEPOLL_EX_CAP_TAGGED_WAKE_EVENT;
+        WEPOLL_EX_CAP_TAGGED_WAKE_EVENT |
+        WEPOLL_EX_CAP_CLOSE_SOCKET_HELPER |
+        WEPOLL_EX_CAP_EXPLICIT_REARM_ONESHOT |
+        WEPOLL_EX_CAP_VIRTUAL_EPOLL_DUP |
+        WEPOLL_EX_CAP_ERROR_INFO;
     wepoll_ex_capabilities capabilities;
     wepoll_ex_global_stats global_stats;
     wepoll_ex_stats stats;
@@ -1613,6 +1617,206 @@ static DWORD WINAPI close_wait_thread(void *opaque)
     return 0;
 }
 
+static void test_epfd_aliases(void)
+{
+    const uint64_t data = UINT64_C(0x45504644414c4941);
+    close_wait_context_t context;
+    struct epoll_event event;
+    struct epoll_event output;
+    tcp_pair_t pair;
+    HANDLE thread = NULL;
+    int epfd = -1;
+    int alias = -1;
+    int registered = 0;
+    int ok = 0;
+
+    TEST("virtual epfd aliases share one port and close independently");
+    memset(&context, 0, sizeof(context));
+    tcp_pair_init(&pair);
+    errno = 0;
+    if (wepoll_ex_dup(-1) != -1 || errno != EBADF) {
+        goto cleanup;
+    }
+
+    epfd = epoll_create1(0);
+    alias = wepoll_ex_dup(epfd);
+    context.epfd = epfd;
+    context.started = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (epfd < 0 || alias < 0 || alias == epfd ||
+        context.started == NULL || epoll_fd_count(alias) != 0) {
+        goto cleanup;
+    }
+
+    thread = CreateThread(NULL, 0, close_wait_thread, &context, 0, NULL);
+    if (thread == NULL ||
+        WaitForSingleObject(context.started, 2000) != WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+    Sleep(100);
+    if (wepoll_close(epfd) != 0) {
+        goto cleanup;
+    }
+    epfd = -1;
+    errno = 0;
+    if (epoll_fd_count(context.epfd) != -1 || errno != EBADF ||
+        WaitForSingleObject(thread, 100) != WAIT_TIMEOUT ||
+        wepoll_ex_wake(alias) != 0 ||
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0 ||
+        context.result != 0 || context.error != 0) {
+        goto cleanup;
+    }
+    CloseHandle(thread);
+    thread = NULL;
+
+    if (make_tcp_pair(&pair) != 0) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.u64 = data;
+    if (epoll_ctl(alias, EPOLL_CTL_ADD, pair.server, &event) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (epoll_fd_count(alias) != 1 || send_byte(pair.client) != 0 ||
+        epoll_wait(alias, &output, 1, 2000) != 1 ||
+        output.events != EPOLLIN || output.data.u64 != data ||
+        recv_byte(pair.server) != 0 ||
+        epoll_ctl(alias, EPOLL_CTL_DEL, pair.server, NULL) != 0) {
+        goto cleanup;
+    }
+    registered = 0;
+    if (wepoll_close(alias) != 0) {
+        goto cleanup;
+    }
+    alias = -1;
+    ok = 1;
+
+cleanup:
+    if (registered && alias >= 0) {
+        (void)epoll_ctl(alias, EPOLL_CTL_DEL, pair.server, NULL);
+    }
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (alias >= 0) (void)wepoll_close(alias);
+    if (thread != NULL &&
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0) {
+        (void)TerminateThread(thread, 1);
+        ok = 0;
+    }
+    if (thread != NULL) CloseHandle(thread);
+    if (context.started != NULL) CloseHandle(context.started);
+    tcp_pair_close(&pair);
+    if (!ok) {
+        FAIL("virtual epfd alias contract");
+        return;
+    }
+    PASS();
+}
+
+static void test_close_socket_helper(void)
+{
+    tcp_pair_t pair;
+    struct epoll_event event;
+    SOCKET unregistered = INVALID_SOCKET;
+    SOCKET retained = INVALID_SOCKET;
+    int epfd = -1;
+    int registered = 0;
+    int ok = 0;
+
+    TEST("close helper removes registration before closesocket");
+    tcp_pair_init(&pair);
+    epfd = epoll_create1(0);
+    if (epfd < 0 || make_tcp_pair(&pair) != 0) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (wepoll_ex_close_socket(epfd, pair.server) != 0) {
+        goto cleanup;
+    }
+    pair.server = INVALID_SOCKET;
+    registered = 0;
+    if (epoll_fd_count(epfd) != 0) {
+        goto cleanup;
+    }
+
+    unregistered = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (unregistered == INVALID_SOCKET ||
+        wepoll_ex_close_socket(epfd, unregistered) != 0) {
+        goto cleanup;
+    }
+    unregistered = INVALID_SOCKET;
+
+    retained = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    errno = 0;
+    if (retained == INVALID_SOCKET ||
+        wepoll_ex_close_socket(-1, retained) != -1 || errno != EBADF ||
+        closesocket(retained) == SOCKET_ERROR) {
+        goto cleanup;
+    }
+    retained = INVALID_SOCKET;
+    errno = 0;
+    if (wepoll_ex_close_socket(epfd, EPOLL_FD_INVALID) != -1 ||
+        errno != EBADF || wepoll_close(epfd) != 0) {
+        goto cleanup;
+    }
+    epfd = -1;
+    ok = 1;
+
+cleanup:
+    if (registered && epfd >= 0) {
+        (void)epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL);
+    }
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (unregistered != INVALID_SOCKET) closesocket(unregistered);
+    if (retained != INVALID_SOCKET) closesocket(retained);
+    tcp_pair_close(&pair);
+    if (!ok) {
+        FAIL("close socket helper contract");
+        return;
+    }
+    PASS();
+}
+
+static void test_error_info(void)
+{
+    wepoll_ex_error_info error_info;
+    uint32_t prefix[2] = { 0, 0 };
+
+    TEST("thread-local portable and Winsock error information");
+    errno = 0;
+    if (epoll_create1(0x4000) != -1 || errno != EINVAL ||
+        wepoll_ex_get_last_error_info(&error_info,
+                                      sizeof(error_info)) != 0 ||
+        error_info.version != WEPOLL_EX_ERROR_INFO_VERSION ||
+        error_info.struct_size != sizeof(error_info) ||
+        error_info.portable_error != EINVAL ||
+        error_info.native_domain != WEPOLL_EX_NATIVE_ERROR_NONE ||
+        error_info.native_code != 0 ||
+        error_info.winsock_error != WSAEINVAL ||
+        (error_info.flags & WEPOLL_EX_ERROR_WINSOCK_EQUIVALENT) == 0 ||
+        (error_info.flags & WEPOLL_EX_ERROR_NATIVE_EXACT) != 0 ||
+        wepoll_ex_get_last_error_info(
+            (wepoll_ex_error_info *)prefix, sizeof(prefix)) != 0 ||
+        prefix[0] != WEPOLL_EX_ERROR_INFO_VERSION ||
+        prefix[1] != sizeof(error_info)) {
+        FAIL("error information snapshot");
+        return;
+    }
+    errno = 0;
+    if (wepoll_ex_get_last_error_info(&error_info,
+                                      sizeof(uint32_t)) != -1 ||
+        errno != EINVAL) {
+        FAIL("error information size validation");
+        return;
+    }
+    PASS();
+}
+
 static void test_wait_wake(void)
 {
     const uint64_t data = UINT64_C(0x57414b4552454144);
@@ -2057,6 +2261,9 @@ int main(void)
     test_oneshot_native_close_cleanup();
     test_batch_safety();
     test_epfd_collision_and_reuse();
+    test_epfd_aliases();
+    test_close_socket_helper();
+    test_error_info();
     test_wait_wake();
     test_empty_wait_concurrent_add();
     test_concurrent_close();

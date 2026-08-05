@@ -29,8 +29,11 @@ if(WEPOLL_EX_EXPORT_FORMAT STREQUAL "ELF")
         epoll_rearm_classes
         epoll_wait_ex
         wepoll_close
+        wepoll_ex_close_socket
+        wepoll_ex_dup
         wepoll_ex_get_capabilities
         wepoll_ex_get_global_stats
+        wepoll_ex_get_last_error_info
         wepoll_ex_get_socket_lifetime_policy
         wepoll_ex_get_stats
         wepoll_ex_version
@@ -101,8 +104,11 @@ elseif(WEPOLL_EX_EXPORT_FORMAT STREQUAL "PE")
         epoll_wait
         epoll_wait_ex
         wepoll_close
+        wepoll_ex_close_socket
+        wepoll_ex_dup
         wepoll_ex_get_capabilities
         wepoll_ex_get_global_stats
+        wepoll_ex_get_last_error_info
         wepoll_ex_get_socket_lifetime_policy
         wepoll_ex_get_stats
         wepoll_ex_version

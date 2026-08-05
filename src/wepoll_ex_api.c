@@ -2,13 +2,14 @@
  * wepoll_ex_api.c -- public Windows API surface.
  *
  * The user-visible epoll descriptor is a small positive integer.  A
- * process-global table maps it to an ep_port_t and holds a reference for
- * every public operation.  Closing first removes the descriptor from public
- * lookup, wakes blocked waiters, and waits for those references to drain
- * before destroying the port.
+ * process-global table maps each alias to shared ep_port_t ownership and holds
+ * a reference for every public operation.  Closing a non-final alias removes
+ * only that integer; final close wakes blocked waiters and waits for aggregate
+ * references to drain before destroying the port.
  */
 #include "wepoll_ex_internal.h"
 
+#include <assert.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -22,13 +23,18 @@
  * independent: this deadline covers only public API references. */
 #define EP_API_CLOSE_TIMEOUT_MS 5000U
 
-typedef struct epfd_entry {
-    int fd;
+typedef struct epfd_shared {
     ep_port_t *port;
     unsigned int refs;
+    unsigned int aliases;
     int closing;
     int detached;
     HANDLE refs_drained_event;
+} epfd_shared_t;
+
+typedef struct epfd_entry {
+    int fd;
+    epfd_shared_t *shared;
     struct epfd_entry *next;
 } epfd_entry_t;
 
@@ -72,24 +78,10 @@ static epfd_entry_t *epfd_find_locked(int fd)
     return NULL;
 }
 
-static int epfd_alloc(ep_port_t *port)
+static int epfd_allocate_id_locked(void)
 {
-    epfd_entry_t *entry;
     int fd = -1;
 
-    entry = (epfd_entry_t *)calloc(1, sizeof(*entry));
-    if (entry == NULL) {
-        ep_set_errno(ENOMEM);
-        return -1;
-    }
-    entry->refs_drained_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (entry->refs_drained_event == NULL) {
-        free(entry);
-        ep_set_errno(ep_winerr_to_errno(GetLastError()));
-        return -1;
-    }
-
-    pthread_mutex_lock(&g_epfd_lock);
     for (int attempts = 0; attempts < INT_MAX; attempts++) {
         int candidate = g_next_fd;
 
@@ -99,66 +91,142 @@ static int epfd_alloc(ep_port_t *port)
             break;
         }
     }
+    return fd;
+}
 
+static void epfd_insert_locked(epfd_entry_t *entry, int fd)
+{
+    unsigned int bucket = epfd_bucket(fd);
+
+    entry->fd = fd;
+    entry->next = g_epfd_buckets[bucket];
+    g_epfd_buckets[bucket] = entry;
+}
+
+static int epfd_alloc(ep_port_t *port)
+{
+    epfd_shared_t *shared;
+    epfd_entry_t *entry;
+    int fd = -1;
+
+    shared = (epfd_shared_t *)calloc(1, sizeof(*shared));
+    if (shared == NULL) {
+        ep_set_errno(ENOMEM);
+        return -1;
+    }
+    entry = (epfd_entry_t *)calloc(1, sizeof(*entry));
+    if (entry == NULL) {
+        free(shared);
+        ep_set_errno(ENOMEM);
+        return -1;
+    }
+    shared->refs_drained_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (shared->refs_drained_event == NULL) {
+        DWORD error = GetLastError();
+
+        free(entry);
+        free(shared);
+        ep_set_win32_error(error);
+        return -1;
+    }
+    shared->port = port;
+    shared->aliases = 1;
+    entry->shared = shared;
+
+    pthread_mutex_lock(&g_epfd_lock);
+    fd = epfd_allocate_id_locked();
     if (fd > 0) {
-        unsigned int bucket = epfd_bucket(fd);
-
-        entry->fd = fd;
-        entry->port = port;
-        entry->next = g_epfd_buckets[bucket];
-        g_epfd_buckets[bucket] = entry;
+        epfd_insert_locked(entry, fd);
     }
     pthread_mutex_unlock(&g_epfd_lock);
 
     if (fd < 0) {
-        (void)CloseHandle(entry->refs_drained_event);
+        (void)CloseHandle(shared->refs_drained_event);
         free(entry);
+        free(shared);
         ep_set_errno(EMFILE);
     }
     return fd;
 }
 
-static epfd_entry_t *epfd_acquire(int fd)
+static int epfd_duplicate(int fd)
+{
+    epfd_entry_t *source;
+    epfd_entry_t *entry;
+    int duplicate_fd;
+
+    entry = (epfd_entry_t *)calloc(1, sizeof(*entry));
+    if (entry == NULL) {
+        ep_set_errno(ENOMEM);
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_epfd_lock);
+    source = epfd_find_locked(fd);
+    if (source == NULL || source->shared->closing) {
+        pthread_mutex_unlock(&g_epfd_lock);
+        free(entry);
+        ep_set_errno(EBADF);
+        return -1;
+    }
+    duplicate_fd = epfd_allocate_id_locked();
+    if (duplicate_fd > 0) {
+        entry->shared = source->shared;
+        entry->shared->aliases++;
+        epfd_insert_locked(entry, duplicate_fd);
+    }
+    pthread_mutex_unlock(&g_epfd_lock);
+
+    if (duplicate_fd < 0) {
+        free(entry);
+        ep_set_errno(EMFILE);
+    }
+    return duplicate_fd;
+}
+
+static epfd_shared_t *epfd_acquire(int fd)
 {
     epfd_entry_t *entry;
+    epfd_shared_t *shared = NULL;
 
     pthread_mutex_lock(&g_epfd_lock);
     entry = epfd_find_locked(fd);
-    if (entry != NULL && !entry->closing) {
-        entry->refs++;
-    } else {
-        entry = NULL;
+    if (entry != NULL && !entry->shared->closing) {
+        shared = entry->shared;
+        shared->refs++;
     }
     pthread_mutex_unlock(&g_epfd_lock);
-    return entry;
+    return shared;
 }
 
-static int epfd_destroy(epfd_entry_t *entry)
+static int epfd_destroy(epfd_shared_t *shared)
 {
-    int result = ep_port_destroy(entry->port);
-    int saved_errno = ep_last_err();
+    int result = ep_port_destroy(shared->port);
+    wepoll_ex_error_info saved_error;
 
-    (void)CloseHandle(entry->refs_drained_event);
-    free(entry);
+    ep_get_last_error_info(&saved_error);
+
+    (void)CloseHandle(shared->refs_drained_event);
+    free(shared);
     if (result != 0) {
-        ep_set_errno(saved_errno);
+        ep_restore_last_error_info(&saved_error);
     }
     return result;
 }
 
-static void epfd_put(epfd_entry_t *entry)
+static void epfd_put(epfd_shared_t *shared)
 {
     int destroy = 0;
 
     pthread_mutex_lock(&g_epfd_lock);
-    if (entry->refs > 0) {
-        entry->refs--;
+    if (shared->refs > 0) {
+        shared->refs--;
     }
-    if (entry->closing && entry->refs == 0) {
-        if (entry->detached) {
+    if (shared->closing && shared->refs == 0) {
+        if (shared->detached) {
             destroy = 1;
         } else {
-            (void)SetEvent(entry->refs_drained_event);
+            (void)SetEvent(shared->refs_drained_event);
         }
     }
     pthread_mutex_unlock(&g_epfd_lock);
@@ -167,14 +235,18 @@ static void epfd_put(epfd_entry_t *entry)
         /* The public operation has already selected its result and errno.
          * Deferred teardown can report its own error only diagnostically, so
          * do not let it overwrite the completing operation's errno. */
+        wepoll_ex_error_info operation_error;
         int operation_errno = ep_last_err();
-        int destroy_result = epfd_destroy(entry);
+        int destroy_result;
 
+        ep_get_last_error_info(&operation_error);
+        destroy_result = epfd_destroy(shared);
         if (destroy_result == 0) {
             atomic_fetch_add_explicit(&g_api_deferred_destroy_count, 1,
                                       memory_order_relaxed);
         }
-        ep_set_errno(operation_errno);
+        ep_restore_last_error_info(&operation_error);
+        errno = operation_errno;
     }
 }
 
@@ -190,14 +262,14 @@ static void epfd_unlink_locked(epfd_entry_t *entry)
     }
 }
 
-static epfd_entry_t *epfd_require(int fd)
+static epfd_shared_t *epfd_require(int fd)
 {
-    epfd_entry_t *entry = epfd_acquire(fd);
+    epfd_shared_t *shared = epfd_acquire(fd);
 
-    if (entry == NULL) {
+    if (shared == NULL) {
         ep_set_errno(EBADF);
     }
-    return entry;
+    return shared;
 }
 
 uint64_t ep_api_close_timeout_count(void)
@@ -220,7 +292,7 @@ void *ep_test_api_ref_hold(int epfd)
 void ep_test_api_ref_release(void *reference)
 {
     if (reference != NULL) {
-        epfd_put((epfd_entry_t *)reference);
+        epfd_put((epfd_shared_t *)reference);
     }
 }
 
@@ -303,7 +375,7 @@ static int epoll_ctl_port(ep_port_t *port,
     }
 }
 
-static int epoll_wait_port(epfd_entry_t *entry,
+static int epoll_wait_port(epfd_shared_t *entry,
                            epoll_event_ex *events,
                            int maxevents,
                            int timeout_ms,
@@ -313,7 +385,7 @@ static int epoll_wait_port(epfd_entry_t *entry,
                         timeout_ms, sigmask);
 }
 
-static int epoll_wait_port_timeout(epfd_entry_t *entry,
+static int epoll_wait_port_timeout(epfd_shared_t *entry,
                                    epoll_event_ex *events,
                                    int maxevents,
                                    const ep_wait_timeout_t *timeout,
@@ -364,10 +436,12 @@ WEPOLL_EX_API int epoll_create_ex(int size, int flags)
 
     fd = epfd_alloc(port);
     if (fd < 0) {
-        int saved_errno = ep_last_err();
+        wepoll_ex_error_info saved_error;
+
+        ep_get_last_error_info(&saved_error);
         ep_port_begin_close(port);
         (void)ep_port_destroy(port);
-        ep_set_errno(saved_errno);
+        ep_restore_last_error_info(&saved_error);
     }
     return fd;
 }
@@ -388,7 +462,7 @@ WEPOLL_EX_API int epoll_ctl_ctx(int epfd,
 {
     struct epoll_event event_copy;
     struct epoll_event *effective_event = NULL;
-    epfd_entry_t *entry;
+    epfd_shared_t *entry;
     int result;
 
     /* Mainline Linux copies every non-DEL event before acquiring either
@@ -430,7 +504,7 @@ static int epoll_wait_basic_timeout(int epfd,
                                     const ep_wait_timeout_t *timeout,
                                     const wepoll_sigset_t *sigmask)
 {
-    epfd_entry_t *entry;
+    epfd_shared_t *entry;
     int result;
 
     if (maxevents <= 0 || maxevents > WEPOLL_EPOLL_MAX_EVENTS) {
@@ -485,7 +559,7 @@ WEPOLL_EX_API int epoll_wait_ex(int epfd,
                                 int maxevents,
                                 int timeout)
 {
-    epfd_entry_t *entry;
+    epfd_shared_t *entry;
     int result;
 
     if (maxevents <= 0 || maxevents > WEPOLL_EPOLL_EX_MAX_EVENTS) {
@@ -511,7 +585,7 @@ WEPOLL_EX_API int epoll_pwait2_ex(int epfd,
                                   const struct timespec *timeout,
                                   const wepoll_sigset_t *sigmask)
 {
-    epfd_entry_t *entry;
+    epfd_shared_t *entry;
     ep_wait_timeout_t wait_timeout;
     int result;
 
@@ -542,7 +616,7 @@ WEPOLL_EX_API int epoll_ctl_batch(int epfd,
                                   const struct epoll_event *events,
                                   int count)
 {
-    epfd_entry_t *entry;
+    epfd_shared_t *entry;
     int result = 0;
 
     if (count <= 0) {
@@ -583,7 +657,9 @@ WEPOLL_EX_API int epoll_ctl_batch(int epfd,
 
         if (epoll_ctl_port(entry->port, ops[i], fds[i],
                            event, NULL) != 0) {
-            int saved_errno = ep_last_err();
+            wepoll_ex_error_info saved_error;
+
+            ep_get_last_error_info(&saved_error);
 
             /* ADD is the only operation that can be safely undone without
              * retaining a full copy of prior registration state.  MOD and
@@ -595,7 +671,7 @@ WEPOLL_EX_API int epoll_ctl_batch(int epfd,
                                          fds[j], NULL, NULL);
                 }
             }
-            ep_set_errno(saved_errno);
+            ep_restore_last_error_info(&saved_error);
             result = -1;
             break;
         }
@@ -614,7 +690,7 @@ WEPOLL_EX_API int epoll_drain(int epfd,
 
 WEPOLL_EX_API int epoll_rearm(int epfd, epoll_fd_t fd)
 {
-    epfd_entry_t *entry = epfd_require(epfd);
+    epfd_shared_t *entry = epfd_require(epfd);
     int result;
 
     if (entry == NULL) {
@@ -633,7 +709,7 @@ WEPOLL_EX_API int epoll_rearm(int epfd, epoll_fd_t fd)
 WEPOLL_EX_API int epoll_rearm_classes(int epfd, epoll_fd_t fd,
                                       uint32_t classes)
 {
-    epfd_entry_t *entry = epfd_require(epfd);
+    epfd_shared_t *entry = epfd_require(epfd);
     int result;
 
     if (entry == NULL) {
@@ -656,7 +732,7 @@ WEPOLL_EX_API int epoll_rearm_classes(int epfd, epoll_fd_t fd,
 
 WEPOLL_EX_API int epoll_fd_count(int epfd)
 {
-    epfd_entry_t *entry = epfd_require(epfd);
+    epfd_shared_t *entry = epfd_require(epfd);
     size_t count;
 
     if (entry == NULL) {
@@ -729,7 +805,11 @@ WEPOLL_EX_API int wepoll_ex_get_capabilities(
                      WEPOLL_EX_CAP_WAKE_EXTENDED_WAIT |
                      WEPOLL_EX_CAP_VIRTUAL_EPOLL_DESCRIPTOR |
                      WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM |
-                     WEPOLL_EX_CAP_TAGGED_WAKE_EVENT;
+                     WEPOLL_EX_CAP_TAGGED_WAKE_EVENT |
+                     WEPOLL_EX_CAP_CLOSE_SOCKET_HELPER |
+                     WEPOLL_EX_CAP_EXPLICIT_REARM_ONESHOT |
+                     WEPOLL_EX_CAP_VIRTUAL_EPOLL_DUP |
+                     WEPOLL_EX_CAP_ERROR_INFO;
     return copy_versioned_snapshot(capabilities, capabilities_size,
                                    &snapshot, sizeof(snapshot));
 }
@@ -737,7 +817,7 @@ WEPOLL_EX_API int wepoll_ex_get_capabilities(
 WEPOLL_EX_API int wepoll_ex_get_stats(int epfd, wepoll_ex_stats *stats,
                                       size_t stats_size)
 {
-    epfd_entry_t *entry;
+    epfd_shared_t *entry;
     wepoll_ex_stats snapshot;
     int result;
 
@@ -768,9 +848,19 @@ WEPOLL_EX_API int wepoll_ex_get_global_stats(
                                    &snapshot, sizeof(snapshot));
 }
 
+WEPOLL_EX_API int wepoll_ex_get_last_error_info(
+    wepoll_ex_error_info *error_info, size_t error_info_size)
+{
+    wepoll_ex_error_info snapshot;
+
+    ep_get_last_error_info(&snapshot);
+    return copy_versioned_snapshot(error_info, error_info_size,
+                                   &snapshot, sizeof(snapshot));
+}
+
 WEPOLL_EX_API int wepoll_ex_wake(int epfd)
 {
-    epfd_entry_t *entry = epfd_require(epfd);
+    epfd_shared_t *entry = epfd_require(epfd);
     int result;
 
     if (entry == NULL) {
@@ -789,7 +879,7 @@ WEPOLL_EX_API int wepoll_ex_wake_event(
         EPOLLRDNORM | EPOLLRDBAND | EPOLLWRNORM | EPOLLWRBAND |
         EPOLLMSG | EPOLLRDHUP;
     struct epoll_event event_copy;
-    epfd_entry_t *entry;
+    epfd_shared_t *entry;
     int result;
 
     if (event == NULL) {
@@ -811,33 +901,85 @@ WEPOLL_EX_API int wepoll_ex_wake_event(
     return result;
 }
 
+WEPOLL_EX_API int wepoll_ex_dup(int epfd)
+{
+    return epfd_duplicate(epfd);
+}
+
+WEPOLL_EX_API int wepoll_ex_close_socket(int epfd, epoll_fd_t fd)
+{
+    epfd_shared_t *entry;
+    int unregister_result;
+    int unregister_error;
+
+    if (fd == EPOLL_FD_INVALID) {
+        ep_set_errno(EBADF);
+        return -1;
+    }
+    entry = epfd_require(epfd);
+    if (entry == NULL) {
+        return -1;
+    }
+
+    unregister_result = ep_port_unregister(entry->port, (SOCKET)fd);
+    unregister_error = ep_last_err();
+    if (unregister_result != 0 && unregister_error != ENOENT) {
+        epfd_put(entry);
+        return -1;
+    }
+    if (closesocket((SOCKET)fd) == SOCKET_ERROR) {
+        DWORD error = (DWORD)WSAGetLastError();
+
+        epfd_put(entry);
+        ep_set_winsock_error(error);
+        return -1;
+    }
+    epfd_put(entry);
+    return 0;
+}
+
 WEPOLL_EX_API int wepoll_close(int epfd)
 {
     epfd_entry_t *entry;
+    epfd_shared_t *shared;
     ep_port_t *port;
     unsigned int timeout_ms;
     int wait_error;
+    int final_alias;
 
     pthread_mutex_lock(&g_epfd_lock);
     entry = epfd_find_locked(epfd);
-    if (entry == NULL || entry->closing) {
+    if (entry == NULL || entry->shared->closing) {
         pthread_mutex_unlock(&g_epfd_lock);
         ep_set_errno(EBADF);
         return -1;
     }
-    entry->closing = 1;
-    port = entry->port;
+    shared = entry->shared;
+    epfd_unlink_locked(entry);
+    assert(shared->aliases > 0);
+    shared->aliases--;
+    final_alias = shared->aliases == 0;
+    if (final_alias) {
+        shared->closing = 1;
+    }
     pthread_mutex_unlock(&g_epfd_lock);
+    free(entry);
+
+    if (!final_alias) {
+        return 0;
+    }
+    port = shared->port;
 
     /* Wake any operation blocked in ep_port_wait before waiting for its API
-     * reference to drain. */
+     * reference to drain.  Non-final aliases do not reach this path, so a
+     * close of one alias cannot interrupt a wait issued through another. */
     ep_port_begin_close(port);
 
     timeout_ms = atomic_load_explicit(&g_api_close_timeout_ms,
                                       memory_order_relaxed);
     pthread_mutex_lock(&g_epfd_lock);
-    if (entry->refs != 0) {
-        HANDLE refs_drained_event = entry->refs_drained_event;
+    if (shared->refs != 0) {
+        HANDLE refs_drained_event = shared->refs_drained_event;
         DWORD wait_result;
 
         pthread_mutex_unlock(&g_epfd_lock);
@@ -854,12 +996,11 @@ WEPOLL_EX_API int wepoll_close(int epfd)
     } else {
         wait_error = 0;
     }
-    if (entry->refs != 0) {
-        /* Public lookup is severed before ownership is transferred.  The
-         * final outstanding operation observes detached under the same lock
-         * and becomes responsible for teardown in epfd_put(). */
-        entry->detached = 1;
-        epfd_unlink_locked(entry);
+    if (shared->refs != 0) {
+        /* Every alias was removed before ownership is transferred.  The final
+         * outstanding operation observes detached under the same lock and
+         * becomes responsible for teardown in epfd_put(). */
+        shared->detached = 1;
         if (wait_error == 0) wait_error = ETIMEDOUT;
         if (wait_error == ETIMEDOUT) {
             atomic_fetch_add_explicit(&g_api_close_timeout_count, 1,
@@ -869,8 +1010,7 @@ WEPOLL_EX_API int wepoll_close(int epfd)
         ep_set_errno(wait_error);
         return -1;
     }
-    epfd_unlink_locked(entry);
     pthread_mutex_unlock(&g_epfd_lock);
 
-    return epfd_destroy(entry);
+    return epfd_destroy(shared);
 }

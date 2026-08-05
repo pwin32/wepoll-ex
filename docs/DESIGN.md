@@ -31,6 +31,12 @@ nginx source/build tree. The tracked `nginx/config` hook separately registers
 the adapter as an nginx EVENT addon and compiles the static wepoll-ex sources
 into that disposable nginx build.
 
+Windows builds also provide `WEPOLL_EX_BUILD_EPOLL_COMPAT`, an interface target
+exported as `wepoll_ex::epoll_compat`. Its isolated include root contains
+`<sys/epoll.h>` and links the selected library. The header is installed below
+`include/wepoll-ex-compat`, so the ordinary package target does not shadow a
+platform header merely by being linked.
+
 Until the ABI is frozen, installed CMake packages use `ExactVersion`
 compatibility and ELF shared libraries use the full project version as their
 SONAME. The package consumer rejects an older non-exact 0.x request, while an
@@ -42,8 +48,12 @@ the nginx-embedded source build independent of a generated CMake header.
 
 ## Windows data flow and lifetime
 
-1. `epoll_create*` creates an `ep_port_t`, IOCP, AFD poll state, pools, and a
-   virtual integer `epfd` table entry. Standard `epoll_create(size)` requires a
+1. `epoll_create*` creates an `ep_port_t`, IOCP, AFD poll state, pools, an
+   `epfd_shared_t` ownership record, and its first virtual integer table entry.
+   `wepoll_ex_dup()` adds another table entry referencing the same shared
+   record. Operations acquire aggregate public references from that record, so
+   removing one alias cannot invalidate a wait or control call already using
+   another. Standard `epoll_create(size)` requires a
    positive size but ignores its value. The extension `epoll_create_ex()` uses
    a positive size only as an initial fd-table and pool-capacity hint whose
    value is capped at 4096; it is not a registration limit. The POSIX extension
@@ -56,7 +66,13 @@ the nginx-embedded source build independent of a generated CMake header.
    including `EACCES` for a waitable without `SYNCHRONIZE`. For every numeric
    operation other than `EPOLL_CTL_DEL`, the event value is copied once at API
    entry and a null pointer returns `EFAULT` before epfd, target, or operation
-   validation. DEL does not inspect its event pointer.
+   validation. DEL does not inspect its event pointer. Public failures also
+   update a thread-local `wepoll_ex_error_info`: `portable_error` is the errno
+   result, an exact Win32/Winsock/NTSTATUS source is retained where available,
+   and a separately flagged canonical Winsock equivalent is supplied when
+   meaningful. A normalized mapping without the exact flag is not represented
+   as the original native source. The versioned getter preserves this channel
+   on success.
 3. `EPOLL_CTL_ADD` validates a Winsock socket, resolves its base provider
    handle, records an optional WFP ALE endpoint token for stable native-handle
    reuse detection, stores the requested data and context, assigns a
@@ -186,10 +202,16 @@ the nginx-embedded source build independent of a generated CMake header.
    exposes a stable
    WFP ALE endpoint token, a native close followed by immediate numeric
    `SOCKET` reuse retires the old registration before ADD/MOD/rearm can attach
-   stale data to the replacement.
-6. `wepoll_close()` marks the port closing, wakes waiters, and removes the
-   logical epfd. Public API references and the first AFD-completion drain each
-   have a five-second bound. If references remain, close returns
+   stale data to the replacement. `wepoll_ex_close_socket()` first applies DEL
+   to one port, accepting ENOENT only after target validation, and calls
+   `closesocket()` afterward. Other DEL failures leave the socket open. It does
+   not remove registrations from other ports or retain a socket duplicate.
+6. Closing a non-final virtual alias unlinks and frees only that integer table
+   entry; it does not mark the shared port closing or wake its waits. Closing
+   the final alias marks the shared record closing, wakes waiters, and removes
+   the last logical epfd. Public API references aggregated across every alias
+   and the first AFD-completion drain each have a five-second bound. If
+   references remain, close returns
    `ETIMEDOUT`; the last operation to release its reference performs deferred
    destruction. If only completion draining times out while IOCP remains
    usable, a detached reaper owns the quarantined port for up to 60 seconds.
@@ -493,13 +515,18 @@ temporary fallback signal mask before unwinding.
   while a ready node has not yet been consumed, and `epoll_rearm()` is the
   all-class shorthand after consumption.
 
-  This mode is socket-only and initially rejects ET combined with ONESHOT or
-  EXCLUSIVE. A terminal delivery can remove every AFD interest, so explicit
-  users must issue DEL before `closesocket()` instead of relying on an idle
-  native-close probe. POSIX reports the creation flag and class-rearm API as
-  unsupported. The mode supplies a deterministic drain/ack primitive for an
-  nginx experiment; nginx still needs per-handler rearm hooks and cannot use
-  its unmodified Linux module.
+  This mode is socket-only and rejects EXCLUSIVE. It supports ONESHOT: partial
+  acknowledgement updates the delivered-class disarm set while keeping the
+  fired one-shot on its probe list and without submitting native work; clearing
+  the final class removes the fired state, starts a new generation, and submits
+  or queues the next AFD request. Submission failure restores the generation,
+  observation state, class disarms, and mutually exclusive rearm/oneshot
+  worklist membership. A terminal delivery can remove every AFD interest, so
+  explicit users must issue DEL before `closesocket()` instead of relying on
+  an idle native-close probe. POSIX reports the creation flag and class-rearm
+  API as unsupported. The mode supplies a deterministic drain/ack primitive
+  for an nginx experiment; nginx still needs per-handler rearm hooks and cannot
+  use its unmodified Linux module.
 - `EPOLLEXCLUSIVE` applies only to socket registrations and may be set only by
   ADD. It may be combined with `EPOLLET`, but not with `EPOLLONESHOT`,
   `EPOLLRDHUP`, or unsupported event bits. Every MOD of a registration added
@@ -563,10 +590,12 @@ temporary fallback signal mask before unwinding.
   Because an `epfd` is a process-local integer rather than a kernel HANDLE,
   self-registration and nested-epoll attempts cannot always reproduce Linux's
   distinct `EINVAL` result and may instead classify as an invalid or unrelated
-  native target. The integer cannot be duplicated, inherited, passed as an OS
-  descriptor, or used with `fcntl` or `ioctl`. `EPOLL_CLOEXEC` is accepted for
-  compatibility, but all virtual epfds are process-local regardless. Linux's
-  `EPIOCSPARAMS`/`EPIOCGPARAMS` busy-poll ioctls therefore have no Windows
+  native target. `wepoll_ex_dup()` can create another process-local virtual
+  integer sharing the same port and final-close lifetime. The integer still
+  cannot be duplicated through native descriptor APIs, inherited, passed as an
+  OS descriptor, or used with `fcntl` or `ioctl`. `EPOLL_CLOEXEC` is accepted
+  for compatibility, but all virtual epfds are process-local regardless.
+  Linux's `EPIOCSPARAMS`/`EPIOCGPARAMS` busy-poll ioctls therefore have no Windows
   counterpart; the POSIX build exposes a native epoll fd and inherits host
   ioctl support.
 - `SO_OOBINLINE` exposes urgent bytes as ordinary readable data without a
@@ -610,21 +639,21 @@ temporary fallback signal mask before unwinding.
 
 ## Verification baseline
 
-On August 4, 2026, Windows 10.0.19044 with MSYS2 MinGW GCC 16.1 and
-`-O2 -Wall -Wextra -Wpedantic -Werror` completed 183 combined best-effort, 181
-static-only, 103 shared-only, 183 strict-identity, 103 strict shared-only, 183
-synchronized-lifetime, and 103 synchronized shared-only CTest entries. Their
-passed/skipped counts were 182/1, 180/1, 102/1, 182/1, 102/1, 178/5, and 98/5.
+On August 5, 2026, Windows 10.0.19044 with MSYS2 MinGW GCC 16.1 and
+`-O2 -Wall -Wextra -Wpedantic -Werror` completed 193 combined best-effort, 191
+static-only, 109 shared-only, 193 strict-identity, 109 strict shared-only, 193
+synchronized-lifetime, and 109 synchronized shared-only CTest entries. Their
+passed/skipped counts were 192/1, 190/1, 108/1, 192/1, 108/1, 188/5, and 104/5.
 All seven variants skipped the environment-dependent UDP/ICMP case;
 synchronized modes additionally skipped the four native-reuse identity cases
-owned by their DEL-before-close contract. Three repeats of 94 focused tests in
-each internal-capable build and 57 focused tests in each shared-only build
+owned by their DEL-before-close contract. Three repeats of 103 focused tests in
+each internal-capable build and 62 focused tests in each shared-only build
 passed. The shared builds also passed exact public-export checks.
 
 The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 5/5 in both
 native and explicitly forced `epoll_pwait2` fallback lanes, five repeats each
 of the API, large-wait, and pool executables, and ASan/UBSan CTest 4/4. The API
-executable reported 50 passed, one focused legacy-WSL1 ready-list-rotation
+executable reported 56 passed, one focused legacy-WSL1 ready-list-rotation
 skip, and zero failures. Coverage includes exact preview package compatibility,
 ELF SONAME and Linux/MinGW export surfaces; socket alias, urgent-data,
 status/error, ET/exclusive read, write, mixed-class, and stale-snapshot

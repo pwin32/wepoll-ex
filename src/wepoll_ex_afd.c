@@ -352,12 +352,12 @@ int ep_afd_open(HANDLE iocp, HANDLE *out)
                                   NULL,
                                   0);
     if (status != STATUS_SUCCESS) {
-        ep_set_errno(ep_status_to_errno(status));
+        ep_set_ntstatus_error(status);
         return -1;
     }
 
     if (CreateIoCompletionPort(h, iocp, 0, 0) == NULL) {
-        ep_set_errno(ep_winerr_to_errno(GetLastError()));
+        ep_set_win32_error(GetLastError());
         CloseHandle(h);
         return -1;
     }
@@ -370,7 +370,7 @@ int ep_afd_open(HANDLE iocp, HANDLE *out)
     if (!SetFileCompletionNotificationModes(
             h, FILE_SKIP_SET_EVENT_ON_HANDLE |
                    FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)) {
-        ep_set_errno(ep_winerr_to_errno(GetLastError()));
+        ep_set_win32_error(GetLastError());
         CloseHandle(h);
         return -1;
     }
@@ -557,7 +557,7 @@ SOCKET ep_socket_get_base_with_ioctl(SOCKET socket,
         /* Preserve the SIO_BASE_HANDLE error.  The fallback probes are
          * best-effort and would otherwise overwrite the useful provider
          * error in the caller's errno. */
-        ep_set_errno(ep_winerr_to_errno((DWORD)base_error));
+        ep_set_winsock_error((DWORD)base_error);
         return INVALID_SOCKET;
     }
 
@@ -607,10 +607,11 @@ uint8_t ep_socket_get_protocol(SOCKET socket)
 #ifdef _WIN32
     WSAPROTOCOL_INFOW protocol_info;
     int protocol_info_length = (int)sizeof(protocol_info);
-    int saved_errno = ep_last_err();
+    wepoll_ex_error_info saved_error;
     int saved_wsa_error = WSAGetLastError();
     uint8_t protocol = EP_SOCKET_PROTOCOL_UNKNOWN;
 
+    ep_get_last_error_info(&saved_error);
     memset(&protocol_info, 0, sizeof(protocol_info));
     if (socket != INVALID_SOCKET &&
         getsockopt(socket, SOL_SOCKET, SO_PROTOCOL_INFOW,
@@ -619,7 +620,7 @@ uint8_t ep_socket_get_protocol(SOCKET socket)
                                                 protocol_info_length);
     }
     WSASetLastError(saved_wsa_error);
-    ep_set_errno(saved_errno);
+    ep_restore_last_error_info(&saved_error);
     return protocol;
 #else
     (void)socket;
@@ -662,7 +663,7 @@ int ep_socket_get_endpoint_id_with_ioctl(
             ioctl_error == WSAENOPROTOOPT || ioctl_error == WSAEINVAL) {
             return 0;
         }
-        ep_set_errno(ep_winerr_to_errno((DWORD)ioctl_error));
+        ep_set_winsock_error((DWORD)ioctl_error);
         return -1;
     }
     if (bytes != (DWORD)sizeof(result)) {
@@ -802,8 +803,6 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
      * output snapshot is complete now; FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
      * guarantees that no IOCP packet owns the embedded status block. */
     if (status != STATUS_SUCCESS && status != STATUS_PENDING) {
-        int status_errno = ep_status_to_errno(status);
-
         atomic_store(&sock->poll_status, EP_POLL_IDLE);
         sock->submitted_afd_events = old_submitted_afd_events;
         if (target_is_duplicate) {
@@ -811,7 +810,7 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
         } else {
             ep_afd_poll_key_release(sock);
         }
-        ep_set_errno(status_errno);
+        ep_set_ntstatus_error(status);
         return -1;
     }
     if (status == STATUS_PENDING) {
@@ -881,7 +880,7 @@ int ep_afd_cancel(ep_sock_t *sock)
     if (status == STATUS_NOT_FOUND)
         return 0;
 
-    ep_set_errno(ep_status_to_errno(status));
+    ep_set_ntstatus_error(status);
     return -1;
 #else
     (void)sock;

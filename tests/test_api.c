@@ -606,7 +606,9 @@ static void test_extension_api(void)
     const uint64_t expected_capabilities =
         WEPOLL_EX_CAP_NATIVE_EDGE_QUEUE |
         WEPOLL_EX_CAP_ATOMIC_SIGNAL_MASK_WAIT |
-        WEPOLL_EX_CAP_NATIVE_EPOLL_DESCRIPTOR;
+        WEPOLL_EX_CAP_NATIVE_EPOLL_DESCRIPTOR |
+        WEPOLL_EX_CAP_CLOSE_SOCKET_HELPER |
+        WEPOLL_EX_CAP_ERROR_INFO;
     wepoll_ex_capabilities capabilities;
     uint32_t capabilities_prefix[2] = { 0, 0 };
     static const char version_prefix[] =
@@ -617,6 +619,14 @@ static void test_extension_api(void)
     if (v == NULL ||
         strncmp(v, version_prefix, sizeof(version_prefix) - 1) != 0) {
         FAIL("version string mismatch");
+        return;
+    }
+    PASS();
+
+    TEST("POSIX uses native dup instead of the virtual alias extension");
+    errno = 0;
+    if (wepoll_ex_dup(-1) != -1 || errno != EOPNOTSUPP) {
+        FAIL("POSIX virtual epfd alias boundary");
         return;
     }
     PASS();
@@ -670,6 +680,53 @@ static void test_extension_api(void)
     if (epoll_rearm_classes(-1, -1, WEPOLL_EX_REARM_ALL) != -1 ||
         errno != EOPNOTSUPP) {
         FAIL("POSIX explicit rearm support boundary");
+        return;
+    }
+    PASS();
+
+    TEST("portable error information exposes the current POSIX errno");
+    wepoll_ex_error_info error_info;
+    uint32_t error_prefix[2] = { 0, 0 };
+    errno = EACCES;
+    if (wepoll_ex_get_last_error_info(&error_info,
+                                      sizeof(error_info)) != 0 ||
+        error_info.version != WEPOLL_EX_ERROR_INFO_VERSION ||
+        error_info.struct_size != sizeof(error_info) ||
+        error_info.portable_error != EACCES ||
+        error_info.native_domain != WEPOLL_EX_NATIVE_ERROR_NONE ||
+        error_info.native_code != 0 || error_info.winsock_error != 0 ||
+        error_info.flags != 0 ||
+        wepoll_ex_get_last_error_info(
+            (wepoll_ex_error_info *)error_prefix,
+            sizeof(error_prefix)) != 0 ||
+        error_prefix[0] != WEPOLL_EX_ERROR_INFO_VERSION ||
+        error_prefix[1] != sizeof(error_info)) {
+        FAIL("POSIX error information snapshot");
+        return;
+    }
+    PASS();
+
+    TEST("close helper removes a POSIX registration before close");
+    int close_epfd = epoll_create1(EPOLL_CLOEXEC);
+    int close_pair[2] = { -1, -1 };
+    struct epoll_event close_event;
+    memset(&close_event, 0, sizeof(close_event));
+    close_event.events = EPOLLIN;
+    if (close_epfd < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, close_pair) != 0 ||
+        epoll_ctl_ctx(close_epfd, EPOLL_CTL_ADD, close_pair[0],
+                      &close_event, NULL) != 0 ||
+        wepoll_ex_close_socket(close_epfd, close_pair[0]) != 0 ||
+        epoll_fd_count(close_epfd) != 0) {
+        FAIL("POSIX close helper");
+        if (close_pair[0] >= 0) (void)close(close_pair[0]);
+        if (close_pair[1] >= 0) (void)close(close_pair[1]);
+        if (close_epfd >= 0) (void)wepoll_close(close_epfd);
+        return;
+    }
+    close_pair[0] = -1;
+    (void)close(close_pair[1]);
+    if (wepoll_close(close_epfd) != 0) {
+        FAIL("POSIX close helper epfd teardown");
         return;
     }
     PASS();

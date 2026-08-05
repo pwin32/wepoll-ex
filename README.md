@@ -22,7 +22,9 @@ for the exact-source comparison,
 [`docs/NGINX_INTEGRATION.md`](docs/NGINX_INTEGRATION.md) for the current
 adapter validation checklist, and
 [`docs/NGINX_NATIVE_EPOLL_PORT.md`](docs/NGINX_NATIVE_EPOLL_PORT.md) for the
-native Linux module's portability boundary.
+native Linux module's portability boundary, and
+[`docs/WINDOWS_PORTING.md`](docs/WINDOWS_PORTING.md) for the opt-in source and
+lifetime bridges intended for direct Windows ports.
 
 ## Architecture at a glance
 
@@ -127,7 +129,9 @@ The header [`include/wepoll_ex.h`](include/wepoll_ex.h) declares
 `epoll_create_ex`, `epoll_ctl_ctx`, `epoll_wait_ex`, `epoll_pwait2_ex`,
 `epoll_ctl_batch`, `epoll_drain`, `epoll_rearm`, `epoll_rearm_classes`,
 `epoll_fd_count`, version helpers, capability/socket-lifetime/statistics
-queries, `wepoll_ex_wake`, `wepoll_ex_wake_event`, and `wepoll_close`.
+queries, `wepoll_ex_get_last_error_info`, `wepoll_ex_wake`,
+`wepoll_ex_wake_event`, `wepoll_ex_dup`, `wepoll_ex_close_socket`, and
+`wepoll_close`.
 `epoll_ctl_batch` applies operations in order and best-effort rolls back ADDs;
 it is not transactional.
 
@@ -176,11 +180,17 @@ only as an extension hint: Windows caps the positive hint value at 4096, while
 POSIX accepts and ignores it. The hint is not a registration limit.
 Windows accepts `EPOLL_CLOEXEC`, but its epfds are process-local virtual
 integers rather than inheritable OS descriptors, so close-on-exec does not
-change their lifetime. A Windows epfd cannot be duplicated, inherited, passed
-as a HANDLE or CRT descriptor, or operated on with `fcntl` or `ioctl`. In
-particular, Linux's `EPIOCSPARAMS` and `EPIOCGPARAMS` epoll busy-poll ioctls are
-not available on Windows. The POSIX build returns a native epoll fd and
-naturally inherits those ioctls when the host headers and kernel support them.
+change their lifetime. `wepoll_ex_dup()` creates another virtual integer for
+the same Windows port: registrations, readiness, waits, and statistics are
+shared, closing a non-final alias removes only that alias, and final close
+wakes waiters and destroys the port. This is an explicit library alias, not a
+native `dup()` result. A Windows epfd still cannot be inherited, passed as a
+HANDLE or CRT descriptor, duplicated by `DuplicateHandle`/`dup`, or operated
+on with `fcntl` or `ioctl`. In particular, Linux's `EPIOCSPARAMS` and
+`EPIOCGPARAMS` epoll busy-poll ioctls are not available on Windows. The POSIX
+build returns a native epoll fd and naturally inherits native `dup()` and
+those ioctls when the host headers and kernel support them;
+`wepoll_ex_dup()` reports `EOPNOTSUPP` there.
 
 Windows `epoll_create_ex()` also accepts
 `WEPOLL_EX_CREATE_EXPLICIT_REARM`.  Socket `EPOLLET` delivery on such a port
@@ -193,12 +203,17 @@ incompletely drained class immediately reports its still-true level once and
 disarms it again.  MOD clears all disarms, `epoll_rearm()` acknowledges all
 classes, and DEL works while the registration is idle or pending.
 
-This explicit contract is socket-only and initially rejects ET combined with
-`EPOLLONESHOT` or `EPOLLEXCLUSIVE`; it does not change ordinary observed-edge
-ports, pipe/waitable ET, or POSIX native epoll.  A fully disarmed registration
-may have no AFD request in flight, so the embedder must DEL before
-`closesocket()`.  Stock nginx's Linux module still needs handler-completion
-rearm hooks, especially for posted events; this is not a symbol-only port.
+This explicit contract is socket-only and rejects `EPOLLEXCLUSIVE`; it does
+not change ordinary observed-edge ports, pipe/waitable ET, or POSIX native
+epoll. `EPOLLONESHOT` may be combined with it. A partial class acknowledgement
+keeps the one-shot fired and submits no native request; acknowledging the last
+delivered class starts the next one-shot generation. A fully disarmed
+registration may have no AFD request in flight, so the embedder must DEL before
+`closesocket()`. `wepoll_ex_close_socket()` provides that ordering for one
+specified epfd and treats an already absent registration as success after
+validating the target; it does not remove the socket from any other epoll
+instances. Stock nginx's Linux module still needs handler-completion rearm
+hooks, especially for posted events; this is not a symbol-only port.
 
 Windows control calls classify the target before membership errors where Linux
 does: an invalid or closed target returns `EBADF`, a valid supported target
@@ -407,9 +422,10 @@ exclusive-claim updates serialize through one process-wide mutex, and virtual
 epoll descriptors cannot be monitored or nested. Consequently, Windows cannot
 reproduce Linux's distinct self-registration and nested-epoll `EINVAL` cases;
 the virtual integer may instead classify as an invalid or unrelated native
-target. Virtual epfds also have no duplicate, inheritance, `fcntl`, `ioctl`,
-or epoll busy-poll configuration semantics; `EPOLL_CLOEXEC` is accepted only
-for source compatibility.
+target. Virtual epfds have explicit same-process aliases through
+`wepoll_ex_dup()`, but no native descriptor duplication, inheritance,
+`fcntl`, `ioctl`, or epoll busy-poll configuration semantics;
+`EPOLL_CLOEXEC` is accepted only for source compatibility.
 
 On Linux, `epoll_fd_count()` reports registrations owned by the extension
 metadata, including successful `epoll_ctl_batch` operations. Native
@@ -430,6 +446,9 @@ Select the Windows policy at configure time with
   complete `EPOLL_CTL_DEL` before every `closesocket()`.
 
 `wepoll_ex_get_socket_lifetime_policy()` reports the compiled policy.
+`wepoll_ex_close_socket()` can enforce DEL-then-close for one epfd without
+retaining a duplicate socket or changing peer-FIN behavior. A socket registered
+in multiple ports must still be removed from every other port first.
 `wepoll_ex_get_stats()` and `wepoll_ex_get_global_stats()` copy versioned,
 size-prefixed operational snapshots. Windows exposes registration, queue,
 pool, stale-event, identity, asynchronous-error, drain-budget, quarantine,
@@ -449,7 +468,16 @@ event and returns it as a one-record synthetic batch; extended waits add
 the first pending tagged payload is retained when later requests coalesce.
 `WEPOLL_EX_CAP_TAGGED_WAKE_EVENT` advertises the tagged form. The POSIX wrapper
 reports both wake operations unsupported because its basic waits are direct
-libc calls.
+libc calls. Additional capability bits advertise the close helper, explicit
+rearm plus ONESHOT, virtual epfd aliases, and the error-info channel.
+
+`wepoll_ex_get_last_error_info()` copies the calling thread's details after a
+failed library operation. `portable_error` is the public `errno`; Windows also
+reports an exact Win32, Winsock, or NTSTATUS source when the failing path
+retained it, plus a canonical Winsock equivalent when meaningful. A normalized
+error without `WEPOLL_EX_ERROR_NATIVE_EXACT` must not be interpreted as the
+original native failure. POSIX reports the current `errno` and leaves native
+fields empty. The successful getter does not overwrite the saved channel.
 
 The prioritized follow-up work and nginx qualification gates are recorded in
 [`docs/COMPATIBILITY_ROADMAP.md`](docs/COMPATIBILITY_ROADMAP.md).
@@ -458,6 +486,7 @@ The prioritized follow-up work and nginx qualification gates are recorded in
 
 ```
 include/   public headers
+compat/    opt-in Windows <sys/epoll.h> compatibility include root
 src/       Windows engine and Linux wrapper
 tests/     Linux, Windows API, pool, and package-consumer tests
 bench/     Linux latency/scaling and Windows qualification benchmarks
@@ -584,6 +613,21 @@ target_link_libraries(my_server PRIVATE wepoll_ex::wepoll_ex)
 Use `wepoll_ex::wepoll_ex_static` or `wepoll_ex::wepoll_ex_shared` when the
 linkage must be explicit. Set `CMAKE_PREFIX_PATH` to the install prefix, or set
 `wepoll_ex_DIR` to its `<libdir>/cmake/wepoll_ex` directory.
+
+Windows builds also install an opt-in source-compatibility target:
+
+```cmake
+find_package(wepoll_ex 0.1.0 EXACT CONFIG REQUIRED COMPONENTS epoll_compat)
+target_link_libraries(my_linux_epoll_port PRIVATE wepoll_ex::epoll_compat)
+```
+
+That target alone adds the isolated installed include root containing
+`<sys/epoll.h>` and links the selected wepoll-ex library. The compatibility
+header is deliberately not placed in the ordinary include root, so consumers
+that use `wepoll_ex::wepoll_ex` do not globally shadow another platform's
+`sys/epoll.h`. Set `WEPOLL_EX_BUILD_EPOLL_COMPAT=OFF` to omit the target. It
+provides declarations and constants, not Linux descriptor semantics such as
+native `dup`, inheritance, nested epoll, eventfd, timerfd, or file AIO.
 
 When included with `add_subdirectory`, wepoll-ex no longer changes the parent
 project's build type and its tests default off. Enable both `BUILD_TESTING` and

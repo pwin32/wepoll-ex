@@ -38,9 +38,12 @@ explicit rearm contract:
 Delivered read/write classes stay disabled while undelivered directions remain
 in the AFD request. Terminal delivery disables every class; MOD clears all
 disarms; pending-mask expansion uses the existing cancellation-losing refresh
-path; and DEL retires idle or pending state. The initial contract is socket
-only, rejects ET with ONESHOT or EXCLUSIVE, requires DEL-before-closesocket(),
-and is reported by `WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM`.
+path; and DEL retires idle or pending state. The contract is socket-only and
+rejects EXCLUSIVE. It now supports ONESHOT: partial class acknowledgement keeps
+the one-shot fired, while the final delivered-class acknowledgement starts its
+next generation. The base mode and stronger combination are reported by
+`WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM` and
+`WEPOLL_EX_CAP_EXPLICIT_REARM_ONESHOT`.
 
 Library regressions cover duplex independence, incomplete drains, pending AFD
 mask expansion, terminal idling, MOD reset, and DEL. The remaining work is the
@@ -71,17 +74,15 @@ socket or eventfd side channel.
 ### Exact-source audit follow-ups
 
 The nginx 1.31.3, libuv 1.52.1, Mio 1.2.2, and Boost.Asio 1.38.2 reference
-archives were compared in `docs/UPSTREAM_EVENT_LOOP_AUDIT.md`. The remaining
-cross-loop candidates are intentionally conditional:
+archives were compared in `docs/UPSTREAM_EVENT_LOOP_AUDIT.md`. Four direct
+porting gaps identified there are now implemented: opt-in `<sys/epoll.h>`
+packaging, virtual epfd aliases with final-close semantics, a one-port
+DEL-before-close helper, and a documented native error-info channel. The
+remaining cross-loop candidates are intentionally conditional:
 
-- a virtual epfd alias/clone would serve a direct Mio Unix-selector port, but
-  needs shared-close semantics rather than pretending the virtual integer is a
-  native HANDLE;
 - a supplemental/double-buffered AFD request, inspired by libuv, may reduce
   cancel/refresh work during interest expansion, but should follow measured
   cancellation and probe pressure;
-- close-aware registration ownership would help all ET integrations only if
-  callers can adopt it consistently without retaining sockets; and
 - native file AIO, io_uring, timerfd, named-pipe completions, and general IOCP
   dispatch remain separate integration facilities, not epoll readiness gaps.
 
@@ -90,17 +91,23 @@ cross-loop candidates are intentionally conditional:
 The existing best-effort, strict, and synchronized policies remain distinct.
 A production nginx profile should qualify synchronized mode only after every
 core and third-party path is proven to issue DEL before `closesocket()`.
-Future work may add a close-aware helper or opaque registration token, but it
-must not silently take ownership of application sockets or retain a duplicate
-that changes peer-FIN behavior.
+`wepoll_ex_close_socket()` now performs DEL against one specified epfd and then
+closes the socket, accepting an already absent registration after validating
+the target. It neither retains a duplicate nor changes peer-FIN behavior. A
+socket registered in multiple ports still has to be removed from the other
+ports before the helper is used for final close.
 
 ### Windows error channel
 
-wepoll-ex reports portable `errno`, while Win32 nginx frequently reads Win32
-or Winsock error state. A future error bridge should expose a documented
-normalized error and, where meaningful, its Winsock equivalent. It must define
-success-path preservation and avoid replacing the error from a completed
-socket operation with an epoll bookkeeping error.
+wepoll-ex continues to report portable `errno`, while
+`wepoll_ex_get_last_error_info()` now exposes a per-thread versioned record for
+the most recent failed library call. Windows retains an exact Win32, Winsock,
+or NTSTATUS source where the failing path has it and separately marks a
+canonical Winsock equivalent when meaningful. A normalized mapping without
+the exact-source flag is not presented as the originating native failure. The
+successful getter preserves the channel. Application socket-operation errors
+remain owned by the application and are not overwritten merely to populate
+this record.
 
 ## Priority 1: measurable performance and deployment behavior
 
@@ -128,9 +135,10 @@ optional future facility, not an implied property of the existing flag.
 `wepoll_ex_get_capabilities()` reports semantic backend properties such as
 native versus observed edge delivery, process-local exclusive arbitration,
 wait-wake support, signal-mask application, and native versus virtual epoll
-descriptors. Deployment qualification should additionally record Windows and
-compiler versions, socket-lifetime policy, provider behavior, and probe
-counters.
+descriptors. It also advertises the close helper, explicit ONESHOT rearm,
+virtual epfd alias, and error-info contracts. Deployment qualification should
+additionally record Windows and compiler versions, socket-lifetime policy,
+provider behavior, and probe counters.
 
 ### Toolchain and provider matrix
 
@@ -151,9 +159,9 @@ reported cleanly rather than being treated as a portable guarantee.
   Windows facility.
 - Generic pipe and waitable extensions should not be expanded merely to make
   the socket/nginx compatibility claim look broader.
-- An epfd alias/clone and supplemental AFD request remain opt-in candidates;
-  neither should change the default ABI or request topology without a concrete
-  embedder and before/after measurements.
+- A supplemental AFD request remains an opt-in candidate and should not change
+  the default request topology without a concrete embedder and before/after
+  measurements.
 
 ## Required nginx qualification
 

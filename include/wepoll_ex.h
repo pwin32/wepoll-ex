@@ -227,6 +227,14 @@ typedef struct wepoll_ex_global_stats {
     (UINT64_C(1) << 8)
 #define WEPOLL_EX_CAP_TAGGED_WAKE_EVENT \
     (UINT64_C(1) << 9)
+#define WEPOLL_EX_CAP_CLOSE_SOCKET_HELPER \
+    (UINT64_C(1) << 10)
+#define WEPOLL_EX_CAP_EXPLICIT_REARM_ONESHOT \
+    (UINT64_C(1) << 11)
+#define WEPOLL_EX_CAP_VIRTUAL_EPOLL_DUP \
+    (UINT64_C(1) << 12)
+#define WEPOLL_EX_CAP_ERROR_INFO \
+    (UINT64_C(1) << 13)
 
 typedef struct wepoll_ex_capabilities {
     uint32_t version;
@@ -234,6 +242,35 @@ typedef struct wepoll_ex_capabilities {
     uint64_t flags;       /* WEPOLL_EX_CAP_* */
     uint64_t reserved[2];
 } wepoll_ex_capabilities;
+
+/* Per-thread details for the most recent failed wepoll-ex call.  portable_error
+ * is the errno value returned by the public API.  native_code is present only
+ * when the implementation retained the exact Win32, Winsock, or NTSTATUS
+ * source; winsock_error is a documented equivalent when one is meaningful.
+ * The channel is defined only after a call returns -1 and is not changed by a
+ * successful call to wepoll_ex_get_last_error_info(). */
+#define WEPOLL_EX_ERROR_INFO_VERSION 1U
+
+typedef enum wepoll_ex_native_error_domain {
+    WEPOLL_EX_NATIVE_ERROR_NONE = 0,
+    WEPOLL_EX_NATIVE_ERROR_WIN32 = 1,
+    WEPOLL_EX_NATIVE_ERROR_WINSOCK = 2,
+    WEPOLL_EX_NATIVE_ERROR_NTSTATUS = 3
+} wepoll_ex_native_error_domain;
+
+#define WEPOLL_EX_ERROR_NATIVE_EXACT       (1U << 0)
+#define WEPOLL_EX_ERROR_WINSOCK_EQUIVALENT (1U << 1)
+
+typedef struct wepoll_ex_error_info {
+    uint32_t version;
+    uint32_t struct_size;
+    int32_t portable_error;
+    uint32_t native_domain;
+    uint32_t native_code;
+    int32_t winsock_error;
+    uint32_t flags;
+    uint32_t reserved;
+} wepoll_ex_error_info;
 
 /* ---------------------------------------------------------------------------
  * Core Linux-compatible API.
@@ -274,9 +311,11 @@ WEPOLL_EX_API int  epoll_pwait2(int epfd, struct epoll_event *events,
  * mode: delivery disarms the returned read/write/terminal readiness classes
  * until epoll_rearm_classes() acknowledges that the application drained the
  * corresponding operations.  A terminal delivery disarms every class while
- * the application decides whether to close or deliberately rearm.  POSIX
- * reports EOPNOTSUPP for this flag, and the Linux-compatible epoll_create1()
- * entry point never accepts it. */
+ * the application decides whether to close or deliberately rearm.  With
+ * EPOLLONESHOT, partial class acknowledgements keep the one-shot disabled and
+ * the final acknowledgement starts the next generation.  EPOLLEXCLUSIVE is
+ * still rejected.  POSIX reports EOPNOTSUPP for this flag, and the Linux-
+ * compatible epoll_create1() entry point never accepts it. */
 #define WEPOLL_EX_CREATE_EXPLICIT_REARM 0x01000000
 
 /* Class mask accepted by epoll_rearm_classes().  READ includes ordinary,
@@ -359,6 +398,9 @@ WEPOLL_EX_API int  epoll_rearm(int epfd, epoll_fd_t fd);
  * ready node has been returned by a wait.  It reports EBUSY while that node is
  * still queued, and EOPNOTSUPP for other ports or registration kinds.  A
  * successful MOD starts a fresh observation and clears every class disarm.
+ * For EPOLLONESHOT, acknowledging only some delivered classes keeps the
+ * registration disabled; clearing the final delivered class also rearms the
+ * one-shot.  epoll_rearm() acknowledges every delivered class at once.
  * Explicitly rearmed embedders must DEL before closesocket(), because a fully
  * disarmed registration may intentionally have no native AFD poll in flight.
  * POSIX reports EOPNOTSUPP. */
@@ -392,6 +434,12 @@ WEPOLL_EX_API int wepoll_ex_get_stats(int epfd,
 WEPOLL_EX_API int wepoll_ex_get_global_stats(
     wepoll_ex_global_stats *stats, size_t stats_size);
 
+/* Copy the calling thread's error details for the most recent failed
+ * wepoll-ex operation.  On POSIX, portable_error reflects errno and the
+ * native fields are empty. */
+WEPOLL_EX_API int wepoll_ex_get_last_error_info(
+    wepoll_ex_error_info *error_info, size_t error_info_size);
+
 /* Request one coalesced early return from a wait on this epoll instance.
  * Windows basic and extended waits return zero after already-ready events and
  * pending errors have taken priority.  Multiple requests before observation
@@ -410,6 +458,20 @@ WEPOLL_EX_API int wepoll_ex_wake(int epfd);
  * WEPOLL_FLAG_WAKE_EVENT. POSIX reports EOPNOTSUPP. */
 WEPOLL_EX_API int wepoll_ex_wake_event(
     int epfd, const struct epoll_event *event);
+
+/* Create another virtual descriptor for the same Windows epoll instance.
+ * Registrations, ready state, waits, and statistics are shared.  Closing a
+ * non-final alias removes only that alias; the final wepoll_close() wakes
+ * waiters and destroys the underlying port.  POSIX callers should use dup()
+ * on the native epoll descriptor and receive EOPNOTSUPP here. */
+WEPOLL_EX_API int wepoll_ex_dup(int epfd);
+
+/* Remove a socket from one epoll instance and then close it in that order.
+ * An absent registration (ENOENT) is accepted after target validation.  Other
+ * DEL failures leave the socket open.  The helper covers only this epfd;
+ * callers that registered the socket in other instances must remove those
+ * registrations first. */
+WEPOLL_EX_API int wepoll_ex_close_socket(int epfd, epoll_fd_t fd);
 
 /* Close an epoll fd created by epoll_create / epoll_create1 /
  * epoll_create_ex.  On POSIX this normally behaves like close(); tracked

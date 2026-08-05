@@ -1154,7 +1154,9 @@ WEPOLL_EX_API int wepoll_ex_get_capabilities(
     snapshot.struct_size = (uint32_t)sizeof(snapshot);
     snapshot.flags = WEPOLL_EX_CAP_NATIVE_EDGE_QUEUE |
                      WEPOLL_EX_CAP_ATOMIC_SIGNAL_MASK_WAIT |
-                     WEPOLL_EX_CAP_NATIVE_EPOLL_DESCRIPTOR;
+                     WEPOLL_EX_CAP_NATIVE_EPOLL_DESCRIPTOR |
+                     WEPOLL_EX_CAP_CLOSE_SOCKET_HELPER |
+                     WEPOLL_EX_CAP_ERROR_INFO;
     return copy_versioned_snapshot(capabilities, capabilities_size,
                                    &snapshot, sizeof(snapshot));
 }
@@ -1201,6 +1203,19 @@ WEPOLL_EX_API int wepoll_ex_get_global_stats(
                                    &snapshot, sizeof(snapshot));
 }
 
+WEPOLL_EX_API int wepoll_ex_get_last_error_info(
+    wepoll_ex_error_info *error_info, size_t error_info_size)
+{
+    wepoll_ex_error_info snapshot;
+
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.version = WEPOLL_EX_ERROR_INFO_VERSION;
+    snapshot.struct_size = (uint32_t)sizeof(snapshot);
+    snapshot.portable_error = errno;
+    return copy_versioned_snapshot(error_info, error_info_size,
+                                   &snapshot, sizeof(snapshot));
+}
+
 WEPOLL_EX_API int wepoll_ex_wake(int epfd)
 {
     (void)epfd;
@@ -1215,6 +1230,31 @@ WEPOLL_EX_API int wepoll_ex_wake_event(
     (void)event;
     errno = EOPNOTSUPP;
     return -1;
+}
+
+WEPOLL_EX_API int wepoll_ex_dup(int epfd)
+{
+    (void)epfd;
+    errno = EOPNOTSUPP;
+    return -1;
+}
+
+WEPOLL_EX_API int wepoll_ex_close_socket(int epfd, int fd)
+{
+    int unregister_result;
+    int unregister_error;
+
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    unregister_result = epoll_ctl_ctx(epfd, EPOLL_CTL_DEL, fd, NULL, NULL);
+    unregister_error = errno;
+    if (unregister_result != 0 && unregister_error != ENOENT) {
+        errno = unregister_error;
+        return -1;
+    }
+    return close(fd);
 }
 
 WEPOLL_EX_API int wepoll_close(int epfd)
@@ -1278,6 +1318,26 @@ WEPOLL_EX_API int wepoll_close(int epfd)
 /* --------------------------------------------------------------------- */
 void ep_set_errno(int e) { errno = e; }
 int  ep_last_err(void)   { return errno; }
+void ep_set_native_error(int e, uint32_t d, uint32_t c)
+{
+    (void)d;
+    (void)c;
+    errno = e;
+}
+void ep_set_win32_error(DWORD e) { errno = ep_winerr_to_errno(e); }
+void ep_set_winsock_error(DWORD e) { errno = ep_winerr_to_errno(e); }
+void ep_set_ntstatus_error(NTSTATUS s) { errno = ep_status_to_errno(s); }
+void ep_get_last_error_info(wepoll_ex_error_info *i)
+{
+    memset(i, 0, sizeof(*i));
+    i->version = WEPOLL_EX_ERROR_INFO_VERSION;
+    i->struct_size = (uint32_t)sizeof(*i);
+    i->portable_error = errno;
+}
+void ep_restore_last_error_info(const wepoll_ex_error_info *i)
+{
+    errno = i->portable_error;
+}
 int  ep_winerr_to_errno(DWORD w) { (void)w; return EINVAL; }
 int  ep_status_to_errno(NTSTATUS s) { (void)s; return EINVAL; }
 

@@ -106,6 +106,14 @@ else()
         "wepoll-ex supports only Windows and Linux; the POSIX shim requires Linux epoll and eventfd")
 endif()
 
+option(WEPOLL_EX_BUILD_EPOLL_COMPAT
+       "Export the opt-in Windows <sys/epoll.h> compatibility target"
+       ${WEPOLL_EX_PLATFORM_WINDOWS})
+if(WEPOLL_EX_BUILD_EPOLL_COMPAT AND NOT WEPOLL_EX_PLATFORM_WINDOWS)
+    message(FATAL_ERROR
+        "WEPOLL_EX_BUILD_EPOLL_COMPAT is a Windows-only source-compatibility target")
+endif()
+
 # --------------------------------------------------------------------- #
 # Threading library.  Both the POSIX shim and the current Windows
 # implementation use the pthread-compatible API.
@@ -322,6 +330,23 @@ elseif(WEPOLL_EX_BUILD_STATIC)
     add_library(wepoll_ex::wepoll_ex ALIAS wepoll_ex_static)
 endif()
 
+if(WEPOLL_EX_BUILD_EPOLL_COMPAT)
+    add_library(wepoll_ex_epoll_compat INTERFACE)
+    set_target_properties(wepoll_ex_epoll_compat PROPERTIES
+        EXPORT_NAME epoll_compat)
+    target_include_directories(wepoll_ex_epoll_compat INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/compat/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/wepoll-ex-compat>)
+    if(WEPOLL_EX_BUILD_SHARED)
+        target_link_libraries(wepoll_ex_epoll_compat INTERFACE
+            wepoll_ex_shared)
+    else()
+        target_link_libraries(wepoll_ex_epoll_compat INTERFACE
+            wepoll_ex_static)
+    endif()
+    add_library(wepoll_ex::epoll_compat ALIAS wepoll_ex_epoll_compat)
+endif()
+
 # --------------------------------------------------------------------- #
 # Tests.
 # --------------------------------------------------------------------- #
@@ -362,6 +387,13 @@ if(WEPOLL_EX_BUILD_STATIC)
         EXPORT wepoll_exTargets
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+
+if(WEPOLL_EX_BUILD_EPOLL_COMPAT)
+    install(TARGETS wepoll_ex_epoll_compat
+        EXPORT wepoll_exTargets)
+    install(DIRECTORY compat/include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/wepoll-ex-compat)
 endif()
 
 install(EXPORT wepoll_exTargets
