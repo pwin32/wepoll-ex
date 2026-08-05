@@ -17,7 +17,7 @@ int main(void)
     if (wepoll_ex_get_capabilities(&capabilities, sizeof(capabilities)) != 0 ||
         capabilities.version != WEPOLL_EX_CAPABILITIES_VERSION ||
         capabilities.struct_size != sizeof(capabilities) ||
-        capabilities.flags == 0) {
+        (capabilities.flags & WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER) == 0) {
         return 2;
     }
 
@@ -60,6 +60,8 @@ int main(void)
 
     errno = 0;
     if (wepoll_ex_close_socket(epfd, EPOLL_FD_INVALID) != -1 ||
+        errno != EBADF ||
+        wepoll_ex_shutdown_socket(epfd, EPOLL_FD_INVALID, 0) != -1 ||
         errno != EBADF ||
         wepoll_ex_get_last_error_info(&error_info,
                                       sizeof(error_info)) != 0 ||

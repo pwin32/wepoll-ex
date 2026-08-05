@@ -809,7 +809,8 @@ WEPOLL_EX_API int wepoll_ex_get_capabilities(
                      WEPOLL_EX_CAP_CLOSE_SOCKET_HELPER |
                      WEPOLL_EX_CAP_EXPLICIT_REARM_ONESHOT |
                      WEPOLL_EX_CAP_VIRTUAL_EPOLL_DUP |
-                     WEPOLL_EX_CAP_ERROR_INFO;
+                     WEPOLL_EX_CAP_ERROR_INFO |
+                     WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER;
     return copy_versioned_snapshot(capabilities, capabilities_size,
                                    &snapshot, sizeof(snapshot));
 }
@@ -936,6 +937,24 @@ WEPOLL_EX_API int wepoll_ex_close_socket(int epfd, epoll_fd_t fd)
     }
     epfd_put(entry);
     return 0;
+}
+
+WEPOLL_EX_API int wepoll_ex_shutdown_socket(int epfd, epoll_fd_t fd, int how)
+{
+    epfd_shared_t *entry;
+    int result;
+
+    if (fd == EPOLL_FD_INVALID) {
+        ep_set_errno(EBADF);
+        return -1;
+    }
+    entry = epfd_require(epfd);
+    if (entry == NULL) {
+        return -1;
+    }
+    result = ep_port_shutdown_socket(entry->port, (SOCKET)fd, how);
+    epfd_put(entry);
+    return result;
 }
 
 WEPOLL_EX_API int wepoll_close(int epfd)

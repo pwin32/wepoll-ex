@@ -70,6 +70,48 @@ direct `closesocket()`.
 On Linux the same API performs DEL followed by `close()`. It is an ordering
 convenience rather than a replacement for application-level ownership.
 
+## Local shutdown readiness helper
+
+Winsock does not turn local `shutdown(SD_RECEIVE)` into AFD, `WSAPoll`, or
+`select` readability. An epoll-shaped loop can therefore block forever waiting
+for the Linux local-EOF event unless it owns the shutdown call.
+`wepoll_ex_shutdown_socket(epfd, socket, how)` supplies that ownership point:
+
+```c
+if (wepoll_ex_shutdown_socket(epfd, socket_fd, SD_RECEIVE) != 0) {
+    handle_shutdown_or_publication_error(socket_fd);
+}
+```
+
+For a recognized TCP socket currently registered in the selected Windows
+port, a successful receive shutdown publishes the requested
+`EPOLLIN`/`EPOLLRDNORM` aliases plus `EPOLLRDHUP`. Once both local directions
+are shut down, it also publishes unrequested `EPOLLHUP`. `SD_SEND` alone does
+not manufacture a new Linux readiness class. Existing ordinary readiness is
+merged into the same snapshot. LT remains persistent; ET reports only newly
+observed bits; ONESHOT remains disabled until normal MOD/rearm; and an
+explicit-rearm port disarms/redelivers the applicable readiness classes under
+its existing acknowledgement contract. MOD and class rearm perform a fresh
+synthetic scan and wake an already blocked waiter.
+
+The helper validates the epfd and target before the first native effect. If an
+idle/queued registration needs a ready node immediately, it reserves that node
+before calling Winsock. Cancellation or IOCP publication can still fail after
+native shutdown succeeds. The TCP state remains recorded; when the port is
+still usable, calling the helper again retries publication without repeating
+the already-recorded native direction. A fatal IOCP-post failure still makes
+the port unusable and should follow normal teardown/error handling.
+
+This is readiness emulation, not data-call emulation. After `SD_RECEIVE`,
+Winsock `recv()` continues to fail with `WSAESHUTDOWN`; it does not return the
+zero-byte EOF that Linux returns. The state belongs to one underlying epoll
+port (and therefore all `wepoll_ex_dup()` aliases of it). Direct `shutdown()`
+calls and independent epoll ports containing the same socket remain outside
+observation. The state also belongs to the current registration: DEL discards
+it, and a later ADD does not infer an already-completed local shutdown. An
+unregistered or non-TCP Windows socket, and every POSIX call, uses native
+`shutdown()` without synthetic state.
+
 ## Explicit rearm with `EPOLLONESHOT`
 
 A Windows port created with `WEPOLL_EX_CREATE_EXPLICIT_REARM` gives socket
@@ -156,7 +198,8 @@ A port that depends on these bridges should query
 
 - `WEPOLL_EX_CAP_CLOSE_SOCKET_HELPER`;
 - `WEPOLL_EX_CAP_EXPLICIT_REARM_ONESHOT`;
-- `WEPOLL_EX_CAP_VIRTUAL_EPOLL_DUP`; and
+- `WEPOLL_EX_CAP_VIRTUAL_EPOLL_DUP`;
+- `WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER`; and
 - `WEPOLL_EX_CAP_ERROR_INFO`.
 
 The older edge-delivery, explicit-rearm, wake, tagged-wake, signal-mask,
@@ -165,14 +208,16 @@ semantics affect the event loop.
 
 ## Remaining drop-in gaps
 
-The five bridges reduce source churn but do not remove these material porting
+The opt-in bridges reduce source churn but do not remove these material porting
 boundaries:
 
 1. Windows `EPOLLET` is either an observed-level filter or the opt-in explicit
    drain/ack contract, not Linux's in-kernel ready-list implementation.
 2. Direct socket close, shutdown, or handle reuse outside the selected
-   lifetime contract can still bypass library observation. Local
-   `shutdown(SD_RECEIVE)` has no asynchronous Winsock readiness transition.
+   lifetime contract can still bypass library observation. In particular,
+   local receive shutdown is visible only when every relevant caller uses
+   `wepoll_ex_shutdown_socket()` for each independent port that needs it, and
+   DEL/re-ADD does not carry the recorded state into the new registration.
 3. `eventfd`, `timerfd`, signalfd/signal masks, Linux file AIO, io_uring, and
    general IOCP operation completions need separate Windows facilities.
 4. `EPOLLEXCLUSIVE` arbitration is process- and loaded-image-local, not a

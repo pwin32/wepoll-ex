@@ -67,6 +67,28 @@ core and third-party close path still needs qualification.
 one epfd; it does not remove registrations from other ports or discover nginx
 objects that bypass the chosen close wrapper.
 
+## Local shutdown bridge
+
+The exact nginx 1.31.3 platform headers define `ngx_shutdown_socket` as the
+native `shutdown()` call. A Windows epoll experiment should route that macro or
+an equivalent event-module hook through
+`wepoll_ex_shutdown_socket(epfd, fd, how)`. For a registered TCP socket, local
+read shutdown then publishes the requested readable aliases and
+`EPOLLRDHUP`; shutting down both directions also publishes `EPOLLHUP`. The
+state follows LT/ET, ONESHOT, explicit-rearm, MOD, and blocked-wait rules, so
+the native module does not need a full registration scan to discover its own
+half-close.
+
+This bridge is one-port and changes readiness only. Third-party code that
+calls Winsock `shutdown()` directly, or another independent epfd containing
+the socket, remains outside observation. nginx data-path code must also retain
+the Windows result contract: `recv()` after local receive shutdown reports
+`WSAESHUTDOWN`, not Linux's zero-byte EOF. A cancellation/publication error can
+be returned after native shutdown has succeeded; a still-usable port can retry
+the same helper call because the native direction is recorded. That record is
+owned by the current registration, so a DEL/re-ADD sequence must not assume
+that the new registration inherited an earlier local shutdown publication.
+
 ## Notification bridge
 
 The native module's control `eventfd` can be replaced without emulating a Unix
@@ -97,8 +119,10 @@ Using this facility is more than changing `epoll_create`, `epoll_ctl`, and
 4. when `NGX_POST_EVENTS` is used, rearm belongs after the posted handler
    executes, not at the end of `ngx_epoll_process_events()`;
 5. `EPOLLERR | EPOLLHUP` handling must close/DEL or deliberately rearm the
-   surviving classes; and
-6. the control notify path must use a tagged wake or another Windows primitive;
+   surviving classes;
+6. every local socket shutdown path must use the event module's
+   `wepoll_ex_shutdown_socket()` bridge; and
+7. the control notify path must use a tagged wake or another Windows primitive;
    optional Linux file AIO and native epoll-fd close assumptions still need
    separate Windows implementations.
 

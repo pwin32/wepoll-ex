@@ -235,6 +235,8 @@ typedef struct wepoll_ex_global_stats {
     (UINT64_C(1) << 12)
 #define WEPOLL_EX_CAP_ERROR_INFO \
     (UINT64_C(1) << 13)
+#define WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER \
+    (UINT64_C(1) << 14)
 
 typedef struct wepoll_ex_capabilities {
     uint32_t version;
@@ -472,6 +474,21 @@ WEPOLL_EX_API int wepoll_ex_dup(int epfd);
  * callers that registered the socket in other instances must remove those
  * registrations first. */
 WEPOLL_EX_API int wepoll_ex_close_socket(int epfd, epoll_fd_t fd);
+
+/* Apply shutdown() to a socket after validating one epoll instance.  On
+ * Windows, a currently registered TCP socket also records the local receive
+ * and write shutdown state so waits can expose Linux-like persistent
+ * IN/RDHUP and full-shutdown HUP readiness that Winsock does not signal to
+ * AFD.  `how` uses the platform's SHUT_RD/SHUT_WR/SHUT_RDWR or equivalent
+ * SD_RECEIVE/SD_SEND/SD_BOTH values.  The synthetic state belongs only to the
+ * current registration in the specified epfd; EPOLL_CTL_DEL discards it and a
+ * later ADD starts without recorded shutdown state.  Direct shutdown() calls
+ * and registrations in other epoll instances remain outside this helper's
+ * observation.  Winsock recv() after SD_RECEIVE still reports WSAESHUTDOWN
+ * rather than Linux EOF.  A publication failure may be reported after native
+ * shutdown has succeeded; recorded TCP state makes the same helper call
+ * retryable while the port remains usable. */
+WEPOLL_EX_API int wepoll_ex_shutdown_socket(int epfd, epoll_fd_t fd, int how);
 
 /* Close an epoll fd created by epoll_create / epoll_create1 /
  * epoll_create_ex.  On POSIX this normally behaves like close(); tracked

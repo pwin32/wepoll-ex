@@ -2636,6 +2636,164 @@ int ep_port_worklists_valid_locked(const ep_port_t *port)
         list_count == live_oneshot_count;
 }
 
+static int ep_local_shutdown_mask(int how, uint8_t *mask_out)
+{
+    switch (how) {
+    case SD_RECEIVE:
+        *mask_out = EP_LOCAL_SHUTDOWN_READ;
+        return 0;
+    case SD_SEND:
+        *mask_out = EP_LOCAL_SHUTDOWN_WRITE;
+        return 0;
+    case SD_BOTH:
+        *mask_out = EP_LOCAL_SHUTDOWN_READ | EP_LOCAL_SHUTDOWN_WRITE;
+        return 0;
+    default:
+        ep_set_winsock_error(WSAEINVAL);
+        return -1;
+    }
+}
+
+static void ep_sock_merge_local_shutdown_locked(ep_sock_t *sock,
+                                                uint32_t *level)
+{
+    if (sock->kind != EP_REG_SOCKET ||
+        sock->socket_protocol != EP_SOCKET_PROTOCOL_TCP) {
+        return;
+    }
+    if ((sock->local_shutdown & EP_LOCAL_SHUTDOWN_READ) != 0) {
+        *level |= sock->user_events &
+            (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP);
+    }
+    if (sock->local_shutdown ==
+            (EP_LOCAL_SHUTDOWN_READ | EP_LOCAL_SHUTDOWN_WRITE)) {
+        *level |= EPOLLHUP;
+    }
+}
+
+static uint32_t ep_sock_local_shutdown_level_locked(ep_sock_t *sock)
+{
+    uint32_t level = 0;
+
+    if (sock->kind != EP_REG_SOCKET ||
+        sock->socket_protocol != EP_SOCKET_PROTOCOL_TCP ||
+        sock->local_shutdown == 0) {
+        return 0;
+    }
+
+    /* Merge ordinary current levels first.  This keeps writable readiness and
+     * a concurrently observed peer reset in the same snapshot instead of
+     * letting the synthetic local level permanently starve native polling. */
+    ep_socket_merge_current_levels(sock, &level);
+    ep_sock_merge_local_shutdown_locked(sock, &level);
+    level &= sock->user_events | EPOLLERR | EPOLLHUP;
+    if (ep_sock_explicit_rearm_enabled(sock)) {
+        ep_readiness_filter_classes(
+            &level, sock->explicit_disarmed_classes);
+    }
+    return level;
+}
+
+/* Queue the current locally-published shutdown level.  The caller holds
+ * fd_table_lock.  A supplied node is consumed or returned to the pool.  Return
+ * one when a ready node was queued, zero when no new delivery is eligible, and
+ * minus one on allocation failure. */
+static int ep_sock_queue_local_shutdown_locked(ep_sock_t *sock,
+                                                ep_ready_node_t *node)
+{
+    ep_port_t *port = sock->port;
+    uint32_t level = ep_sock_local_shutdown_level_locked(sock);
+    uint32_t delivered;
+    uint32_t observed = sock->observed_events;
+    int already_ready = atomic_load_explicit(
+        &sock->ready_queued, memory_order_relaxed) != 0;
+
+    if (!already_ready && sock->oneshot_fired) {
+        if (node != NULL) ep_ready_node_free(port, node);
+        return 0;
+    }
+    delivered = already_ready ? sock->pending_events : 0;
+    if ((sock->user_flags & EPOLLET) != 0) {
+        uint32_t interest = sock->user_events | EPOLLERR | EPOLLHUP;
+        uint32_t edge;
+
+        observed &= level & interest;
+        edge = level & ~observed;
+        delivered |= edge;
+        observed |= edge;
+    } else {
+        delivered |= level;
+    }
+
+    if (delivered == 0 ||
+        (already_ready && delivered == sock->pending_events)) {
+        if ((sock->user_flags & EPOLLET) != 0) {
+            sock->observed_events = observed;
+        }
+        if (node != NULL) ep_ready_node_free(port, node);
+        return 0;
+    }
+    if (node == NULL) {
+        node = ep_fault_hit(EP_FAULT_READY_NODE_ALLOC) == 0
+            ? ep_ready_node_alloc(port) : NULL;
+        if (node == NULL) {
+            if (ep_last_err() == 0) ep_set_errno(ENOMEM);
+            return -1;
+        }
+    }
+
+    if ((sock->user_flags & EPOLLET) != 0) {
+        sock->observed_events = observed;
+    } else {
+        sock->observed_events = 0;
+    }
+    if ((sock->user_flags & EPOLLEXCLUSIVE) != 0 &&
+        !ep_exclusive_try_claim(sock, &delivered)) {
+        ep_ready_node_free(port, node);
+        sock->et_holdoff = 1;
+        ep_sock_set_needs_rearm_locked(sock, 1);
+        return 0;
+    }
+
+    if (already_ready) {
+        sock->generation = ++port->next_sock_generation;
+        if (port->next_sock_generation == 0) {
+            port->next_sock_generation = 1;
+            sock->generation = 1;
+        }
+    }
+    ep_sock_set_needs_rearm_locked(sock, 0);
+    if ((sock->user_flags & EPOLLONESHOT) != 0) {
+        ep_sock_set_oneshot_fired_locked(sock, 1);
+    }
+    if (ep_sock_explicit_rearm_enabled(sock)) {
+        sock->explicit_disarmed_classes |=
+            ep_explicit_delivery_classes(delivered);
+    }
+
+    node->data = sock->user_data;
+    node->user_ctx = sock->user_ctx;
+    node->fd = sock->fd;
+    node->sock_generation = sock->generation;
+    node->events = delivered;
+    node->flags = 0;
+    if ((sock->user_flags & EPOLLET) != 0) {
+        node->flags |= WEPOLL_FLAG_ET_DELIVERED | WEPOLL_FLAG_EDGE_ARMED;
+    }
+    if ((sock->user_flags & EPOLLONESHOT) != 0) {
+        node->flags |= WEPOLL_FLAG_ONESHOT_FIRED;
+    }
+    node->timestamp = ep_now_ns();
+
+    sock->pending_events = delivered;
+    sock->et_holdoff = 0;
+    atomic_store_explicit(&sock->ready_queued, 1, memory_order_relaxed);
+    atomic_store_explicit(&sock->state, EP_SOCK_READY,
+                          memory_order_relaxed);
+    ep_ready_push(&port->ready_queue, node);
+    return 1;
+}
+
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 static int ep_socket_identity_is_stable(SOCKET fd)
 {
@@ -3220,6 +3378,16 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated,
     /* A deferred edge-triggered re-arm is eligible again once a wait is
      * preparing submissions. */
     sock->et_holdoff = 0;
+    if (sock->local_shutdown != 0) {
+        int local_result = ep_sock_queue_local_shutdown_locked(sock, NULL);
+
+        if (local_result < 0) {
+            return -1;
+        }
+        if (local_result > 0) {
+            return 0;
+        }
+    }
     uint32_t afd_events = ep_sock_afd_events_locked(sock, sock->user_events);
     if (afd_events == 0) {
         /* Explicit terminal delivery can intentionally disarm every native
@@ -3832,6 +4000,17 @@ process_socket_snapshot:
         }
         if (sample_all && inactive_classes != 0) {
             ep_exclusive_release_inactive(sock, inactive_classes);
+        }
+    }
+    if (sock->kind == EP_REG_SOCKET && sock->local_shutdown != 0) {
+        /* Winsock does not expose local receive shutdown through AFD,
+         * WSAPoll, or select.  Merge helper-published state only after the
+         * native ET qualification above so it cannot be cleared as an
+         * apparently inactive Windows read level. */
+        ep_sock_merge_local_shutdown_locked(sock, &delivered);
+        if (ep_sock_explicit_rearm_enabled(sock)) {
+            ep_readiness_filter_classes(
+                &delivered, sock->explicit_disarmed_classes);
         }
     }
     delivered &= sock->user_events | EPOLLERR | EPOLLHUP;
@@ -4755,6 +4934,8 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
     uint32_t old_waitable_notification_owned;
     int pending_poll_covers_request = 0;
     int new_waitable_dormant = 0;
+    int wake_ready_waiter = 0;
+    DWORD post_error = ERROR_SUCCESS;
 
     pthread_mutex_lock(&port->fd_table_lock);
     ep_sock_t *sock = ep_fd_table_lookup(port, fd);
@@ -4814,6 +4995,14 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
              * required for consumptive waits: a successful callback may have
              * consumed a signal/count and posted its completion already. */
             pending_poll_covers_request = 1;
+        } else if (sock->local_shutdown != 0) {
+            /* MOD is a fresh readiness scan.  AFD cannot observe a local
+             * receive shutdown, so retire the older request and publish the
+             * helper-recorded level against the new mask/data generation. */
+            if (ep_sock_cancel_locked(sock) != 0) {
+                pthread_mutex_unlock(&port->fd_table_lock);
+                return -1;
+            }
         } else if ((new_afd_events & ~sock->submitted_afd_events) == 0) {
             /* The in-flight request already covers this mask.  Keep it alive
              * and let completion snapshot the latest data/context/generation.
@@ -4990,9 +5179,19 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
             ep_restore_last_error_info(&saved_error);
             return -1;
         }
+        wake_ready_waiter = sock->local_shutdown != 0 &&
+            atomic_load_explicit(&sock->ready_queued,
+                                 memory_order_relaxed) != 0;
     }
     atomic_fetch_add_explicit(&port->generation, 1, memory_order_relaxed);
     pthread_mutex_unlock(&port->fd_table_lock);
+    if (wake_ready_waiter &&
+        !ep_port_post_iocp(port, 0, NULL, EP_FAULT_IOCP_POST,
+                           &post_error)) {
+        ep_port_fail_iocp_post(port, post_error);
+        ep_set_win32_error(post_error);
+        return -1;
+    }
     return 0;
 }
 
@@ -5042,8 +5241,170 @@ int ep_port_unregister(ep_port_t *port, SOCKET fd)
     return 0;
 }
 
+int ep_port_shutdown_socket(ep_port_t *port, SOCKET fd, int how)
+{
+    ep_ready_node_t *reserved_node = NULL;
+    ep_sock_t *sock;
+    uint8_t requested_shutdown;
+    uint8_t proposed_shutdown;
+    uint32_t poll_status;
+    DWORD post_error = ERROR_SUCCESS;
+    int queue_result = 0;
+    int publication_required = 0;
+    int state_changed = 0;
+    int wake_ready_waiter = 0;
+
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = ep_fd_table_lookup(port, fd);
+    if (sock == NULL) {
+        ep_target_info_t target;
+
+        if (ep_target_probe(fd, &target) != 0) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            return -1;
+        }
+        if (target.kind != EP_TARGET_SOCKET) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            ep_set_errno(target.kind == EP_TARGET_INVALID ? EBADF : ENOTSOCK);
+            return -1;
+        }
+        if (ep_local_shutdown_mask(how, &requested_shutdown) != 0) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            return -1;
+        }
+        if (shutdown(fd, how) == SOCKET_ERROR) {
+            DWORD error = (DWORD)WSAGetLastError();
+
+            pthread_mutex_unlock(&port->fd_table_lock);
+            ep_set_winsock_error(error);
+            return -1;
+        }
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return 0;
+    }
+    if (ep_sock_validate_control_locked(port, sock) != 0) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return -1;
+    }
+    if (sock->kind != EP_REG_SOCKET) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        ep_set_errno(ENOTSOCK);
+        return -1;
+    }
+    if (ep_local_shutdown_mask(how, &requested_shutdown) != 0) {
+        pthread_mutex_unlock(&port->fd_table_lock);
+        return -1;
+    }
+
+    proposed_shutdown = sock->local_shutdown | requested_shutdown;
+    state_changed = sock->socket_protocol == EP_SOCKET_PROTOCOL_TCP &&
+        proposed_shutdown != sock->local_shutdown;
+    publication_required = sock->socket_protocol == EP_SOCKET_PROTOCOL_TCP &&
+        (state_changed || sock->needs_rearm);
+    poll_status = atomic_load_explicit(&sock->poll_status,
+                                       memory_order_relaxed);
+    if (publication_required &&
+        (poll_status == EP_POLL_IDLE ||
+         atomic_load_explicit(&sock->ready_queued,
+                              memory_order_relaxed)) &&
+        (atomic_load_explicit(&sock->ready_queued,
+                              memory_order_relaxed) ||
+         !sock->oneshot_fired)) {
+        reserved_node = ep_fault_hit(EP_FAULT_READY_NODE_ALLOC) == 0
+            ? ep_ready_node_alloc(port) : NULL;
+        if (reserved_node == NULL) {
+            pthread_mutex_unlock(&port->fd_table_lock);
+            if (ep_last_err() == 0) ep_set_errno(ENOMEM);
+            return -1;
+        }
+    }
+
+    /* A recorded bit proves that the corresponding native shutdown already
+     * succeeded through this helper.  A retry after a publication/cancel
+     * failure therefore retries only library observation instead of issuing
+     * an unnecessary second Winsock shutdown. */
+    if ((sock->socket_protocol != EP_SOCKET_PROTOCOL_TCP || state_changed) &&
+        shutdown(fd, how) == SOCKET_ERROR) {
+        DWORD error = (DWORD)WSAGetLastError();
+
+        if (reserved_node != NULL) {
+            ep_ready_node_free(port, reserved_node);
+        }
+        pthread_mutex_unlock(&port->fd_table_lock);
+        ep_set_winsock_error(error);
+        return -1;
+    }
+
+    if (sock->socket_protocol == EP_SOCKET_PROTOCOL_TCP && state_changed) {
+        sock->local_shutdown = proposed_shutdown;
+    }
+    if (publication_required) {
+        poll_status = atomic_load_explicit(&sock->poll_status,
+                                           memory_order_relaxed);
+        if (poll_status == EP_POLL_PENDING) {
+            ep_sock_set_needs_rearm_locked(sock, 1);
+            if (ep_sock_cancel_locked(sock) != 0) {
+                wepoll_ex_error_info saved_error;
+
+                ep_get_last_error_info(&saved_error);
+                if (reserved_node != NULL) {
+                    ep_ready_node_free(port, reserved_node);
+                }
+                atomic_fetch_add_explicit(&port->generation, 1,
+                                          memory_order_relaxed);
+                pthread_mutex_unlock(&port->fd_table_lock);
+                ep_restore_last_error_info(&saved_error);
+                return -1;
+            }
+            poll_status = atomic_load_explicit(&sock->poll_status,
+                                               memory_order_relaxed);
+        }
+        if (poll_status == EP_POLL_IDLE ||
+            atomic_load_explicit(&sock->ready_queued,
+                                 memory_order_relaxed)) {
+            queue_result = ep_sock_queue_local_shutdown_locked(
+                sock, reserved_node);
+            reserved_node = NULL;
+            if (queue_result < 0) {
+                wepoll_ex_error_info saved_error;
+
+                ep_get_last_error_info(&saved_error);
+                ep_sock_set_needs_rearm_locked(sock, 1);
+                atomic_fetch_add_explicit(&port->generation, 1,
+                                          memory_order_relaxed);
+                pthread_mutex_unlock(&port->fd_table_lock);
+                ep_restore_last_error_info(&saved_error);
+                return -1;
+            }
+            wake_ready_waiter = queue_result > 0 &&
+                atomic_load_explicit(&port->waiter_active,
+                                     memory_order_acquire) &&
+                !atomic_load_explicit(&port->waiter_coalescing,
+                                      memory_order_acquire);
+        }
+    }
+    if (reserved_node != NULL) {
+        ep_ready_node_free(port, reserved_node);
+    }
+    if (state_changed) {
+        atomic_fetch_add_explicit(&port->generation, 1,
+                                  memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&port->fd_table_lock);
+
+    if (wake_ready_waiter &&
+        !ep_port_post_iocp(port, 0, NULL, EP_FAULT_IOCP_POST,
+                           &post_error)) {
+        ep_port_fail_iocp_post(port, post_error);
+        ep_set_win32_error(post_error);
+        return -1;
+    }
+    return 0;
+}
+
 static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
-                                        uint8_t classes)
+                                        uint8_t classes,
+                                        int *wake_ready_waiter_out)
 {
     uint8_t old_disarmed = sock->explicit_disarmed_classes;
     uint8_t new_disarmed = old_disarmed & (uint8_t)~classes;
@@ -5061,6 +5422,8 @@ static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
     uint32_t poll_status;
     int rearm_oneshot;
     int pending_poll_covers_request = 0;
+
+    *wake_ready_waiter_out = 0;
 
     if (atomic_load_explicit(&sock->ready_queued,
                              memory_order_relaxed) != 0) {
@@ -5112,6 +5475,15 @@ static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
                     old_udp_readless_receive_parked;
                 return -1;
             }
+        } else if (sock->local_shutdown != 0) {
+            /* A rearmed synthetic class is already true, but AFD cannot
+             * complete for it.  Retire the older request so submission below
+             * can publish the current local-shutdown level. */
+            if (ep_sock_cancel_locked(sock) != 0) {
+                sock->udp_readless_receive_parked =
+                    old_udp_readless_receive_parked;
+                return -1;
+            }
         } else if ((new_afd_events & ~sock->submitted_afd_events) == 0) {
             pending_poll_covers_request = 1;
         } else if (ep_sock_cancel_locked(sock) != 0) {
@@ -5138,12 +5510,13 @@ static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
     }
     sock->et_holdoff = 0;
     if (!pending_poll_covers_request) {
-        ep_sock_set_needs_rearm_locked(sock, new_afd_events != 0);
+        ep_sock_set_needs_rearm_locked(
+            sock, new_afd_events != 0 || sock->local_shutdown != 0);
     }
 
     if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==
             EP_POLL_IDLE &&
-        new_afd_events != 0 &&
+        (new_afd_events != 0 || sock->local_shutdown != 0) &&
         atomic_load_explicit(&port->waiter_active, memory_order_acquire) &&
         !atomic_load_explicit(&port->waiter_coalescing,
                               memory_order_acquire)) {
@@ -5174,6 +5547,9 @@ static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
             ep_restore_last_error_info(&saved_error);
             return -1;
         }
+        *wake_ready_waiter_out = sock->local_shutdown != 0 &&
+            atomic_load_explicit(&sock->ready_queued,
+                                 memory_order_relaxed) != 0;
     }
 
     atomic_fetch_add_explicit(&port->generation, 1, memory_order_relaxed);
@@ -5182,7 +5558,9 @@ static int ep_sock_rearm_classes_locked(ep_port_t *port, ep_sock_t *sock,
 
 int ep_port_rearm_classes(ep_port_t *port, SOCKET fd, uint32_t classes)
 {
+    DWORD post_error = ERROR_SUCCESS;
     int result;
+    int wake_ready_waiter = 0;
 
     if (classes == 0 || (classes & ~WEPOLL_EX_REARM_ALL) != 0) {
         ep_set_errno(EINVAL);
@@ -5206,8 +5584,16 @@ int ep_port_rearm_classes(ep_port_t *port, SOCKET fd, uint32_t classes)
         return -1;
     }
 
-    result = ep_sock_rearm_classes_locked(port, sock, (uint8_t)classes);
+    result = ep_sock_rearm_classes_locked(
+        port, sock, (uint8_t)classes, &wake_ready_waiter);
     pthread_mutex_unlock(&port->fd_table_lock);
+    if (result == 0 && wake_ready_waiter &&
+        !ep_port_post_iocp(port, 0, NULL, EP_FAULT_IOCP_POST,
+                           &post_error)) {
+        ep_port_fail_iocp_post(port, post_error);
+        ep_set_win32_error(post_error);
+        return -1;
+    }
     return result;
 }
 
@@ -5229,6 +5615,8 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     uint8_t old_et_holdoff;
     uint8_t old_udp_readless_receive_parked;
     uint32_t old_waitable_notification_owned;
+    DWORD post_error = ERROR_SUCCESS;
+    int wake_ready_waiter = 0;
 
     pthread_mutex_lock(&port->fd_table_lock);
     ep_sock_t *sock = ep_fd_table_lookup(port, fd);
@@ -5244,9 +5632,17 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
     }
     if (ep_sock_explicit_rearm_enabled(sock)) {
         int result = ep_sock_rearm_classes_locked(
-            port, sock, (uint8_t)WEPOLL_EX_REARM_ALL);
+            port, sock, (uint8_t)WEPOLL_EX_REARM_ALL,
+            &wake_ready_waiter);
 
         pthread_mutex_unlock(&port->fd_table_lock);
+        if (result == 0 && wake_ready_waiter &&
+            !ep_port_post_iocp(port, 0, NULL, EP_FAULT_IOCP_POST,
+                               &post_error)) {
+            ep_port_fail_iocp_post(port, post_error);
+            ep_set_win32_error(post_error);
+            return -1;
+        }
         return result;
     }
     if (!sock->oneshot_fired) {
@@ -5300,6 +5696,9 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
         !atomic_load_explicit(&port->waiter_coalescing,
                               memory_order_acquire)) {
         result = EP_SOCK_SUBMIT_LOCKED(sock, 1);
+        wake_ready_waiter = result == 0 && sock->local_shutdown != 0 &&
+            atomic_load_explicit(&sock->ready_queued,
+                                 memory_order_relaxed) != 0;
     }
     if (result > 0) {
         wepoll_ex_error_info saved_error;
@@ -5338,6 +5737,13 @@ int ep_port_rearm(ep_port_t *port, SOCKET fd)
                                   memory_order_relaxed);
     }
     pthread_mutex_unlock(&port->fd_table_lock);
+    if (result == 0 && wake_ready_waiter &&
+        !ep_port_post_iocp(port, 0, NULL, EP_FAULT_IOCP_POST,
+                           &post_error)) {
+        ep_port_fail_iocp_post(port, post_error);
+        ep_set_win32_error(post_error);
+        return -1;
+    }
     return result;
 }
 

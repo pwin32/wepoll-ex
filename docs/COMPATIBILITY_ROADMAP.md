@@ -74,11 +74,11 @@ socket or eventfd side channel.
 ### Exact-source audit follow-ups
 
 The nginx 1.31.3, libuv 1.52.1, Mio 1.2.2, and Boost.Asio 1.38.2 reference
-archives were compared in `docs/UPSTREAM_EVENT_LOOP_AUDIT.md`. Four direct
-porting gaps identified there are now implemented: opt-in `<sys/epoll.h>`
-packaging, virtual epfd aliases with final-close semantics, a one-port
-DEL-before-close helper, and a documented native error-info channel. The
-remaining cross-loop candidates are intentionally conditional:
+archives were compared in `docs/UPSTREAM_EVENT_LOOP_AUDIT.md`. Direct porting
+gaps implemented from that audit now include opt-in `<sys/epoll.h>` packaging,
+virtual epfd aliases with final-close semantics, one-port close and shutdown
+helpers, explicit rearm with ONESHOT, and a documented native error-info
+channel. The remaining cross-loop candidates are intentionally conditional:
 
 - a supplemental/double-buffered AFD request, inspired by libuv, may reduce
   cancel/refresh work during interest expansion, but should follow measured
@@ -96,6 +96,23 @@ closes the socket, accepting an already absent registration after validating
 the target. It neither retains a duplicate nor changes peer-FIN behavior. A
 socket registered in multiple ports still has to be removed from the other
 ports before the helper is used for final close.
+
+### Local shutdown publication
+
+`wepoll_ex_shutdown_socket()` owns the Windows shutdown call when a port needs
+Linux-like local EOF readiness. A registered TCP receive shutdown publishes
+requested readable aliases plus `EPOLLRDHUP`; full local shutdown also
+publishes `EPOLLHUP`. LT, observed ET, ONESHOT, explicit rearm, queued MOD
+replacement, and blocked-wait wakeup share the normal ready-state rules.
+Pending AFD work is cancelled/refreshed rather than requiring a full table
+scan. Recorded state makes a retry after a nonfatal cancellation/publication
+failure idempotent with respect to native shutdown.
+
+The helper is intentionally one-port and does not change Winsock `recv()`
+semantics. Direct `shutdown()` calls, another independently created epfd, and
+code that expects zero-byte Linux EOF remain explicit porting boundaries. Its
+record is registration-local: DEL/re-ADD starts a fresh registration without
+reconstructing prior local shutdown state.
 
 ### Windows error channel
 
@@ -136,9 +153,9 @@ optional future facility, not an implied property of the existing flag.
 native versus observed edge delivery, process-local exclusive arbitration,
 wait-wake support, signal-mask application, and native versus virtual epoll
 descriptors. It also advertises the close helper, explicit ONESHOT rearm,
-virtual epfd alias, and error-info contracts. Deployment qualification should
-additionally record Windows and compiler versions, socket-lifetime policy,
-provider behavior, and probe counters.
+virtual epfd alias, shutdown helper, and error-info contracts. Deployment
+qualification should additionally record Windows and compiler versions,
+socket-lifetime policy, provider behavior, and probe counters.
 
 ### Toolchain and provider matrix
 
@@ -150,9 +167,9 @@ reported cleanly rather than being treated as a portable guarantee.
 
 ## Priority 2: opt-in platform bridges
 
-- A close-aware `shutdown()` wrapper could publish Linux-like local
-  receive/full-shutdown state when every caller uses it. Arbitrary direct
-  Winsock calls remain outside the library's observation.
+- The close-aware shutdown wrapper is implemented. Arbitrary direct Winsock
+  calls and registrations in other independent ports remain outside the
+  library's observation.
 - `SO_OOBINLINE`, inert band bits, `EPOLLMSG`, signal interruption,
   `EPOLLWAKEUP`, nested epoll descriptors, and Linux file AIO should remain
   explicit limitations unless a demonstrated workload requires a separate

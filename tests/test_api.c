@@ -608,7 +608,8 @@ static void test_extension_api(void)
         WEPOLL_EX_CAP_ATOMIC_SIGNAL_MASK_WAIT |
         WEPOLL_EX_CAP_NATIVE_EPOLL_DESCRIPTOR |
         WEPOLL_EX_CAP_CLOSE_SOCKET_HELPER |
-        WEPOLL_EX_CAP_ERROR_INFO;
+        WEPOLL_EX_CAP_ERROR_INFO |
+        WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER;
     wepoll_ex_capabilities capabilities;
     uint32_t capabilities_prefix[2] = { 0, 0 };
     static const char version_prefix[] =
@@ -729,6 +730,70 @@ static void test_extension_api(void)
         FAIL("POSIX close helper epfd teardown");
         return;
     }
+    PASS();
+
+    TEST("shutdown helper preserves native POSIX edge semantics");
+    int shutdown_epfd = epoll_create1(EPOLL_CLOEXEC);
+    int shutdown_pair[2] = { -1, -1 };
+    struct epoll_event shutdown_event;
+    struct epoll_event shutdown_output;
+    char shutdown_byte = 0;
+    memset(&shutdown_event, 0, sizeof(shutdown_event));
+    shutdown_event.events =
+        EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+    errno = 0;
+    if (shutdown_epfd < 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, shutdown_pair) != 0 ||
+        wepoll_ex_shutdown_socket(-1, shutdown_pair[0], SHUT_RD) != -1 ||
+        errno != EBADF || write(shutdown_pair[1], "s", 1) != 1 ||
+        read(shutdown_pair[0], &shutdown_byte, 1) != 1 ||
+        shutdown_byte != 's' ||
+        epoll_ctl(shutdown_epfd, EPOLL_CTL_ADD, shutdown_pair[0],
+                  &shutdown_event) != 0 ||
+        epoll_wait(shutdown_epfd, &shutdown_output, 1, 1000) != 1 ||
+        shutdown_output.events != EPOLLOUT) {
+        FAIL("POSIX shutdown helper setup");
+        if (shutdown_pair[0] >= 0) (void)close(shutdown_pair[0]);
+        if (shutdown_pair[1] >= 0) (void)close(shutdown_pair[1]);
+        if (shutdown_epfd >= 0) (void)wepoll_close(shutdown_epfd);
+        return;
+    }
+    if (wepoll_ex_shutdown_socket(shutdown_epfd, shutdown_pair[0],
+                                  SHUT_RD) != 0) {
+        FAIL("POSIX shutdown helper native call");
+        if (shutdown_pair[0] >= 0) (void)close(shutdown_pair[0]);
+        if (shutdown_pair[1] >= 0) (void)close(shutdown_pair[1]);
+        if (shutdown_epfd >= 0) (void)wepoll_close(shutdown_epfd);
+        return;
+    }
+    memset(&shutdown_output, 0, sizeof(shutdown_output));
+    int shutdown_count = epoll_wait(
+        shutdown_epfd, &shutdown_output, 1, 1000);
+    if (shutdown_count != 1 ||
+        shutdown_output.events != (EPOLLIN | EPOLLRDHUP)) {
+        fprintf(stderr,
+                "POSIX shutdown event count=%d events=0x%08x expected=0x%08x\n",
+                shutdown_count, shutdown_output.events,
+                EPOLLIN | EPOLLRDHUP);
+        FAIL("POSIX shutdown helper readiness");
+        if (shutdown_pair[0] >= 0) (void)close(shutdown_pair[0]);
+        if (shutdown_pair[1] >= 0) (void)close(shutdown_pair[1]);
+        if (shutdown_epfd >= 0) (void)wepoll_close(shutdown_epfd);
+        return;
+    }
+    if (epoll_wait(shutdown_epfd, &shutdown_output, 1, 0) != 0 ||
+        read(shutdown_pair[0], &shutdown_byte, 1) != 0 ||
+        epoll_ctl(shutdown_epfd, EPOLL_CTL_DEL, shutdown_pair[0], NULL) != 0 ||
+        wepoll_close(shutdown_epfd) != 0) {
+        FAIL("POSIX shutdown helper drain/cleanup");
+        if (shutdown_pair[0] >= 0) (void)close(shutdown_pair[0]);
+        if (shutdown_pair[1] >= 0) (void)close(shutdown_pair[1]);
+        if (shutdown_epfd >= 0) (void)wepoll_close(shutdown_epfd);
+        return;
+    }
+    shutdown_epfd = -1;
+    (void)close(shutdown_pair[0]);
+    (void)close(shutdown_pair[1]);
     PASS();
 
     TEST("versioned operational statistics report the POSIX contract");

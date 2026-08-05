@@ -206,6 +206,12 @@ the nginx-embedded source build independent of a generated CMake header.
    to one port, accepting ENOENT only after target validation, and calls
    `closesocket()` afterward. Other DEL failures leave the socket open. It does
    not remove registrations from other ports or retain a socket duplicate.
+   `wepoll_ex_shutdown_socket()` similarly validates one port before applying
+   native shutdown. Unregistered and non-TCP sockets are native passthroughs.
+   A registered TCP socket retains local read/write shutdown bits in its
+   `ep_sock_t`; that state is shared by virtual aliases of the port but not by
+   independent ports containing the same socket, and DEL discards it with the
+   registration.
 6. Closing a non-final virtual alias unlinks and frees only that integer table
    entry; it does not mark the shared port closing or wake its waits. Closing
    the final alias marks the shared record closing, wakes waiters, and removes
@@ -441,14 +447,29 @@ temporary fallback signal mask before unwinding.
   LT/ET rearm can observe the later terminal class, while ONESHOT needs the
   normal MOD rearm after a partial first-class delivery.
 - Local Winsock receive shutdown is not an AFD readiness transition.
-  `shutdown(SD_RECEIVE)` and `shutdown(SD_BOTH)` leave AFD, zero-time
-  `WSAPoll`, and zero-time `select` without a readable indication, including
-  after a fresh MOD submission. Consequently the adapter cannot reproduce
-  Linux's immediate local `EPOLLIN | EPOLLRDHUP` state, or the additional
-  `EPOLLHUP` for full local shutdown, without intercepting `shutdown()` or
-  replacing queued-event scaling with whole-registration scans. A wait whose
-  only relevant interests are read/RDHUP may remain blocked until another
-  observable event. Peer FIN/reset readiness retains the exact behavior above.
+  `wepoll_ex_shutdown_socket()` is the explicit interception point. For a
+  registered TCP socket, successful `SD_RECEIVE` records a READ bit and merges
+  requested `EPOLLIN`/`EPOLLRDNORM` plus `EPOLLRDHUP`; once READ and WRITE are
+  both recorded it also adds unrequested `EPOLLHUP`. `SD_SEND` alone records
+  ownership but adds no synthetic readiness. Current ordinary TCP levels are
+  sampled first so writable or reset state can share the snapshot.
+
+  A direct idle publication reserves its ready node before the irreversible
+  first Winsock shutdown. Pending AFD work is cancelled and its completion
+  resubmits against the recorded state; losing cancellation is handled by the
+  already-queued completion. A cancellation fault after native success leaves
+  `needs_rearm` and the shutdown bits intact. A same-direction helper retry
+  skips the already-completed native call and retries publication. Direct
+  queueing replaces a queued generation when it adds bits, composes with the
+  ET observed latch, ONESHOT, explicit disarms, and exclusive claims, and posts
+  an internal IOCP wake only when a waiter is actually blocked. MOD and
+  explicit rearm force a fresh local-state scan and preserve that wakeup rule.
+
+  This mechanism does not alter Winsock I/O: `recv()` after `SD_RECEIVE`
+  returns `SOCKET_ERROR`/`WSAESHUTDOWN`, not Linux's zero-byte EOF. Direct
+  `shutdown()` calls and registrations in another independent port are still
+  unobserved. DEL/re-ADD starts with no prior local-shutdown record. Peer
+  FIN/reset readiness retains the exact behavior above.
 - TCP urgent-data readiness is qualified for LT persistence until
   `recv(MSG_OOB)`, observed ET suppression and re-edge, ONESHOT MOD rearm, and
   MOD filtering/data replacement. Exact-event regressions verify that urgent
@@ -640,14 +661,14 @@ temporary fallback signal mask before unwinding.
 ## Verification baseline
 
 On August 5, 2026, Windows 10.0.19044 with MSYS2 MinGW GCC 16.1 and
-`-O2 -Wall -Wextra -Wpedantic -Werror` completed 193 combined best-effort, 191
-static-only, 109 shared-only, 193 strict-identity, 109 strict shared-only, 193
-synchronized-lifetime, and 109 synchronized shared-only CTest entries. Their
-passed/skipped counts were 192/1, 190/1, 108/1, 192/1, 108/1, 188/5, and 104/5.
+`-O2 -Wall -Wextra -Wpedantic -Werror` completed 201 combined best-effort, 199
+static-only, 115 shared-only, 201 strict-identity, 115 strict shared-only, 201
+synchronized-lifetime, and 115 synchronized shared-only CTest entries. Their
+passed/skipped counts were 200/1, 198/1, 114/1, 200/1, 114/1, 196/5, and 110/5.
 All seven variants skipped the environment-dependent UDP/ICMP case;
 synchronized modes additionally skipped the four native-reuse identity cases
-owned by their DEL-before-close contract. Three repeats of 103 focused tests in
-each internal-capable build and 62 focused tests in each shared-only build
+owned by their DEL-before-close contract. Three repeats of 111 focused tests in
+each internal-capable build and 68 focused tests in each shared-only build
 passed. The shared builds also passed exact public-export checks.
 
 The same worktree passed Linux/WSL GCC 14.2 strict Release CTest 5/5 in both
@@ -662,7 +683,9 @@ duplicate descriptors for one endpoint, and concurrent ready ADD wakeup from
 an empty interest list; cancellation-losing same-wait MOD expansion refresh;
 mixed normal/urgent LT convergence and persistence; live unread-data TCP FIN
 and reset state, same-wait RDHUP/ERR/HUP merging, and preserved
-`WSAECONNRESET`; direction-aware pipe adapters; waitable terminal ET and
+`WSAECONNRESET`; local-shutdown LT/ET/ONESHOT/explicit-rearm publication,
+blocked-wait MOD/rearm wakeups, and allocation/cancellation retry faults;
+direction-aware pipe adapters; waitable terminal ET and
 pending/queued MOD races; consumptive notification counts; auxiliary-disarm
 fault recovery and preserved consumptive retries; immediate auxiliary
 cancellation reclamation; IOCP post/close lease races and fatal-post wakeups;

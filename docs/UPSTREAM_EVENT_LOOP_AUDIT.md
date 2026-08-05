@@ -23,7 +23,7 @@ Windows IOCP/AFD implementations that are more integrated than an epoll shim.
 
 | Source | Native pattern | Useful wepoll-ex mapping | Remaining boundary |
 | --- | --- | --- | --- |
-| nginx 1.31.3 | Duplex socket ET, eventfd notify/AIO, pointer plus instance bit | Explicit readiness-class rearm; tagged wake for control notify; close helper | Handler-completion rearm, file AIO, multi-process exclusive behavior |
+| nginx 1.31.3 | Duplex socket ET, eventfd notify/AIO, pointer plus instance bit | Explicit readiness-class rearm; tagged wake for control notify; close/shutdown helpers | Handler-completion rearm, file AIO, multi-process exclusive behavior |
 | libuv 1.52.1 | Linux LT epoll with queued changes; native Windows IOCP/AFD | Tagged wake for an epoll-shaped experiment; existing LT semantics | Replacing libuv's Windows backend would lose native completion integration |
 | Mio 1.2.2 | Unix ET plus eventfd; Windows AFD disarm/rearm plus tagged IOCP wake | Explicit class rearm closely matches `WouldBlock` ownership; tagged wake matches its Waker; virtual aliases match selector cloning | Named-pipe IOCP is separate; the alias is not a native descriptor |
 | Boost.Asio 1.38.2 | Socket ET, dynamic write MOD, persistent eventfd interrupter | Observed ET works; explicit rearm can avoid writable resampling; tagged wake replaces the interrupter side channel | Handler changes, timer/file completion integration |
@@ -43,6 +43,14 @@ file AIO or deliver `io_getevents()` results. The native module also skips
 `EPOLL_CTL_DEL` on close paths that rely on Linux automatic removal; a Windows
 port using synchronized lifetime or explicit rearm must DEL before
 `closesocket()`.
+
+nginx already routes platform shutdown through the `ngx_shutdown_socket`
+macro (`shutdown` in the reference tree). A Windows epoll port can redefine
+that ownership point to call `wepoll_ex_shutdown_socket()` with its active
+epfd, allowing local read/full shutdown to publish the Linux readiness shape.
+This remains a semantic adapter change: direct third-party Winsock calls and a
+socket registered in another independent port are not covered, and Winsock
+`recv()` still reports `WSAESHUTDOWN` instead of zero-byte EOF.
 
 The reusable structure is the connection registration and stale-instance
 dispatch. The non-portable parts are ET ownership, eventfd/file-AIO setup,
@@ -132,6 +140,9 @@ The following library work is implemented and regression-tested:
    Win32/Winsock/NTSTATUS sources, and canonical Winsock equivalents.
 9. The opt-in `wepoll_ex::epoll_compat` package target exposes an isolated
    Windows `<sys/epoll.h>` include path for source-oriented builds.
+10. `wepoll_ex_shutdown_socket()` publishes one-port local TCP shutdown
+    readiness, composes with ET/ONESHOT/explicit rearm, and retains retryable
+    state when cancellation fails after native shutdown.
 
 ## Remaining candidates
 

@@ -56,22 +56,37 @@ one-shot disabled and the final class starts its next generation, with injected
 submission-failure coverage for exact state/worklist rollback.
 `wepoll_ex_get_last_error_info()` adds a per-thread versioned channel that
 distinguishes portable errno, exact Win32/Winsock/NTSTATUS sources, and marked
-canonical Winsock equivalents. New capability bits advertise all four runtime
+canonical Winsock equivalents. New capability bits advertise the runtime
 contracts. POSIX supplies the close helper and portable error record, directs
 callers to native `dup()` instead of the virtual-alias extension, and does not
 install the Windows compatibility header target. The remaining non-drop-in
 descriptor and completion boundaries are documented in
 `docs/WINDOWS_PORTING.md`.
 
+The August 5 follow-up adds `wepoll_ex_shutdown_socket()` and
+`WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER`. Native Winsock receive shutdown has no
+AFD/`WSAPoll`/`select` read transition, so the helper records successful local
+TCP shutdown for one port and publishes Linux-like requested readable aliases
+plus `EPOLLRDHUP`; full local shutdown also publishes `EPOLLHUP`. The synthetic
+level composes with LT, observed ET, ONESHOT, explicit rearm, current ordinary
+readiness, MOD replacement, and blocked-wait wakeup. Direct queueing reserves
+allocation before the first irreversible shutdown. If pending-request
+cancellation fails afterward, the recorded state and rearm work survive; a
+same-direction retry resumes publication without repeating the native call.
+Direct `shutdown()` and independent epoll ports remain unobserved, and Winsock
+`recv()` after `SD_RECEIVE` still returns `WSAESHUTDOWN` rather than Linux EOF.
+DEL/re-ADD starts a fresh registration without the earlier recorded state.
+POSIX validates the epfd and delegates to native `shutdown()`.
+
 Qualification for this slice used Windows 10.0.19044.1826 with MSYS2 MinGW
 GCC 16.1.0 and Release `-O2 -Wall -Wextra -Wpedantic -Werror` builds. The
 combined, static-only, shared-only, strict combined, strict shared,
-synchronized combined, and synchronized shared lanes contained 193, 191, 109,
-193, 109, 193, and 109 CTest entries. Their passed/skipped counts were 192/1,
-190/1, 108/1, 192/1, 108/1, 188/5, and 104/5; the skips are the documented
+synchronized combined, and synchronized shared lanes contained 201, 199, 115,
+201, 115, 201, and 115 CTest entries. Their passed/skipped counts were 200/1,
+198/1, 114/1, 200/1, 114/1, 196/5, and 110/5; the skips are the documented
 environment-dependent IPv4 UDP/ICMP case plus four synchronized-lifetime
-native-reuse identity cases. Focused repeats passed 103/103 in combined/static/
-strict/synchronized builds and 62/62 in shared-only builds. Linux/WSL GCC
+native-reuse identity cases. Focused repeats passed 111/111 in combined/static/
+strict/synchronized builds and 68/68 in shared-only builds. Linux/WSL GCC
 14.2.0 strict Release passed 5/5 for both native and forced-fallback
 `epoll_pwait2`, five repeats each of the API, large-wait, and pool lanes, and
 4/4 under ASan/UBSan.
@@ -791,10 +806,10 @@ synchronous/layered-provider and parked receive-head caveats described above,
 same-wait TCP terminal merging behind an earlier nonterminal AFD class remains
 conservative when a provider rejects `WSAPoll`,
 unknown provider protocol metadata retains a conservative abort
-mapping, local `shutdown(SD_RECEIVE)`/`shutdown(SD_BOTH)` cannot synthesize
-Linux's immediate read/RDHUP/HUP state because Winsock exposes no corresponding
-AFD, `WSAPoll`, or `select` transition, and pipe writable readiness can remain
-advisory when native quota information is unavailable. In particular, an
+mapping, direct local `shutdown(SD_RECEIVE)`/`shutdown(SD_BOTH)` bypasses the
+helper that publishes Linux-like read/RDHUP/HUP state, and pipe writable
+readiness can remain advisory when native quota information is unavailable. In
+particular, an
 overlapped or mode-unknown write-only handle is not zero-write-probed because
 it may belong to an application IOCP, so peer closure can remain
 indistinguishable on that narrow fallback.

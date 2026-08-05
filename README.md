@@ -64,14 +64,22 @@ behind unread data; `POLLERR | POLLHUP` merges unrequested
 `WSAECONNRESET`. Unknown protocols and providers that reject `WSAPoll` retain
 the original conservative AFD/select result.
 
-Winsock local receive shutdown is a platform boundary. `shutdown(SD_RECEIVE)`
-and `shutdown(SD_BOTH)` do not raise an AFD, `WSAPoll`, or `select` read event,
-so wepoll-ex cannot asynchronously reproduce Linux's immediate local
-`EPOLLIN | EPOLLRDHUP` state (or the additional `EPOLLHUP` after full local
-shutdown) without interposing `shutdown()` or scanning every registered
-socket. A read/RDHUP-only wait can therefore remain blocked after a local
-receive shutdown until some independently observable event occurs, and a MOD
-does not manufacture the missing state. Peer FIN/reset behavior is unaffected.
+Direct Winsock local receive shutdown remains a platform boundary:
+`shutdown(SD_RECEIVE)` and `shutdown(SD_BOTH)` do not raise an AFD, `WSAPoll`,
+or `select` read event. `wepoll_ex_shutdown_socket()` is the opt-in
+interposition point. For a TCP socket registered in the selected port it
+records successful local read/write shutdown, publishes requested
+`EPOLLIN`/`EPOLLRDNORM` plus `EPOLLRDHUP` after receive shutdown, and adds
+unrequested `EPOLLHUP` after both directions are shut down. LT persistence,
+observed ET suppression, ONESHOT, explicit class rearm, current ordinary
+readiness, MOD metadata replacement, and blocked-wait wakeup compose with the
+synthetic level. A pending AFD request is cancelled/refreshed; an idle or
+already-ready registration is queued directly. Direct `shutdown()` calls and
+registrations in another independent port remain unobserved. DEL discards the
+registration-local record, so re-ADD starts without the earlier synthetic
+shutdown state. Winsock data-call semantics also remain native: `recv()` after
+`SD_RECEIVE` fails with `WSAESHUTDOWN` rather than returning Linux EOF. Peer
+FIN/reset behavior is unaffected.
 
 Internal failures after a successful control call are latched for the wait
 path. Already-queued readiness is delivered before the deferred error; a later
@@ -130,8 +138,8 @@ The header [`include/wepoll_ex.h`](include/wepoll_ex.h) declares
 `epoll_ctl_batch`, `epoll_drain`, `epoll_rearm`, `epoll_rearm_classes`,
 `epoll_fd_count`, version helpers, capability/socket-lifetime/statistics
 queries, `wepoll_ex_get_last_error_info`, `wepoll_ex_wake`,
-`wepoll_ex_wake_event`, `wepoll_ex_dup`, `wepoll_ex_close_socket`, and
-`wepoll_close`.
+`wepoll_ex_wake_event`, `wepoll_ex_dup`, `wepoll_ex_close_socket`,
+`wepoll_ex_shutdown_socket`, and `wepoll_close`.
 `epoll_ctl_batch` applies operations in order and best-effort rolls back ADDs;
 it is not transactional.
 
@@ -212,8 +220,10 @@ registration may have no AFD request in flight, so the embedder must DEL before
 `closesocket()`. `wepoll_ex_close_socket()` provides that ordering for one
 specified epfd and treats an already absent registration as success after
 validating the target; it does not remove the socket from any other epoll
-instances. Stock nginx's Linux module still needs handler-completion rearm
-hooks, especially for posted events; this is not a symbol-only port.
+instances. `wepoll_ex_shutdown_socket()` similarly publishes local TCP
+shutdown readiness only in the specified underlying port (including its
+virtual aliases). Stock nginx's Linux module still needs handler-completion
+rearm hooks, especially for posted events; this is not a symbol-only port.
 
 Windows control calls classify the target before membership errors where Linux
 does: an invalid or closed target returns `EBADF`, a valid supported target
@@ -417,7 +427,8 @@ protocol metadata retains a conservative abort mapping, pipe writable
 readiness can remain advisory when native local information is unavailable,
 an overlapped or mode-unknown write-only pipe cannot be safely
 zero-write-probed, local receive/full shutdown has no asynchronous Winsock
-read/RDHUP transition,
+read/RDHUP transition when the application bypasses
+`wepoll_ex_shutdown_socket()`,
 exclusive-claim updates serialize through one process-wide mutex, and virtual
 epoll descriptors cannot be monitored or nested. Consequently, Windows cannot
 reproduce Linux's distinct self-registration and nested-epoll `EINVAL` cases;
@@ -449,6 +460,17 @@ Select the Windows policy at configure time with
 `wepoll_ex_close_socket()` can enforce DEL-then-close for one epfd without
 retaining a duplicate socket or changing peer-FIN behavior. A socket registered
 in multiple ports must still be removed from every other port first.
+`wepoll_ex_shutdown_socket()` validates the epfd before effect and passes
+through to native `shutdown()` for unregistered/non-TCP sockets. For a
+registered TCP socket it publishes local shutdown state only to that port.
+The state lasts for that registration; DEL/re-ADD does not reconstruct a
+shutdown that happened before the new ADD.
+When an immediate ready-node allocation is required for the first transition,
+the node is reserved before the irreversible Winsock call. A later
+cancellation/publication failure can return `-1` after native shutdown has
+already succeeded; the recorded state lets a retry on a still-usable port
+resume publication without issuing the same native shutdown again. A fatal
+IOCP post failure still fails the port.
 `wepoll_ex_get_stats()` and `wepoll_ex_get_global_stats()` copy versioned,
 size-prefixed operational snapshots. Windows exposes registration, queue,
 pool, stale-event, identity, asynchronous-error, drain-budget, quarantine,
@@ -469,7 +491,8 @@ the first pending tagged payload is retained when later requests coalesce.
 `WEPOLL_EX_CAP_TAGGED_WAKE_EVENT` advertises the tagged form. The POSIX wrapper
 reports both wake operations unsupported because its basic waits are direct
 libc calls. Additional capability bits advertise the close helper, explicit
-rearm plus ONESHOT, virtual epfd aliases, and the error-info channel.
+rearm plus ONESHOT, virtual epfd aliases, the shutdown helper, and the
+error-info channel.
 
 `wepoll_ex_get_last_error_info()` copies the calling thread's details after a
 failed library operation. `portable_error` is the public `errno`; Windows also

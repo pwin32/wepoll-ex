@@ -971,6 +971,49 @@ static int make_udp_receiver(SOCKET *receiver_out,
     return 0;
 }
 
+static int make_tcp_pair(SOCKET *listener_out, SOCKET *client_out,
+                         SOCKET *server_out)
+{
+    struct sockaddr_in address;
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET server = INVALID_SOCKET;
+    int address_length = (int)sizeof(address);
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(0);
+    listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET ||
+        bind(listener, (const struct sockaddr *)&address,
+             (int)sizeof(address)) == SOCKET_ERROR ||
+        listen(listener, 1) == SOCKET_ERROR ||
+        getsockname(listener, (struct sockaddr *)&address,
+                    &address_length) == SOCKET_ERROR) {
+        goto fail;
+    }
+    client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (client == INVALID_SOCKET ||
+        connect(client, (const struct sockaddr *)&address,
+                address_length) == SOCKET_ERROR) {
+        goto fail;
+    }
+    server = accept(listener, NULL, NULL);
+    if (server == INVALID_SOCKET) goto fail;
+
+    *listener_out = listener;
+    *client_out = client;
+    *server_out = server;
+    return 0;
+
+fail:
+    if (server != INVALID_SOCKET) closesocket(server);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return -1;
+}
+
 static int wait_for_empty_public_port(int epfd)
 {
     ULONGLONG deadline = GetTickCount64() + 2000;
@@ -1839,6 +1882,155 @@ cleanup:
     return result;
 }
 
+static int test_shutdown_ready_node_alloc(void)
+{
+    static const char byte = 's';
+    ep_port_t *port = NULL;
+    ep_sock_t *sock = NULL;
+    epoll_data_t data;
+    epoll_event_ex output;
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET server = INVALID_SOCKET;
+    int context = 1;
+    int registered = 0;
+    int state_ok;
+    int result = -1;
+    char received = 0;
+
+    ep_fault_reset();
+    memset(&data, 0, sizeof(data));
+    memset(&output, 0, sizeof(output));
+    data.u64 = UINT64_C(0x73687574616c6c6f);
+    if (ep_global_init() != 0 ||
+        make_tcp_pair(&listener, &client, &server) != 0 ||
+        ep_port_create(0, 0, &port) != 0 ||
+        ep_port_register(port, server, EPOLLOUT, 0,
+                         data, &context) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    if (ep_port_wait(port, &output, 1, 2000, NULL) != 1 ||
+        output.events != EPOLLOUT || output.data.u64 != data.u64 ||
+        output.user_ctx != &context ||
+        ep_port_modify(port, server, EPOLLIN | EPOLLRDHUP, 0,
+                       data, &context) != 0 ||
+        ep_fault_configure(EP_FAULT_READY_NODE_ALLOC, 1, ENOMEM) != 0) {
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (ep_port_shutdown_socket(port, server, SD_RECEIVE) != -1 ||
+        errno != ENOMEM ||
+        ep_fault_hits(EP_FAULT_READY_NODE_ALLOC) != 1) {
+        goto cleanup;
+    }
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    state_ok = sock != NULL && sock->next == NULL &&
+        sock->local_shutdown == 0 &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_IDLE &&
+        atomic_load_explicit(&sock->ready_queued,
+                             memory_order_relaxed) == 0 &&
+        sock->needs_rearm && ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok || send(client, &byte, 1, 0) != 1 ||
+        recv(server, &received, 1, 0) != 1 || received != byte) {
+        goto cleanup;
+    }
+
+    ep_fault_reset();
+    memset(&output, 0, sizeof(output));
+    if (ep_port_shutdown_socket(port, server, SD_RECEIVE) != 0 ||
+        ep_port_wait(port, &output, 1, 2000, NULL) != 1 ||
+        output.events != (EPOLLIN | EPOLLRDHUP) ||
+        output.data.u64 != data.u64 || output.user_ctx != &context) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (registered && port != NULL &&
+        ep_port_unregister(port, server) != 0) {
+        result = -1;
+    }
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    if (server != INVALID_SOCKET) closesocket(server);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return result;
+}
+
+static int test_shutdown_cancel_retry(void)
+{
+    ep_port_t *port = NULL;
+    ep_sock_t *sock = NULL;
+    epoll_data_t data;
+    epoll_event_ex output;
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET server = INVALID_SOCKET;
+    int context = 1;
+    int registered = 0;
+    int state_ok;
+    int result = -1;
+    char byte;
+
+    ep_fault_reset();
+    memset(&data, 0, sizeof(data));
+    memset(&output, 0, sizeof(output));
+    data.u64 = UINT64_C(0x7368757463616e63);
+    if (ep_global_init() != 0 ||
+        make_tcp_pair(&listener, &client, &server) != 0 ||
+        ep_port_create(0, 0, &port) != 0 ||
+        ep_port_register(port, server, EPOLLIN | EPOLLRDHUP, 0,
+                         data, &context) != 0 ||
+        ep_fault_configure(EP_FAULT_AFD_CANCEL, 1, EBUSY) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+
+    errno = 0;
+    if (ep_port_shutdown_socket(port, server, SD_RECEIVE) != -1 ||
+        errno != EBUSY || ep_fault_hits(EP_FAULT_AFD_CANCEL) != 1 ||
+        recv(server, &byte, 1, 0) != SOCKET_ERROR ||
+        WSAGetLastError() != WSAESHUTDOWN) {
+        goto cleanup;
+    }
+    pthread_mutex_lock(&port->fd_table_lock);
+    sock = port->sock_list_head;
+    state_ok = sock != NULL && sock->next == NULL &&
+        sock->local_shutdown == EP_LOCAL_SHUTDOWN_READ &&
+        atomic_load_explicit(&sock->poll_status,
+                             memory_order_relaxed) == EP_POLL_PENDING &&
+        sock->needs_rearm && ep_port_worklists_valid_locked(port);
+    pthread_mutex_unlock(&port->fd_table_lock);
+    if (!state_ok) goto cleanup;
+
+    ep_fault_reset();
+    if (ep_port_shutdown_socket(port, server, SD_RECEIVE) != 0 ||
+        ep_port_wait(port, &output, 1, 2000, NULL) != 1 ||
+        output.events != (EPOLLIN | EPOLLRDHUP) ||
+        output.data.u64 != data.u64 || output.user_ctx != &context) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    ep_fault_reset();
+    if (registered && port != NULL &&
+        ep_port_unregister(port, server) != 0) {
+        result = -1;
+    }
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    if (server != INVALID_SOCKET) closesocket(server);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return result;
+}
+
 static int test_waitable_zero_disarm(void)
 {
     ep_port_t *port = NULL;
@@ -2377,6 +2569,8 @@ static const fault_test_case_t g_tests[] = {
     { "aux-post", test_aux_post_failure },
     { "aux-post-immediate", test_aux_post_immediate_failure },
     { "ready-node-alloc", test_ready_node_alloc },
+    { "shutdown-ready-node-alloc", test_shutdown_ready_node_alloc },
+    { "shutdown-cancel-retry", test_shutdown_cancel_retry },
     { "waitable-ready-node-alloc", test_waitable_ready_node_alloc },
     { "waitable-zero-disarm", test_waitable_zero_disarm },
     { "aux-waitable-disarm", test_aux_waitable_disarm },
@@ -2439,6 +2633,7 @@ int main(int argc, char **argv)
             "endpoint-policy|endpoint-closed-token-loss|iocp-create|"
             "iocp-post|wake-post|iocp-dequeue|"
             "aux-closed-iocp|aux-post|aux-post-immediate|ready-node-alloc|"
+            "shutdown-ready-node-alloc|shutdown-cancel-retry|"
             "waitable-ready-node-alloc|waitable-zero-disarm|"
             "aux-waitable-disarm|"
             "aux-waitable-disarm-repeat|aux-consumptive-disarm|"

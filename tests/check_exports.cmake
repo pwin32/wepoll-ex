@@ -36,6 +36,7 @@ if(WEPOLL_EX_EXPORT_FORMAT STREQUAL "ELF")
         wepoll_ex_get_last_error_info
         wepoll_ex_get_socket_lifetime_policy
         wepoll_ex_get_stats
+        wepoll_ex_shutdown_socket
         wepoll_ex_version
         wepoll_ex_version_string
         wepoll_ex_wake
@@ -111,6 +112,7 @@ elseif(WEPOLL_EX_EXPORT_FORMAT STREQUAL "PE")
         wepoll_ex_get_last_error_info
         wepoll_ex_get_socket_lifetime_policy
         wepoll_ex_get_stats
+        wepoll_ex_shutdown_socket
         wepoll_ex_version
         wepoll_ex_version_string
         wepoll_ex_wake

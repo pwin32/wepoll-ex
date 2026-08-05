@@ -176,7 +176,8 @@ static void test_operational_stats(void)
         WEPOLL_EX_CAP_CLOSE_SOCKET_HELPER |
         WEPOLL_EX_CAP_EXPLICIT_REARM_ONESHOT |
         WEPOLL_EX_CAP_VIRTUAL_EPOLL_DUP |
-        WEPOLL_EX_CAP_ERROR_INFO;
+        WEPOLL_EX_CAP_ERROR_INFO |
+        WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER;
     wepoll_ex_capabilities capabilities;
     wepoll_ex_global_stats global_stats;
     wepoll_ex_stats stats;
@@ -1599,6 +1600,7 @@ static void test_epfd_collision_and_reuse(void)
 typedef struct close_wait_context {
     int epfd;
     HANDLE started;
+    struct epoll_event event;
     int result;
     int error;
 } close_wait_context_t;
@@ -1606,13 +1608,12 @@ typedef struct close_wait_context {
 static DWORD WINAPI close_wait_thread(void *opaque)
 {
     close_wait_context_t *context = (close_wait_context_t *)opaque;
-    struct epoll_event event;
 
     if (context->started != NULL) {
         SetEvent(context->started);
     }
     errno = 0;
-    context->result = epoll_wait(context->epfd, &event, 1, -1);
+    context->result = epoll_wait(context->epfd, &context->event, 1, -1);
     context->error = errno;
     return 0;
 }
@@ -1777,6 +1778,185 @@ cleanup:
     tcp_pair_close(&pair);
     if (!ok) {
         FAIL("close socket helper contract");
+        return;
+    }
+    PASS();
+}
+
+static void test_shutdown_socket_helper(void)
+{
+    tcp_pair_t pair;
+    tcp_pair_t both_pair;
+    wepoll_ex_error_info error_info;
+    struct epoll_event event;
+    struct epoll_event output;
+    SOCKET unconnected = INVALID_SOCKET;
+    u_long blocking = 0;
+    int epfd = -1;
+    int both_registered = 0;
+    int ok = 0;
+    int stage = 0;
+    char byte;
+
+    TEST("shutdown helper validates before effect and preserves native errors");
+    tcp_pair_init(&pair);
+    tcp_pair_init(&both_pair);
+    epfd = epoll_create1(0);
+    if (epfd < 0 || make_tcp_pair(&pair) != 0 ||
+        ioctlsocket(pair.server, FIONBIO, &blocking) == SOCKET_ERROR) {
+        goto cleanup;
+    }
+
+    errno = 0;
+    if (wepoll_ex_shutdown_socket(-1, pair.server, SD_RECEIVE) != -1 ||
+        errno != EBADF || send_byte(pair.client) != 0 ||
+        recv_byte(pair.server) != 0) {
+        goto cleanup;
+    }
+    stage = 1;
+    errno = 0;
+    if (wepoll_ex_shutdown_socket(epfd, pair.server, 99) != -1 ||
+        errno != EINVAL || send_byte(pair.client) != 0 ||
+        recv_byte(pair.server) != 0 ||
+        wepoll_ex_shutdown_socket(epfd, pair.server, SD_RECEIVE) != 0 ||
+        recv(pair.server, &byte, 1, 0) != SOCKET_ERROR ||
+        WSAGetLastError() != WSAESHUTDOWN) {
+        goto cleanup;
+    }
+    stage = 2;
+
+    unconnected = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    errno = 0;
+    if (unconnected == INVALID_SOCKET ||
+        wepoll_ex_shutdown_socket(epfd, unconnected, SD_RECEIVE) != -1 ||
+        wepoll_ex_get_last_error_info(&error_info,
+                                      sizeof(error_info)) != 0 ||
+        error_info.portable_error != errno ||
+        error_info.native_domain != WEPOLL_EX_NATIVE_ERROR_WINSOCK ||
+        error_info.native_code == 0 ||
+        error_info.winsock_error != (int32_t)error_info.native_code ||
+        (error_info.flags & WEPOLL_EX_ERROR_NATIVE_EXACT) == 0) {
+        goto cleanup;
+    }
+    stage = 3;
+    closesocket(unconnected);
+    unconnected = INVALID_SOCKET;
+
+    if (make_tcp_pair(&both_pair) != 0) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+    event.data.u64 = UINT64_C(0x53485554424f5448);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, both_pair.server, &event) != 0) {
+        goto cleanup;
+    }
+    both_registered = 1;
+    if (epoll_wait(epfd, &output, 1, 2000) != 1 ||
+        output.events != EPOLLOUT ||
+        wepoll_ex_shutdown_socket(epfd, both_pair.server, SD_BOTH) != 0 ||
+        epoll_wait(epfd, &output, 1, 2000) != 1 ||
+        output.events != (EPOLLIN | EPOLLRDHUP | EPOLLHUP) ||
+        output.data.u64 != event.data.u64 ||
+        recv(both_pair.server, &byte, 1, 0) != SOCKET_ERROR ||
+        WSAGetLastError() != WSAESHUTDOWN ||
+        epoll_ctl(epfd, EPOLL_CTL_DEL, both_pair.server, NULL) != 0) {
+        goto cleanup;
+    }
+    both_registered = 0;
+    stage = 4;
+
+    errno = 0;
+    if (wepoll_ex_shutdown_socket(epfd, EPOLL_FD_INVALID,
+                                  SD_RECEIVE) != -1 ||
+        errno != EBADF || wepoll_close(epfd) != 0) {
+        goto cleanup;
+    }
+    epfd = -1;
+    stage = 5;
+    ok = 1;
+
+cleanup:
+    if (both_registered && epfd >= 0)
+        (void)epoll_ctl(epfd, EPOLL_CTL_DEL, both_pair.server, NULL);
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (unconnected != INVALID_SOCKET) closesocket(unconnected);
+    tcp_pair_close(&both_pair);
+    tcp_pair_close(&pair);
+    if (!ok) {
+        fprintf(stderr,
+                "shutdown socket helper failed at stage %d errno=%d WSA=%d\n",
+                stage, errno, WSAGetLastError());
+        FAIL("shutdown socket helper contract");
+        return;
+    }
+    PASS();
+}
+
+static void test_shutdown_socket_wait_wake(void)
+{
+    const uint64_t data = UINT64_C(0x5348555457414b45);
+    close_wait_context_t context;
+    tcp_pair_t pair;
+    struct epoll_event event;
+    HANDLE thread = NULL;
+    int epfd = -1;
+    int registered = 0;
+    int ok = 0;
+
+    TEST("shutdown helper wakes a pending socket wait");
+    memset(&context, 0, sizeof(context));
+    tcp_pair_init(&pair);
+    epfd = epoll_create1(0);
+    context.epfd = epfd;
+    context.started = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (epfd < 0 || context.started == NULL || make_tcp_pair(&pair) != 0) {
+        goto cleanup;
+    }
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLRDHUP;
+    event.data.u64 = data;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pair.server, &event) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    thread = CreateThread(NULL, 0, close_wait_thread, &context, 0, NULL);
+    if (thread == NULL ||
+        WaitForSingleObject(context.started, 2000) != WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+    Sleep(100);
+    if (wepoll_ex_shutdown_socket(epfd, pair.server, SD_RECEIVE) != 0 ||
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0 ||
+        context.result != 1 || context.error != 0 ||
+        context.event.events != (EPOLLIN | EPOLLRDHUP) ||
+        context.event.data.u64 != data) {
+        goto cleanup;
+    }
+    CloseHandle(thread);
+    thread = NULL;
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL) != 0 ||
+        wepoll_close(epfd) != 0) {
+        goto cleanup;
+    }
+    registered = 0;
+    epfd = -1;
+    ok = 1;
+
+cleanup:
+    if (registered && epfd >= 0)
+        (void)epoll_ctl(epfd, EPOLL_CTL_DEL, pair.server, NULL);
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (thread != NULL &&
+        WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0) {
+        (void)TerminateThread(thread, 1);
+        ok = 0;
+    }
+    if (thread != NULL) CloseHandle(thread);
+    if (context.started != NULL) CloseHandle(context.started);
+    tcp_pair_close(&pair);
+    if (!ok) {
+        FAIL("shutdown helper wait wake");
         return;
     }
     PASS();
@@ -2263,6 +2443,8 @@ int main(void)
     test_epfd_collision_and_reuse();
     test_epfd_aliases();
     test_close_socket_helper();
+    test_shutdown_socket_helper();
+    test_shutdown_socket_wait_wake();
     test_error_info();
     test_wait_wake();
     test_empty_wait_concurrent_add();

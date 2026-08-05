@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <pthread.h>
@@ -1156,7 +1157,8 @@ WEPOLL_EX_API int wepoll_ex_get_capabilities(
                      WEPOLL_EX_CAP_ATOMIC_SIGNAL_MASK_WAIT |
                      WEPOLL_EX_CAP_NATIVE_EPOLL_DESCRIPTOR |
                      WEPOLL_EX_CAP_CLOSE_SOCKET_HELPER |
-                     WEPOLL_EX_CAP_ERROR_INFO;
+                     WEPOLL_EX_CAP_ERROR_INFO |
+                     WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER;
     return copy_versioned_snapshot(capabilities, capabilities_size,
                                    &snapshot, sizeof(snapshot));
 }
@@ -1255,6 +1257,26 @@ WEPOLL_EX_API int wepoll_ex_close_socket(int epfd, int fd)
         return -1;
     }
     return close(fd);
+}
+
+WEPOLL_EX_API int wepoll_ex_shutdown_socket(int epfd, int fd, int how)
+{
+    posix_port_t *p;
+    int result;
+    int saved_errno;
+
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    p = port_acquire_or_create(epfd);
+    if (p == NULL) return -1;
+
+    result = shutdown(fd, how);
+    saved_errno = errno;
+    port_release(p);
+    if (result != 0) errno = saved_errno;
+    return result;
 }
 
 WEPOLL_EX_API int wepoll_close(int epfd)

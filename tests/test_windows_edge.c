@@ -811,6 +811,314 @@ fail:
     return 1;
 }
 
+typedef enum local_shutdown_mode {
+    LOCAL_SHUTDOWN_LT = 0,
+    LOCAL_SHUTDOWN_ET,
+    LOCAL_SHUTDOWN_ONESHOT,
+    LOCAL_SHUTDOWN_EXPLICIT
+} local_shutdown_mode_t;
+
+static int test_local_shutdown(local_shutdown_mode_t mode)
+{
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    uint32_t events = 0;
+    uint32_t flags = 0;
+    uint32_t expected_read;
+    uint32_t expected_full;
+    int epfd = -1;
+    int registered = 0;
+    int n;
+    char byte;
+
+    if (make_loopback_pair(&listener, &client, &accepted) != 0) {
+        return 1;
+    }
+    epfd = mode == LOCAL_SHUTDOWN_EXPLICIT
+        ? epoll_create_ex(0, WEPOLL_EX_CREATE_EXPLICIT_REARM)
+        : epoll_create1(0);
+    if (epfd < 0) goto fail;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+    if (mode != LOCAL_SHUTDOWN_LT) event.events |= EPOLLET;
+    if (mode == LOCAL_SHUTDOWN_ONESHOT) event.events |= EPOLLONESHOT;
+    event.data.u64 = UINT64_C(0x53485554444f574e) + (uint64_t)mode;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0) goto fail;
+    registered = 1;
+
+    n = wait_one(epfd, 1000, &events, &flags);
+    if (n != 1 || events != EPOLLOUT ||
+        (mode != LOCAL_SHUTDOWN_LT &&
+         (flags & WEPOLL_FLAG_ET_DELIVERED) == 0) ||
+        (mode == LOCAL_SHUTDOWN_ONESHOT &&
+         (flags & WEPOLL_FLAG_ONESHOT_FIRED) == 0)) {
+        fprintf(stderr,
+                "local-shutdown: initial mode=%d n=%d events=0x%08lx flags=0x%08lx\n",
+                (int)mode, n, (unsigned long)events, (unsigned long)flags);
+        goto fail;
+    }
+
+    if (wepoll_ex_shutdown_socket(epfd, accepted, SD_RECEIVE) != 0) {
+        fprintf(stderr,
+                "local-shutdown: SD_RECEIVE mode=%d errno=%d WSA=%d\n",
+                (int)mode, errno, WSAGetLastError());
+        goto fail;
+    }
+    if (mode == LOCAL_SHUTDOWN_ONESHOT) {
+        if (wait_one(epfd, 50, &events, &flags) != 0 ||
+            epoll_ctl(epfd, EPOLL_CTL_MOD, accepted, &event) != 0) {
+            fputs("local-shutdown: fired oneshot was not kept disabled\n",
+                  stderr);
+            goto fail;
+        }
+    }
+
+    expected_read = (mode == LOCAL_SHUTDOWN_LT ||
+                     mode == LOCAL_SHUTDOWN_ONESHOT)
+        ? EPOLLIN | EPOLLOUT | EPOLLRDHUP
+        : EPOLLIN | EPOLLRDHUP;
+    n = wait_one(epfd, 1000, &events, &flags);
+    if (n != 1 || events != expected_read ||
+        (mode != LOCAL_SHUTDOWN_LT &&
+         (flags & WEPOLL_FLAG_ET_DELIVERED) == 0) ||
+        (mode == LOCAL_SHUTDOWN_ONESHOT &&
+         (flags & WEPOLL_FLAG_ONESHOT_FIRED) == 0)) {
+        fprintf(stderr,
+                "local-shutdown: read mode=%d n=%d events=0x%08lx flags=0x%08lx WSA=%d\n",
+                (int)mode, n, (unsigned long)events, (unsigned long)flags,
+                WSAGetLastError());
+        goto fail;
+    }
+    if (recv(accepted, &byte, 1, 0) != SOCKET_ERROR ||
+        WSAGetLastError() != WSAESHUTDOWN) {
+        fputs("local-shutdown: Winsock recv boundary changed\n", stderr);
+        goto fail;
+    }
+
+    if (mode == LOCAL_SHUTDOWN_LT) {
+        n = wait_one(epfd, 1000, &events, &flags);
+        if (n != 1 || events != expected_read) {
+            fputs("local-shutdown: LT level did not persist\n", stderr);
+            goto fail;
+        }
+    } else if (mode == LOCAL_SHUTDOWN_EXPLICIT) {
+        if (wait_one(epfd, 50, &events, &flags) != 0 ||
+            epoll_rearm_classes(epfd, accepted,
+                                WEPOLL_EX_REARM_READ) != 0) {
+            fputs("local-shutdown: explicit read acknowledgement failed\n",
+                  stderr);
+            goto fail;
+        }
+        n = wait_one(epfd, 1000, &events, &flags);
+        if (n != 1 || events != (EPOLLIN | EPOLLRDHUP)) {
+            fputs("local-shutdown: explicit local EOF did not redeliver\n",
+                  stderr);
+            goto fail;
+        }
+    } else if (wait_one(epfd, 50, &events, &flags) != 0) {
+        fputs("local-shutdown: ET/oneshot local EOF redelivered\n", stderr);
+        goto fail;
+    }
+
+    if (wepoll_ex_shutdown_socket(epfd, accepted, SD_SEND) != 0) {
+        fprintf(stderr, "local-shutdown: SD_SEND mode=%d errno=%d WSA=%d\n",
+                (int)mode, errno, WSAGetLastError());
+        goto fail;
+    }
+    if (mode == LOCAL_SHUTDOWN_ONESHOT) {
+        if (wait_one(epfd, 50, &events, &flags) != 0 ||
+            epoll_ctl(epfd, EPOLL_CTL_MOD, accepted, &event) != 0) {
+            fputs("local-shutdown: full shutdown escaped fired oneshot\n",
+                  stderr);
+            goto fail;
+        }
+    }
+
+    expected_full = mode == LOCAL_SHUTDOWN_LT ||
+                    mode == LOCAL_SHUTDOWN_ONESHOT
+        ? EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLHUP
+        : EPOLLHUP;
+    n = wait_one(epfd, 1000, &events, &flags);
+    if (n != 1 || events != expected_full) {
+        fprintf(stderr,
+                "local-shutdown: full mode=%d n=%d events=0x%08lx expected=0x%08lx flags=0x%08lx\n",
+                (int)mode, n, (unsigned long)events,
+                (unsigned long)expected_full, (unsigned long)flags);
+        goto fail;
+    }
+
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL) != 0) goto fail;
+    registered = 0;
+    (void)wepoll_close(epfd);
+    closesocket(accepted);
+    closesocket(client);
+    closesocket(listener);
+    printf("local-shutdown-%d: Linux-like local shutdown readiness OK\n",
+           (int)mode);
+    return 0;
+
+fail:
+    if (registered && epfd >= 0)
+        (void)epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL);
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    return 1;
+}
+
+static int test_local_shutdown_mod_wake(void)
+{
+    const uint64_t data = UINT64_C(0x534855544d4f4457);
+    multi_wait_context_t context;
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    HANDLE thread = NULL;
+    uint32_t events = 0;
+    uint32_t flags = 0;
+    int epfd = -1;
+    int registered = 0;
+    int result = 1;
+
+    memset(&context, 0, sizeof(context));
+    if (make_loopback_pair(&listener, &client, &accepted) != 0) goto cleanup;
+    epfd = epoll_create1(0);
+    context.epfd = epfd;
+    context.started = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (epfd < 0 || context.started == NULL) goto cleanup;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP |
+                   EPOLLET | EPOLLONESHOT;
+    event.data.u64 = data;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0) goto cleanup;
+    registered = 1;
+    if (wait_one(epfd, 1000, &events, &flags) != 1 ||
+        events != EPOLLOUT ||
+        (flags & WEPOLL_FLAG_ONESHOT_FIRED) == 0 ||
+        wepoll_ex_shutdown_socket(epfd, accepted, SD_RECEIVE) != 0 ||
+        wait_one(epfd, 50, &events, &flags) != 0) {
+        goto cleanup;
+    }
+
+    thread = CreateThread(NULL, 0, multi_wait_thread, &context, 0, NULL);
+    if (thread == NULL ||
+        WaitForSingleObject(context.started, 2000) != WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+    Sleep(100);
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, accepted, &event) != 0 ||
+        WaitForSingleObject(thread, 2000) != WAIT_OBJECT_0 ||
+        context.result != 1 || context.error != 0 ||
+        context.event.events != (EPOLLIN | EPOLLOUT | EPOLLRDHUP) ||
+        context.event.data.u64 != data) {
+        goto cleanup;
+    }
+    CloseHandle(thread);
+    thread = NULL;
+    result = 0;
+
+cleanup:
+    if (thread != NULL &&
+        WaitForSingleObject(thread, 0) != WAIT_OBJECT_0) {
+        if (epfd >= 0) (void)wepoll_ex_wake(epfd);
+        if (WaitForSingleObject(thread, 2000) != WAIT_OBJECT_0) {
+            (void)TerminateThread(thread, 1);
+            result = 1;
+        }
+    }
+    if (thread != NULL) CloseHandle(thread);
+    if (registered && epfd >= 0)
+        (void)epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL);
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (context.started != NULL) CloseHandle(context.started);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    if (result == 0)
+        puts("local-shutdown-mod-wake: blocked wait observed fresh MOD");
+    return result;
+}
+
+static int test_local_shutdown_rearm_wake(void)
+{
+    const uint64_t data = UINT64_C(0x5348555452454152);
+    multi_wait_context_t context;
+    SOCKET listener = INVALID_SOCKET;
+    SOCKET client = INVALID_SOCKET;
+    SOCKET accepted = INVALID_SOCKET;
+    struct epoll_event event;
+    HANDLE thread = NULL;
+    uint32_t events = 0;
+    uint32_t flags = 0;
+    int epfd = -1;
+    int registered = 0;
+    int result = 1;
+
+    memset(&context, 0, sizeof(context));
+    if (make_loopback_pair(&listener, &client, &accepted) != 0) goto cleanup;
+    epfd = epoll_create_ex(0, WEPOLL_EX_CREATE_EXPLICIT_REARM);
+    context.epfd = epfd;
+    context.started = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (epfd < 0 || context.started == NULL) goto cleanup;
+
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
+    event.data.u64 = data;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, accepted, &event) != 0 ||
+        wepoll_ex_shutdown_socket(epfd, accepted, SD_RECEIVE) != 0 ||
+        wait_one(epfd, 1000, &events, &flags) != 1 ||
+        events != (EPOLLIN | EPOLLRDHUP) ||
+        (flags & WEPOLL_FLAG_ET_DELIVERED) == 0) {
+        goto cleanup;
+    }
+    registered = 1;
+
+    thread = CreateThread(NULL, 0, multi_wait_thread, &context, 0, NULL);
+    if (thread == NULL ||
+        WaitForSingleObject(context.started, 2000) != WAIT_OBJECT_0) {
+        goto cleanup;
+    }
+    Sleep(100);
+    if (epoll_rearm_classes(epfd, accepted,
+                            WEPOLL_EX_REARM_READ) != 0 ||
+        WaitForSingleObject(thread, 2000) != WAIT_OBJECT_0 ||
+        context.result != 1 || context.error != 0 ||
+        context.event.events != (EPOLLIN | EPOLLRDHUP) ||
+        context.event.data.u64 != data) {
+        goto cleanup;
+    }
+    CloseHandle(thread);
+    thread = NULL;
+    result = 0;
+
+cleanup:
+    if (thread != NULL &&
+        WaitForSingleObject(thread, 0) != WAIT_OBJECT_0) {
+        if (epfd >= 0) (void)wepoll_ex_wake(epfd);
+        if (WaitForSingleObject(thread, 2000) != WAIT_OBJECT_0) {
+            (void)TerminateThread(thread, 1);
+            result = 1;
+        }
+    }
+    if (thread != NULL) CloseHandle(thread);
+    if (registered && epfd >= 0)
+        (void)epoll_ctl(epfd, EPOLL_CTL_DEL, accepted, NULL);
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (context.started != NULL) CloseHandle(context.started);
+    if (accepted != INVALID_SOCKET) closesocket(accepted);
+    if (client != INVALID_SOCKET) closesocket(client);
+    if (listener != INVALID_SOCKET) closesocket(listener);
+    if (result == 0)
+        puts("local-shutdown-rearm-wake: blocked wait observed rearm");
+    return result;
+}
+
 static int test_explicit_rearm_contract(void)
 {
     SOCKET listener = INVALID_SOCKET;
@@ -2124,6 +2432,18 @@ static int run_mode(const char *mode)
         return test_explicit_rearm_fin();
     if (strcmp(mode, "explicit-oneshot") == 0)
         return test_explicit_rearm_oneshot();
+    if (strcmp(mode, "local-shutdown-lt") == 0)
+        return test_local_shutdown(LOCAL_SHUTDOWN_LT);
+    if (strcmp(mode, "local-shutdown-et") == 0)
+        return test_local_shutdown(LOCAL_SHUTDOWN_ET);
+    if (strcmp(mode, "local-shutdown-oneshot") == 0)
+        return test_local_shutdown(LOCAL_SHUTDOWN_ONESHOT);
+    if (strcmp(mode, "local-shutdown-explicit") == 0)
+        return test_local_shutdown(LOCAL_SHUTDOWN_EXPLICIT);
+    if (strcmp(mode, "local-shutdown-mod-wake") == 0)
+        return test_local_shutdown_mod_wake();
+    if (strcmp(mode, "local-shutdown-rearm-wake") == 0)
+        return test_local_shutdown_rearm_wake();
     if (strcmp(mode, "explicit-contract") == 0)
         return test_explicit_rearm_contract();
     if (strcmp(mode, "exclusive-mod") == 0)
@@ -2159,6 +2479,9 @@ int main(int argc, char **argv)
     const char *modes[] = {
         "readable", "same-epfd-et", "writable", "explicit-rearm",
         "explicit-terminal", "explicit-fin", "explicit-oneshot",
+        "local-shutdown-lt", "local-shutdown-et",
+        "local-shutdown-oneshot", "local-shutdown-explicit",
+        "local-shutdown-mod-wake", "local-shutdown-rearm-wake",
         "explicit-contract",
         "exclusive-mod",
         "exclusive-wake",

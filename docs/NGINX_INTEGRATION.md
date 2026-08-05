@@ -82,6 +82,13 @@ adapter keeps nginx's separate delete/close lifecycle because substituting the
 helper requires proving that no socket is registered in another port and that
 all third-party close paths use the same hook.
 
+`wepoll_ex_shutdown_socket()` is likewise available to a future adapter
+revision that routes nginx's `ngx_shutdown_socket` macro through the active
+epfd. The current level-triggered adapter does not interpose that macro, so a
+direct local receive shutdown retains native Winsock behavior and no synthetic
+read/RDHUP transition. The native-module port notes describe the one-port
+readiness contract and the unchanged `WSAESHUTDOWN` data-call boundary.
+
 `wepoll_close()` is required for the virtual epoll descriptor. The adapter must
 not call plain `close()` on it, and must coordinate teardown so no nginx event
 handler can use a context after the port has begun closing.

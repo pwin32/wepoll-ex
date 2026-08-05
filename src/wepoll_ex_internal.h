@@ -348,6 +348,9 @@ typedef enum ep_socket_protocol {
     EP_SOCKET_PROTOCOL_TCP = 2
 } ep_socket_protocol_t;
 
+#define EP_LOCAL_SHUTDOWN_READ  (1U << 0)
+#define EP_LOCAL_SHUTDOWN_WRITE (1U << 1)
+
 /* A one-byte direct AFD receive is only a safe readiness observation when the
  * provider handle was opened for asynchronous I/O.  Cache that conclusion
  * per registration: UNKNOWN/UNSAFE keep the conservative poll mapping, while
@@ -409,6 +412,10 @@ struct ep_sock {
      * unread datagram is observed, park that internal interest until a fresh
      * MOD/rearm scan so the persistent receive level cannot spin IOCP. */
     uint8_t udp_readless_receive_parked;
+    /* Local shutdown state published through wepoll_ex_shutdown_socket().
+     * Winsock does not produce an AFD/readiness transition for receive-side
+     * shutdown, so registered TCP sockets retain the explicit state here. */
+    uint8_t local_shutdown;
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     uint64_t endpoint_id;
     uint8_t endpoint_id_state;
@@ -806,6 +813,7 @@ int  ep_port_modify(ep_port_t *port, SOCKET fd,
                     uint32_t events, uint32_t flags,
                     epoll_data_t data, void *ctx);
 int  ep_port_unregister(ep_port_t *port, SOCKET fd);
+int  ep_port_shutdown_socket(ep_port_t *port, SOCKET fd, int how);
 int  ep_port_rearm(ep_port_t *port, SOCKET fd);
 int  ep_port_rearm_classes(ep_port_t *port, SOCKET fd, uint32_t classes);
 int  ep_port_wake(ep_port_t *port);

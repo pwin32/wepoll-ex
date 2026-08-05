@@ -378,6 +378,12 @@ else()
             explicit-terminal
             explicit-fin
             explicit-oneshot
+            local-shutdown-lt
+            local-shutdown-et
+            local-shutdown-oneshot
+            local-shutdown-explicit
+            local-shutdown-mod-wake
+            local-shutdown-rearm-wake
             explicit-contract
             exclusive-mod
             exclusive-wake
@@ -541,6 +547,8 @@ else()
                 aux-post
                 aux-post-immediate
                 ready-node-alloc
+                shutdown-ready-node-alloc
+                shutdown-cancel-retry
                 waitable-ready-node-alloc
                 waitable-zero-disarm
                 aux-waitable-disarm
