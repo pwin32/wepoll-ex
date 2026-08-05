@@ -3,20 +3,21 @@
 ## Current status
 
 `nginx/` contains an experimental nginx 1.31.3 event-module adapter. It is
-now wired to nginx's `--add-module` hook and has passed strict object/full-link
-checks plus a disposable MinGW HTTP loopback, reload, and graceful-quit smoke
-test. It is not a supported nginx backend or a production validation matrix.
+wired to nginx's `--add-module` hook and has passed strict object/full-link
+checks plus disposable MinGW HTTP and HTTPS runtime matrices. Level-triggered
+operation remains the default. `wepoll_edge on` opts into a separately tested
+explicit-rearm `EPOLLET` mode. This is still not a supported nginx backend or a
+production compatibility claim.
 `nginx-1.31.3.tar.gz` is reference material and must remain ignored; unpack it
 outside this repository for experiments.
 
-The adapter follows nginx's level-triggered poll action layout and uses the
-connection instance bit to reject stale queued events. The Windows backend
-supports observed-readiness `EPOLLET`, but this adapter intentionally does not
-request it because it has no separately tested nginx drain/rearm state machine.
-The `nginx/config` hook compiles the static wepoll-ex sources into an nginx
-build;
-the opt-in CMake target only checks the adapter object against generated nginx
-headers.
+The default path follows nginx's level-triggered poll action layout. Edge mode
+creates the port with `WEPOLL_EX_CREATE_EXPLICIT_REARM`, maintains one fixed
+duplex `EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET` registration per
+connection, and acknowledges READ or WRITE only after nginx has cleared that
+event's `ready` bit and any posted handler has completed. The `nginx/config`
+hook compiles the static wepoll-ex sources into an nginx build; the opt-in
+CMake target only checks the adapter object against generated nginx headers.
 
 The Win32 nginx 1.31.3 configure script rejects `--with-threads`, and its
 thread-pool sources are Unix/POSIX-only. This adapter therefore leaves nginx's
@@ -40,11 +41,45 @@ later (`_WIN32_WINNT=0x0602`) as the current minimum for this experiment.
 ## Architecture constraints
 
 The adapter stores the nginx connection pointer and its instance bit in the
-standard epoll event data. Every queued event is revalidated against the
-connection's current descriptor and instance before dispatch. Registrations
-must remain level-triggered on Windows unless a separate, tested drain/rearm
-state machine is implemented; copying nginx's Linux `EPOLLET` mask is
-incorrect.
+standard epoll event data. Level-mode queued events are revalidated in the
+usual nginx style. Edge mode additionally stores a pointer to stable state for
+the connection slot in `epoll_event_ex.user_ctx`; the state validates the
+current descriptor, instance, registration, and connection address before the
+queued data pointer is dereferenced.
+
+Edge mode deliberately does not copy Linux nginx's mask onto an ordinary
+observed-edge port. It uses explicit readiness-class ownership instead:
+
+- `add_conn` installs one fixed duplex registration and enables both nginx
+  event interests;
+- delivery disarms the returned class and temporarily clears the corresponding
+  non-accept event's `active` bit;
+- a direct handler is eligible for rearm after it returns; a posted handler is
+  eligible at the beginning of the next `process_events` call; and
+- rearm occurs only after the event is no longer posted and nginx has cleared
+  its `ready` bit, which represents a drain to `WSAEWOULDBLOCK`.
+
+The accept handler clears `ready` itself, so listeners follow the same rule
+without an nginx core patch. `del_conn` always performs `EPOLL_CTL_DEL` before
+the socket is closed. Terminal delivery is consumed once; surviving READ or
+WRITE classes can be acknowledged, while the terminal class is not
+automatically rearmed into an error loop.
+
+Configure the event block as follows:
+
+```nginx
+events {
+    use wepoll;
+    worker_connections 1024;
+    wepoll_events 512;
+    wepoll_edge on;
+}
+```
+
+`wepoll_edge_post_events on` additionally forces all adapter dispatch through
+nginx's posted queues. It exists to qualify the delayed ownership path and may
+add overhead; it is not required for ordinary edge operation. A worker logs
+READ/WRITE/terminal delivery and READ/WRITE rearm counters at process exit.
 
 The staged work needed to qualify explicit edge rearming, notification,
 lifetime ownership, error bridging, probe optimization, and multiworker
@@ -52,12 +87,11 @@ behavior is tracked in `docs/COMPATIBILITY_ROADMAP.md`.
 The exact nginx/libuv/Mio/Asio source comparison is recorded in
 `docs/UPSTREAM_EVENT_LOOP_AUDIT.md`.
 
-The library now contains the first explicit-rearm primitive described by that
-roadmap, but the checked-in adapter does not use it.  A native-module-style
-experiment must acknowledge READ/WRITE after the corresponding nginx handler
-actually drains, including after posted handlers rather than merely after
-`process_events()` returns.  The exact compatibility analysis and API contract
-are in `docs/NGINX_NATIVE_EPOLL_PORT.md`.
+The checked-in adapter now implements the handler-completion experiment
+described by that roadmap without pretending that nginx's native Linux module
+is a symbol-only Windows port. The exact compatibility analysis, including the
+remaining notification, file-AIO, shutdown, and descriptor boundaries, is in
+`docs/NGINX_NATIVE_EPOLL_PORT.md`.
 
 Abortive TCP reset delivery now guarantees both `EPOLLERR` and `EPOLLHUP`.
 The adapter's existing terminal-event path treats either bit as readable and
@@ -84,10 +118,10 @@ all third-party close paths use the same hook.
 
 `wepoll_ex_shutdown_socket()` is likewise available to a future adapter
 revision that routes nginx's `ngx_shutdown_socket` macro through the active
-epfd. The current level-triggered adapter does not interpose that macro, so a
-direct local receive shutdown retains native Winsock behavior and no synthetic
-read/RDHUP transition. The native-module port notes describe the one-port
-readiness contract and the unchanged `WSAESHUTDOWN` data-call boundary.
+epfd. Neither adapter mode currently interposes that macro, so a direct local
+receive shutdown retains native Winsock behavior and no synthetic read/RDHUP
+transition. The native-module port notes describe the one-port readiness
+contract and the unchanged `WSAESHUTDOWN` data-call boundary.
 
 `wepoll_close()` is required for the virtual epoll descriptor. The adapter must
 not call plain `close()` on it, and must coordinate teardown so no nginx event
@@ -138,16 +172,17 @@ The `wepoll_events` directive is restricted to a positive value that fits the
    PCRE-dependent rewrite/gzip modules), configure `events { use wepoll; }`,
    and request a static loopback resource. This has passed locally with nginx
    1.31.3 and the requested MSYS2 GCC toolchain.
-6. Build nginx with the requested MinGW shell, record compiler/OS versions,
-   run `nginx -t`, and exercise keep-alive plus graceful shutdown/reload. This
-   has passed locally in normal master/worker mode with 100 loopback requests
-   spanning a reload. Stock Win32 nginx's `master_process off` path is a stub
-   that handles hard stop only, so it is not suitable for quit/reload testing.
+6. Build nginx with the requested MinGW shell, record compiler/OS versions and
+   the selected lifetime mode, run `nginx -t`, and exercise level mode before
+   enabling edge mode. Stock Win32 nginx's `master_process off` path is a stub
+   that handles hard stop only, so use normal master/worker mode for quit and
+   reload testing.
 7. Run the standard-library endurance client against the already-running HTTP
-   endpoint. It mixes normal requests, verified persistent keep-alive, slow
-   partial headers, abortive client resets, and client write-half-close. The
-   default is bounded; `--long` and `--production` select larger bounded
-   profiles. A command or nginx executable can be invoked between batches:
+   or HTTPS endpoint. It mixes normal requests, verified persistent keep-alive,
+   slow partial headers, abortive client resets, client write-half-close, and
+   opt-in response backpressure. The default is bounded; `--long` and
+   `--production` select larger bounded profiles. A command or nginx executable
+   can be invoked between batches:
 
    ```sh
    python3 scripts/nginx-endurance.py http://127.0.0.1:PORT/resource
@@ -155,16 +190,69 @@ The `wepoll_events` directive is restricted to a positive value that fits the
        --nginx-executable D:/path/to/nginx.exe \
        --nginx-prefix D:/path/to/run \
        http://127.0.0.1:PORT/resource
+   python3 scripts/nginx-endurance.py --insecure \
+       --backpressure-per-batch 4 \
+       --backpressure-pause-ms 500 \
+       --backpressure-min-body-bytes 8388608 \
+       --max-body-bytes 9437184 \
+       https://127.0.0.1:PORT/large.bin
    ```
 
    The client prints per-batch JSON, a deterministic seed, and a final summary;
-   any request or reload failure makes it exit nonzero.
-8. Keep focused adapter coverage for stale queued events, timers, posted
-   events, worker shutdown, and module-specific add/modify/delete transitions;
-   the HTTP endurance client does not directly assert those internal states.
+   any request or reload failure makes it exit nonzero. `--insecure` is intended
+   only for a disposable self-signed test endpoint. On stock Win32 nginx,
+   `--reload-settle 0.75` avoids sending the first health request while a worker
+   can still be inside its up-to-500 ms event wait and retiring.
+8. Run edge mode once normally and once with `wepoll_edge_post_events on`.
+   Confirm the worker-exit summary contains nonzero READ and WRITE delivery and
+   rearm counts. This proves the test crossed the explicit ownership path rather
+   than passing solely through an idle or level-triggered worker.
 9. Only after functional tests pass, collect latency or throughput data with a
    reproducible workload. `bench_windows` measures the library directly; nginx
    throughput remains a separate end-to-end measurement.
+
+## Explicit-rearm qualification snapshot
+
+On August 5, 2026, nginx 1.31.3 was built in synchronized lifetime mode with
+MSYS2 MinGW GCC 16.1.0, `-Werror`, and the static wepoll-ex addon. The TLS build
+used OpenSSL 3.6.3. `nginx -t`, full linking, ordinary edge dispatch, forced
+posted dispatch, reload, and worker-exit cleanup all passed on Windows
+10.0.19044.1826.
+
+The bounded loopback runs covered:
+
+- direct HTTP traffic with 1,000 ordinary requests, 1,600 verified keep-alive
+  requests, 80 slow-header requests, 160 abortive resets, and 80 client
+  write-half-closes, with no failures;
+- two-worker forced-posted HTTP traffic with 800 ordinary, 1,440 keep-alive,
+  60 slow, 120 reset, and 60 write-half-close operations across four reloads;
+- twelve 8 MiB static downloads after a 500 ms client receive pause and a
+  4 KiB receive buffer;
+- forced-posted upstream proxy traffic with 24 ordinary, 18 keep-alive, six
+  slow, 12 reset, and twelve 8 MiB backpressure operations across two reloads;
+  and
+- forced-posted HTTPS traffic with 24 ordinary, 24 keep-alive, six slow, 12
+  reset, six TCP write-half-close, and twelve 8 MiB backpressure operations
+  across two reloads.
+
+Retiring TLS workers reported nonzero ownership activity; one example logged
+408 READ deliveries, 450 WRITE deliveries, 342 READ rearms, and 371 WRITE
+rearms. This verifies that both directions crossed the explicit-rearm state
+machine. The forced-posted runs verify that acknowledgements were delayed until
+nginx removed the event from its posted queue and its handler cleared `ready`.
+
+Two boundaries were separated from adapter correctness. First, stock Win32
+nginx can leave a retiring worker in an event wait for up to 500 ms; signaling
+reload and immediately opening new work produced occasional connection resets,
+so the reproducible harness uses a 0.75 s post-signal settle. Second, proxied
+client write-half-close failed identically in level and edge modes in the tested
+stock nginx configuration. It is recorded as an nginx/Win32 proxy baseline,
+while direct static and TLS write-half-close remain covered.
+
+This snapshot qualifies the tested built-in HTTP, TLS, and proxy paths. It does
+not audit arbitrary third-party modules for DEL-before-close, implement Linux
+file AIO or eventfd notification, establish cross-process `EPOLLEXCLUSIVE`, or
+make a throughput claim.
 
 ## Local throughput snapshot
 

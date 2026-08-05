@@ -223,7 +223,9 @@ validating the target; it does not remove the socket from any other epoll
 instances. `wepoll_ex_shutdown_socket()` similarly publishes local TCP
 shutdown readiness only in the specified underlying port (including its
 virtual aliases). Stock nginx's Linux module still needs handler-completion
-rearm hooks, especially for posted events; this is not a symbol-only port.
+rearm hooks, especially for posted events; this is not a symbol-only port. The
+checked-in nginx adapter supplies those hooks behind `wepoll_edge on`, while
+retaining level-triggered operation as its default.
 
 Windows control calls classify the target before membership errors where Linux
 does: an invalid or closed target returns `EBADF`, a valid supported target

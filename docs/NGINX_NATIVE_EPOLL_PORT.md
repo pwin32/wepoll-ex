@@ -16,6 +16,10 @@ kernel epoll ready list records later transitions after the handler drains the
 socket.  AFD exposes one level snapshot per request instead of that kernel
 edge queue.
 
+The checked-in `ngx_wepoll_module.c` now demonstrates a compatible nginx event
+lifecycle using explicit readiness-class rearm. It is a semantic adapter, not
+a proof that `ngx_epoll_module.c` can be ported by renaming a few functions.
+
 Ordinary wepoll-ex `EPOLLET` remains an observed-level compatibility filter.
 It suppresses a continuously true bit and resamples to prove that the level
 became inactive.  That mode is useful and already regression-tested, but an
@@ -67,6 +71,30 @@ core and third-party close path still needs qualification.
 one epfd; it does not remove registrations from other ports or discover nginx
 objects that bypass the chosen close wrapper.
 
+## Checked-in nginx edge adapter
+
+`events { wepoll_edge on; }` creates an explicit-rearm port and installs one
+fixed duplex ET registration for each nginx connection. Stable state indexed
+by the nginx connection slot records descriptor identity, instance, active
+interests, disarmed classes, and pending acknowledgements. The ordinary event
+payload still carries nginx's connection pointer and instance bit; extended
+`user_ctx` carries the stable state so stale records are rejected before the
+connection pointer is dereferenced.
+
+The adapter exposes `add_conn`/`del_conn` and deliberately omits
+`NGX_USE_EPOLL_EVENT`, causing accepted and outbound sockets to use the
+connection-wide lifecycle. On delivery it transfers READ and WRITE ownership
+to nginx. A direct handler can rearm after it returns and clears `ready`; a
+posted handler is rechecked at the next `process_events` entry. The accept
+handler participates because it clears its own `ready` bit after draining.
+`wepoll_edge_post_events on` forces the delayed posted path for qualification.
+`del_conn` performs DEL-before-close, and worker exit logs delivery/rearm
+counters.
+
+Level-triggered operation remains the default. The edge mode does not add
+native file AIO, nginx thread notification, local-shutdown interposition, or a
+native epoll descriptor. Those remain separate from the socket handler contract.
+
 ## Local shutdown bridge
 
 The exact nginx 1.31.3 platform headers define `ngx_shutdown_socket` as the
@@ -104,7 +132,7 @@ file-AIO eventfd is coupled to `io_setup`, `io_submit`, and `io_getevents` and
 therefore needs a separate Windows file-I/O completion design. A tagged wake
 does not manufacture file-AIO completion records.
 
-## nginx changes still required
+## Changes required by a direct native-module port
 
 Using this facility is more than changing `epoll_create`, `epoll_ctl`, and
 `epoll_wait` names:
@@ -135,9 +163,11 @@ failed wepoll-ex control operation into nginx logging without guessing whether
 the normalized errno originated as Win32, Winsock, or NTSTATUS.
 
 Those changes can be localized around nginx's event lifecycle, but they are
-semantic changes rather than symbol aliases.  The checked-in
-`ngx_wepoll_module.c` therefore remains level-triggered until a separate
-edge-driven nginx experiment implements this handler-completion contract.
+semantic changes rather than symbol aliases. The checked-in adapter now
+implements items 1 through 5 for its own socket lifecycle and validates direct
+and posted handlers. It does not transform the native Linux module, interpose
+the shutdown macro, enable notify/file AIO, or make virtual epfds native
+descriptors.
 
 ## Performance expectation and qualification
 
@@ -149,12 +179,14 @@ is possible when a handler rearms one direction while another direction has a
 narrow pending request, and established TCP delivery may still use the
 current-level `WSAPoll` qualification needed for FIN/reset races.
 
-An nginx port is not qualified until it covers accept draining, HTTP
-keep-alive, TLS, upstream proxying, read/write backpressure, graceful FIN,
-abortive reset, write half-close, posted events, reload, graceful quit,
-multiple workers, and third-party close paths.  Level-triggered,
-observed-edge, and explicit-rearm builds must be measured separately with the
-wepoll-ex probe, wake, and lifecycle diagnostics recorded.
+The checked-in adapter has now covered accept draining, HTTP keep-alive, TLS,
+upstream proxying, read/write backpressure, graceful FIN, abortive reset,
+direct client write-half-close, posted events, reload, graceful worker exit,
+and multiple workers in bounded loopback tests. Proxied client write-half-close
+failed identically in level and edge modes and remains a stock Win32 nginx
+baseline rather than an edge-specific pass. Arbitrary third-party close paths
+still require an audit, and level versus explicit-rearm throughput must be
+measured separately with probe, wake, and lifecycle diagnostics recorded.
 
 The broader nginx/libuv/Mio/Asio comparison and the reasons for not treating
 native completion facilities as epoll flags are recorded in

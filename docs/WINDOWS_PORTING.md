@@ -141,9 +141,10 @@ reports the creation mode and class-rearm operations unsupported.
 
 This facility makes Mio-style `WouldBlock` ownership and an nginx-style
 handler-completion experiment expressible. It does not automatically discover
-that a handler drained a socket. Posted handlers, TLS layers, proxy chains, and
-third-party modules must place acknowledgement at their real operation
-boundary.
+that a handler drained a socket. The checked-in nginx adapter now places the
+acknowledgement after direct or posted handlers clear `ready`, and has exercised
+TLS and proxy chains; other embedders and third-party modules must still place
+acknowledgement at their real operation boundary.
 
 ## Virtual epfd aliases
 

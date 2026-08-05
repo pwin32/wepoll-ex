@@ -12,6 +12,7 @@ import os
 import random
 import shlex
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -32,6 +33,7 @@ PROFILES = {
         "slow": 3,
         "resets": 6,
         "half_close": 3,
+        "backpressure": 0,
         "workers": 8,
         "pause_ms": 50,
     },
@@ -43,6 +45,7 @@ PROFILES = {
         "slow": 12,
         "resets": 24,
         "half_close": 12,
+        "backpressure": 0,
         "workers": 16,
         "pause_ms": 100,
     },
@@ -54,6 +57,7 @@ PROFILES = {
         "slow": 24,
         "resets": 64,
         "half_close": 24,
+        "backpressure": 0,
         "workers": 32,
         "pause_ms": 250,
     },
@@ -62,6 +66,7 @@ PROFILES = {
 
 @dataclasses.dataclass(frozen=True)
 class Target:
+    scheme: str
     host: str
     port: int
     request_target: str
@@ -79,9 +84,13 @@ class Config:
     slow: int
     resets: int
     half_close: int
+    backpressure: int
     workers: int
     timeout: float
     slow_delay_ms: float
+    backpressure_pause_ms: float
+    backpressure_receive_buffer: int
+    backpressure_min_body_bytes: int
     pause_ms: int
     max_body_bytes: int
     accepted_statuses: Set[int]
@@ -89,6 +98,8 @@ class Config:
     reload_every: int
     reload_timeout: float
     reload_grace: float
+    reload_settle: float
+    ssl_context: Optional[ssl.SSLContext]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -158,8 +169,9 @@ def parse_statuses(specification: str) -> Set[int]:
 
 def parse_target(url: str) -> Target:
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme.lower() != "http":
-        raise argparse.ArgumentTypeError("only plain http:// endpoints are supported")
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise argparse.ArgumentTypeError("only http:// and https:// endpoints are supported")
     if parsed.username is not None or parsed.password is not None:
         raise argparse.ArgumentTypeError("URL user information is unsupported")
     if parsed.fragment:
@@ -167,7 +179,8 @@ def parse_target(url: str) -> Target:
     if parsed.hostname is None:
         raise argparse.ArgumentTypeError("URL must include a host")
     try:
-        port = parsed.port or 80
+        default_port = 443 if scheme == "https" else 80
+        port = parsed.port or default_port
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
     request_target = parsed.path or "/"
@@ -176,18 +189,26 @@ def parse_target(url: str) -> Target:
     display_host = parsed.hostname
     if ":" in display_host and not display_host.startswith("["):
         display_host = "[" + display_host + "]"
-    host_header = display_host if port == 80 else f"{display_host}:{port}"
-    return Target(parsed.hostname, port, request_target, host_header)
+    host_header = (
+        display_host if port == default_port else f"{display_host}:{port}"
+    )
+    return Target(scheme, parsed.hostname, port, request_target, host_header)
 
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Exercise normal, persistent, slow, reset, and half-close HTTP "
-            "client behavior against an already-running nginx endpoint."
+            "client behavior plus opt-in response backpressure against an "
+            "already-running nginx endpoint."
         )
     )
-    parser.add_argument("url", type=parse_target, help="plain HTTP endpoint URL")
+    parser.add_argument("url", type=parse_target, help="HTTP or HTTPS endpoint URL")
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="disable HTTPS certificate and hostname verification",
+    )
     profile = parser.add_mutually_exclusive_group()
     profile.add_argument("--long", action="store_true",
                          help="bounded extended qualification profile")
@@ -202,9 +223,16 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slow-per-batch", type=nonnegative_int)
     parser.add_argument("--resets-per-batch", type=nonnegative_int)
     parser.add_argument("--half-close-per-batch", type=nonnegative_int)
+    parser.add_argument("--backpressure-per-batch", type=nonnegative_int)
     parser.add_argument("--workers", type=positive_int)
     parser.add_argument("--timeout", type=positive_float, default=5.0)
     parser.add_argument("--slow-delay-ms", type=nonnegative_float, default=5.0)
+    parser.add_argument("--backpressure-pause-ms", type=nonnegative_float,
+                        default=250.0)
+    parser.add_argument("--backpressure-receive-buffer", type=positive_int,
+                        default=4096)
+    parser.add_argument("--backpressure-min-body-bytes", type=positive_int,
+                        default=1)
     parser.add_argument("--pause-ms", type=nonnegative_int)
     parser.add_argument("--max-body-bytes", type=positive_int,
                         default=1024 * 1024)
@@ -225,6 +253,15 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reload-every", type=positive_int, default=1)
     parser.add_argument("--reload-timeout", type=positive_float, default=15.0)
     parser.add_argument("--reload-grace", type=positive_float, default=10.0)
+    parser.add_argument(
+        "--reload-settle",
+        type=nonnegative_float,
+        default=0.0,
+        help=(
+            "seconds to wait after signaling reload before the health check; "
+            "stock Win32 nginx may need at least 0.5 seconds"
+        ),
+    )
     return parser
 
 
@@ -253,6 +290,15 @@ def config_from_arguments(arguments: argparse.Namespace) -> Config:
     )
     profile = PROFILES[profile_name]
 
+    if arguments.insecure and arguments.url.scheme != "https":
+        raise EnduranceError("--insecure requires an https:// endpoint")
+    ssl_context: Optional[ssl.SSLContext] = None
+    if arguments.url.scheme == "https":
+        ssl_context = ssl.create_default_context()
+        if arguments.insecure:
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+
     def selected(name: str, argument_name: str) -> int:
         value = getattr(arguments, argument_name)
         return profile[name] if value is None else value
@@ -271,9 +317,13 @@ def config_from_arguments(arguments: argparse.Namespace) -> Config:
         slow=selected("slow", "slow_per_batch"),
         resets=selected("resets", "resets_per_batch"),
         half_close=selected("half_close", "half_close_per_batch"),
+        backpressure=selected("backpressure", "backpressure_per_batch"),
         workers=selected("workers", "workers"),
         timeout=arguments.timeout,
         slow_delay_ms=arguments.slow_delay_ms,
+        backpressure_pause_ms=arguments.backpressure_pause_ms,
+        backpressure_receive_buffer=arguments.backpressure_receive_buffer,
+        backpressure_min_body_bytes=arguments.backpressure_min_body_bytes,
         pause_ms=selected("pause_ms", "pause_ms"),
         max_body_bytes=arguments.max_body_bytes,
         accepted_statuses=arguments.expect_status,
@@ -281,6 +331,8 @@ def config_from_arguments(arguments: argparse.Namespace) -> Config:
         reload_every=arguments.reload_every,
         reload_timeout=arguments.reload_timeout,
         reload_grace=arguments.reload_grace,
+        reload_settle=arguments.reload_settle,
+        ssl_context=ssl_context,
     )
 
 
@@ -294,8 +346,43 @@ def request_headers(config: Config, request_id: str,
     }
 
 
+def make_http_connection(config: Config) -> http.client.HTTPConnection:
+    if config.target.scheme == "https":
+        assert config.ssl_context is not None
+        return http.client.HTTPSConnection(
+            config.target.host,
+            config.target.port,
+            timeout=config.timeout,
+            context=config.ssl_context,
+        )
+    return http.client.HTTPConnection(
+        config.target.host, config.target.port, timeout=config.timeout
+    )
+
+
+def open_raw_connection(config: Config,
+                        receive_buffer: Optional[int] = None) -> socket.socket:
+    client = socket.create_connection(
+        (config.target.host, config.target.port), timeout=config.timeout
+    )
+    client.settimeout(config.timeout)
+    if receive_buffer is not None:
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+    if config.target.scheme == "https":
+        assert config.ssl_context is not None
+        try:
+            client = config.ssl_context.wrap_socket(
+                client, server_hostname=config.target.host
+            )
+        except Exception:
+            client.close()
+            raise
+        client.settimeout(config.timeout)
+    return client
+
+
 def validate_response(config: Config, response: http.client.HTTPResponse,
-                      request_id: str) -> None:
+                      request_id: str) -> int:
     if response.status not in config.accepted_statuses:
         raise EnduranceError(
             f"{request_id}: unexpected HTTP status {response.status}"
@@ -318,12 +405,11 @@ def validate_response(config: Config, response: http.client.HTTPResponse,
         raise EnduranceError(
             f"{request_id}: body exceeds {config.max_body_bytes} bytes"
         )
+    return len(body)
 
 
 def normal_request(config: Config, request_id: str) -> Outcome:
-    connection = http.client.HTTPConnection(
-        config.target.host, config.target.port, timeout=config.timeout
-    )
+    connection = make_http_connection(config)
     try:
         connection.request(
             "GET",
@@ -339,9 +425,7 @@ def normal_request(config: Config, request_id: str) -> Outcome:
 
 
 def keepalive_requests(config: Config, request_id: str) -> Outcome:
-    connection = http.client.HTTPConnection(
-        config.target.host, config.target.port, timeout=config.timeout
-    )
+    connection = make_http_connection(config)
     original_fileno: Optional[int] = None
     try:
         for index in range(config.keepalive_requests):
@@ -381,11 +465,11 @@ def raw_request(config: Config, request_id: str,
 
 
 def read_raw_response(config: Config, client: socket.socket,
-                      request_id: str) -> None:
+                      request_id: str) -> int:
     response = http.client.HTTPResponse(client)
     try:
         response.begin()
-        validate_response(config, response, request_id)
+        return validate_response(config, response, request_id)
     finally:
         response.close()
 
@@ -393,10 +477,7 @@ def read_raw_response(config: Config, client: socket.socket,
 def slow_request(config: Config, request_id: str, seed: int) -> Outcome:
     rng = random.Random(seed)
     payload = raw_request(config, request_id)
-    client = socket.create_connection(
-        (config.target.host, config.target.port), timeout=config.timeout
-    )
-    client.settimeout(config.timeout)
+    client = open_raw_connection(config)
     try:
         offset = 0
         while offset < len(payload):
@@ -432,10 +513,7 @@ def reset_request(config: Config, request_id: str, seed: int) -> Outcome:
     payload = raw_request(config, request_id)
     maximum = max(1, len(payload) - 4)
     prefix_length = rng.randint(1, maximum)
-    client = socket.create_connection(
-        (config.target.host, config.target.port), timeout=config.timeout
-    )
-    client.settimeout(config.timeout)
+    client = open_raw_connection(config)
     try:
         client.sendall(payload[:prefix_length])
         set_abortive_close(client)
@@ -446,17 +524,38 @@ def reset_request(config: Config, request_id: str, seed: int) -> Outcome:
 
 def half_close_request(config: Config, request_id: str) -> Outcome:
     payload = raw_request(config, request_id)
-    client = socket.create_connection(
-        (config.target.host, config.target.port), timeout=config.timeout
-    )
-    client.settimeout(config.timeout)
+    client = open_raw_connection(config)
     try:
         client.sendall(payload)
-        client.shutdown(socket.SHUT_WR)
+        if config.target.scheme == "https":
+            socket.socket.shutdown(client, socket.SHUT_WR)
+        else:
+            client.shutdown(socket.SHUT_WR)
         read_raw_response(config, client, request_id)
     finally:
         client.close()
     return Outcome("half_close", 1)
+
+
+def backpressure_request(config: Config, request_id: str) -> Outcome:
+    payload = raw_request(config, request_id)
+    client = open_raw_connection(
+        config, receive_buffer=config.backpressure_receive_buffer
+    )
+    try:
+        client.sendall(payload)
+        if config.backpressure_pause_ms:
+            time.sleep(config.backpressure_pause_ms / 1000.0)
+        body_bytes = read_raw_response(config, client, request_id)
+        if body_bytes < config.backpressure_min_body_bytes:
+            raise EnduranceError(
+                f"{request_id}: response body {body_bytes} bytes is below "
+                f"the backpressure minimum "
+                f"{config.backpressure_min_body_bytes}"
+            )
+    finally:
+        client.close()
+    return Outcome("backpressure", 1)
 
 
 def execute_task(config: Config, batch: int, task: Task) -> Outcome:
@@ -471,6 +570,8 @@ def execute_task(config: Config, batch: int, task: Task) -> Outcome:
         return reset_request(config, request_id, task.seed)
     if task.kind == "half_close":
         return half_close_request(config, request_id)
+    if task.kind == "backpressure":
+        return backpressure_request(config, request_id)
     raise AssertionError(f"unknown task kind {task.kind}")
 
 
@@ -481,6 +582,7 @@ def make_tasks(config: Config, rng: random.Random) -> List[Task]:
         ("slow", config.slow),
         ("reset", config.resets),
         ("half_close", config.half_close),
+        ("backpressure", config.backpressure),
     )
     tasks: List[Task] = []
     index = 0
@@ -501,6 +603,7 @@ def run_batch(config: Config, batch: int,
         "slow": 0,
         "reset": 0,
         "half_close": 0,
+        "backpressure": 0,
     }
     failures: List[str] = []
     with concurrent.futures.ThreadPoolExecutor(
@@ -546,6 +649,8 @@ def invoke_reload(config: Config) -> None:
             f"reload exited {completed.returncode}; "
             f"stdout={stdout!r}; stderr={stderr!r}"
         )
+    if config.reload_settle:
+        time.sleep(config.reload_settle)
 
 
 def wait_for_health(config: Config, reload_index: int) -> int:
@@ -579,6 +684,7 @@ def run(config: Config) -> int:
         "slow": 0,
         "reset": 0,
         "half_close": 0,
+        "backpressure": 0,
     }
     all_failures: List[str] = []
     reloads = 0
@@ -632,7 +738,7 @@ def run(config: Config) -> int:
         "result": "pass" if not all_failures else "fail",
         "seed": f"0x{config.seed:016x}",
         "url": (
-            f"http://{config.target.host_header}"
+            f"{config.target.scheme}://{config.target.host_header}"
             f"{config.target.request_target}"
         ),
         "batches": config.batches,

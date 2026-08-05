@@ -23,7 +23,7 @@ Windows IOCP/AFD implementations that are more integrated than an epoll shim.
 
 | Source | Native pattern | Useful wepoll-ex mapping | Remaining boundary |
 | --- | --- | --- | --- |
-| nginx 1.31.3 | Duplex socket ET, eventfd notify/AIO, pointer plus instance bit | Explicit readiness-class rearm; tagged wake for control notify; close/shutdown helpers | Handler-completion rearm, file AIO, multi-process exclusive behavior |
+| nginx 1.31.3 | Duplex socket ET, eventfd notify/AIO, pointer plus instance bit | Qualified adapter-level readiness-class rearm; tagged wake for control notify; close/shutdown helpers | Direct native-module changes, file AIO, multi-process exclusive behavior |
 | libuv 1.52.1 | Linux LT epoll with queued changes; native Windows IOCP/AFD | Tagged wake for an epoll-shaped experiment; existing LT semantics | Replacing libuv's Windows backend would lose native completion integration |
 | Mio 1.2.2 | Unix ET plus eventfd; Windows AFD disarm/rearm plus tagged IOCP wake | Explicit class rearm closely matches `WouldBlock` ownership; tagged wake matches its Waker; virtual aliases match selector cloning | Named-pipe IOCP is separate; the alias is not a native descriptor |
 | Boost.Asio 1.38.2 | Socket ET, dynamic write MOD, persistent eventfd interrupter | Observed ET works; explicit rearm can avoid writable resampling; tagged wake replaces the interrupter side channel | Handler changes, timer/file completion integration |
@@ -56,6 +56,13 @@ The reusable structure is the connection registration and stale-instance
 dispatch. The non-portable parts are ET ownership, eventfd/file-AIO setup,
 native epoll descriptor lifetime, and cross-process `EPOLLEXCLUSIVE` behavior.
 The detailed port contract is in `NGINX_NATIVE_EPOLL_PORT.md`.
+
+The checked-in adapter now validates one concrete ET ownership mapping. It uses
+a fixed duplex registration on an explicit-rearm port, stores stable state in
+extended event context, and acknowledges READ/WRITE after direct or posted
+nginx handlers clear `ready`. That closes the adapter-level handler-completion
+gap for the tested built-in paths; it does not make the native Linux module a
+symbol-only Windows port or supply its eventfd/file-AIO facilities.
 
 ## libuv 1.52.1
 
@@ -157,10 +164,11 @@ These are candidates, not promises:
   IOCP operation dispatch as explicit integration layers rather than pretending
   they are socket epoll readiness.
 
-The highest-value next step is an end-to-end explicit-rearm nginx experiment,
-not another unconditional epoll flag. It must qualify accept, posted events,
-TLS, proxy backpressure, FIN/reset, reload, graceful quit, and every close path
-before performance comparisons are meaningful.
+The end-to-end explicit-rearm nginx experiment now covers accept, posted
+events, TLS, proxy backpressure, FIN/reset, reload, graceful worker exit, and
+the stock built-in close paths exercised by those workloads. The next useful
+steps are a third-party close-path audit and controlled level-versus-edge
+measurements, not another unconditional epoll flag.
 
 The resulting source-porting surface and the remaining non-drop-in descriptor
 boundaries are summarized in `WINDOWS_PORTING.md`.

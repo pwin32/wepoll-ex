@@ -7,11 +7,14 @@
  *
  *     ./configure --crossbuild=win32 --add-module=path/to/wepoll-ex/nginx
  *
- * and select it explicitly with `events { use wepoll; }`.  The module uses
- * nginx's level-triggered action contract; EPOLLET is intentionally not used.
+ * and select it explicitly with `events { use wepoll; }`.  Level-triggered
+ * operation remains the default.  `wepoll_edge on` opts into the separately
+ * qualified explicit-rearm EPOLLET contract, and
+ * `wepoll_edge_post_events on` forces posted dispatch for qualification.
  *
- * Event data stores nginx's connection pointer plus its instance bit, matching
- * the stale-event guard used by nginx's native event modules.
+ * Event data stores nginx's connection pointer plus its instance bit.  Edge
+ * mode additionally stores stable per-connection adapter state in user_ctx so
+ * queued records can be rejected before a recycled connection is dereferenced.
  */
 #ifndef NGX_WEPOLL_MODULE_H_
 #define NGX_WEPOLL_MODULE_H_

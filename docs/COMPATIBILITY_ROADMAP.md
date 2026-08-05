@@ -46,11 +46,12 @@ next generation. The base mode and stronger combination are reported by
 `WEPOLL_EX_CAP_EXPLICIT_REARM_ONESHOT`.
 
 Library regressions cover duplex independence, incomplete drains, pending AFD
-mask expansion, terminal idling, MOD reset, and DEL. The remaining work is the
-nginx handler integration itself: rearm must occur after the real accept,
-read, or write handler drains, including after `NGX_POST_EVENTS` dispatch.
-Until those nginx regressions exist, the checked-in adapter remains
-level-triggered. See `docs/NGINX_NATIVE_EPOLL_PORT.md`.
+mask expansion, terminal idling, MOD reset, and DEL. The checked-in nginx
+adapter now adds the handler integration: direct handlers rearm after returning,
+posted handlers are acknowledged on the next event-loop entry, accept draining
+uses the accept event's cleared `ready` bit, and stable per-connection context
+rejects stale records. Level mode remains the default; explicit rearm is
+selected with `wepoll_edge on`. See `docs/NGINX_NATIVE_EPOLL_PORT.md`.
 
 ### Wait notification
 
@@ -182,9 +183,11 @@ reported cleanly rather than being treated as a portable guarantee.
 
 ## Required nginx qualification
 
-An edge-driven nginx experiment is not complete until it covers accepting,
-HTTP keep-alive, TLS, upstream proxying, read and write backpressure, graceful
-FIN, abortive reset, client write-half-close, reload, graceful quit, multiple
-workers, and relevant third-party close paths. Level-triggered, observed-edge,
-and explicit-rearm variants must be benchmarked separately with the probe and
-wake counters recorded.
+The built-in nginx experiment now covers accepting, HTTP keep-alive, TLS,
+upstream proxying, read and write backpressure, graceful FIN, abortive reset,
+direct client write-half-close, posted dispatch, reload, graceful worker exit,
+and multiple workers. Proxied client write-half-close is an identified stock
+Win32 nginx baseline because it fails in both level and edge modes. Remaining
+release gates are an audit of relevant third-party close paths and separate
+level/explicit-rearm performance measurements with probe, wake, and lifecycle
+counters recorded.

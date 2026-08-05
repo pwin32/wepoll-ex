@@ -28,8 +28,8 @@ capability is reported as `WEPOLL_EX_CAP_EXPLICIT_EDGE_REARM`; POSIX reports
 the extension unsupported. ET with ONESHOT/EXCLUSIVE and non-socket ET remain
 outside the initial mode, which also requires DEL-before-closesocket(). The
 native nginx 1.31.3 module still needs read/write acknowledgements after the
-actual handler, including posted-event dispatch, so the checked-in adapter
-remains level-triggered.
+actual handler, including posted-event dispatch; at that stage the checked-in
+adapter remained level-triggered.
 
 The exact nginx 1.31.3, libuv 1.52.1, Mio 1.2.2, and Boost.Asio 1.38.2 source
 archives were then audited for event-loop assumptions. The common control-path
@@ -77,6 +77,28 @@ Direct `shutdown()` and independent epoll ports remain unobserved, and Winsock
 `recv()` after `SD_RECEIVE` still returns `WSAESHUTDOWN` rather than Linux EOF.
 DEL/re-ADD starts a fresh registration without the earlier recorded state.
 POSIX validates the epfd and delegates to native `shutdown()`.
+
+The later August 5 nginx slice adds an opt-in explicit-rearm edge mode while
+keeping the adapter level-triggered by default. `wepoll_edge on` creates an
+explicit-rearm port and maintains a fixed duplex ET registration for each
+connection. Stable per-connection context validates queued records before a
+recycled connection is dereferenced. READ and WRITE are acknowledged only
+after direct handlers return or posted handlers leave the queue and nginx
+clears `ready`; accept draining follows the same rule. `del_conn` enforces
+DEL-before-close, and worker exit records delivery/rearm counters.
+`wepoll_edge_post_events on` forces the delayed posted path for qualification.
+
+The nginx endurance client now supports HTTP and HTTPS, self-signed test
+endpoints through `--insecure`, delayed small-window response consumption, body
+size assertions, and an explicit post-reload settle interval. A strict
+synchronized nginx 1.31.3 build with MinGW GCC 16.1.0 and OpenSSL 3.6.3 passed
+direct and forced-posted HTTP/TLS traffic, 8 MiB static and proxy backpressure,
+abortive reset, direct write-half-close, two workers, repeated reload, and
+graceful worker cleanup. Nonzero READ/WRITE rearm counters prove the explicit
+ownership path ran. Proxied client write-half-close failed identically in level
+and edge modes and is retained as a stock Win32 nginx baseline. Arbitrary
+third-party close paths, native file AIO/notify, local-shutdown interposition,
+and controlled throughput comparisons remain outside this qualification.
 
 Qualification for this slice used Windows 10.0.19044.1826 with MSYS2 MinGW
 GCC 16.1.0 and Release `-O2 -Wall -Wextra -Wpedantic -Werror` builds. The
