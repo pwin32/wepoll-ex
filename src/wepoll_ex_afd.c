@@ -763,6 +763,12 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
 #endif
 
     AFD_POLL_INFO *info = sock->afd_info;
+    /* The buffer is reused across re-arms, and an immediately satisfied poll
+     * returns STATUS_SUCCESS while writing only Handles[0].Events: it leaves
+     * Handles[0].Status holding whatever the previous request left there.
+     * Since a negative status is translated into EPOLLERR, the stale value
+     * must be cleared before every submission or an immediate-ready socket
+     * would report a spurious error. */
     memset(info, 0, sizeof(*info));
     info->Timeout.QuadPart  = INT64_MAX;
     info->NumberOfHandles   = 1;
@@ -785,7 +791,11 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
     }
     info->Handles[0].Handle = sock->afd_poll_target;
 
-    memset(&sock->io_status_block, 0, sizeof(sock->io_status_block));
+    /* Only Status is ever consumed from this block: the IOCP dispatcher
+     * recovers the registration from the embedded address and reads Status,
+     * and Information is never inspected on the poll path.  Publishing
+     * STATUS_PENDING is therefore sufficient, and zeroing the whole block on
+     * every submission would be dead work. */
     sock->io_status_block.Status = STATUS_PENDING;
 
     /* Publish PENDING before entering the kernel: an immediately satisfied
