@@ -120,6 +120,9 @@ the nginx-embedded source build independent of a generated CMake header.
    skips stale generations. Lock acquisition is included in finite timeouts,
    and an early `WAIT_TIMEOUT` is retried against the absolute deadline. A
    zero-timeout call returns immediately if another waiter owns the drain.
+   One drain pass holds `fd_table_lock` across the whole batch rather than
+   reacquiring it per delivered node, so a large ready set does not hand the
+   lock back to concurrent control operations between every event.
    A delivered LT registration is rearmed only after its ready node is
    consumed, which places it behind already queued peers and rotates a ready
    set larger than `maxevents` across successive waits. ET observation state
@@ -410,6 +413,18 @@ temporary fallback signal mask before unwinding.
   fail in both modes. Normal pre-connect registrations adopt a new token only
   after an AFD completion proves continuity; the covered MOD-before-connect
   path preserves that evidence.
+- The endpoint-token query is a kernel round trip, so hardened modes memoize
+  one verdict per registration per serialized wait generation. Delivery and
+  re-arm both consult that memo, which turns a socket producing several ready
+  snapshots inside one `epoll_wait` into a single query instead of one per
+  delivered event. Retirement removes a replaced registration from the fd
+  table before any later drain observes it, so the memo cannot outlive the
+  identity it describes. Transient `EP_IDENTITY_ERROR` results are never
+  memoized because they carry an errno the caller must re-derive, and the
+  memo is confined to the wait epoch: a new wait re-queries. Hardened
+  submissions additionally cache the provider base handle against the token
+  that validated it, so a re-arm skips the `SIO_BASE_HANDLE` traversal and its
+  layered-provider fallbacks while any token change forces a fresh walk.
 - Synchronized lifetime mode is an explicit performance contract for embedders
   that guarantee `EPOLL_CTL_DEL` before every native socket close. Windows DEL
   removes public registration even when cancellation fails; storage remains

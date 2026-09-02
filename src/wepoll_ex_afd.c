@@ -407,6 +407,7 @@ int ep_afd_open(HANDLE iocp, HANDLE *out)
 #    define SIO_QUERY_WFP_ALE_ENDPOINT_HANDLE 0x580000CD
 #  endif
 
+
 static SOCKET ep_socket_ioctl_handle(SOCKET socket, DWORD ioctl,
                                      int *error_out, void *context)
 {
@@ -735,10 +736,30 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
     }
 #else
     /* Hardened builds revalidate the provider chain before every request so
-     * native close/reuse cannot attach an old base handle to a new socket. */
-    sock->base_socket = ep_socket_get_base(sock->fd);
-    if (sock->base_socket == INVALID_SOCKET)
-        return -1;
+     * native close/reuse cannot attach an old base handle to a new socket.
+     * When the caller has already confirmed the endpoint identity for this
+     * exact registration and the previous traversal was recorded against that
+     * same token, the chain cannot have been re-pointed underneath us, so the
+     * cached base handle is reused instead of walking SIO_BASE_HANDLE and its
+     * LSP fallbacks again. */
+    if (sock->base_socket_cached &&
+        sock->endpoint_id_state != EP_SOCKET_ID_UNAVAILABLE &&
+        sock->base_socket_identity == sock->endpoint_id &&
+        sock->base_socket != INVALID_SOCKET) {
+        /* cached traversal is still valid for this endpoint token */
+    } else {
+        sock->base_socket = ep_socket_get_base(sock->fd);
+        if (sock->base_socket == INVALID_SOCKET) {
+            sock->base_socket_cached = 0;
+            return -1;
+        }
+        if (sock->endpoint_id_state != EP_SOCKET_ID_UNAVAILABLE) {
+            sock->base_socket_identity = sock->endpoint_id;
+            sock->base_socket_cached = 1;
+        } else {
+            sock->base_socket_cached = 0;
+        }
+    }
 #endif
 
     AFD_POLL_INFO *info = sock->afd_info;

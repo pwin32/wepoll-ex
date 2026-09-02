@@ -419,6 +419,22 @@ struct ep_sock {
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     uint64_t endpoint_id;
     uint8_t endpoint_id_state;
+    /* Memoized delivery-path identity verdict.  The endpoint-token query is a
+     * kernel round-trip (~1.4us) and a hot socket can deliver several ready
+     * snapshots inside one epoll_wait.  Numeric-handle reuse requires a
+     * closesocket() plus a fresh socket(); a registration that stays live
+     * across one serialized wait generation cannot have been replaced without
+     * also retiring this node, so one verdict per registration per wait epoch
+     * is sufficient.  Zero means no memo; wait epochs never reuse zero. */
+    uint64_t identity_checked_epoch;
+    int8_t identity_checked_result; /* ep_identity_check_t */
+    /* Provider base handle cached alongside the endpoint token that proved
+     * this registration still names the original kernel socket.  A submission
+     * whose identity was just validated can reuse the traversal result instead
+     * of repeating SIO_BASE_HANDLE (and its LSP fallback chain) on every
+     * re-arm.  Any identity failure or retirement invalidates it. */
+    uint64_t base_socket_identity;
+    uint8_t base_socket_cached;
 #endif
 
     /* User-supplied event mask + data + per-fd context. */

@@ -858,5 +858,18 @@ indistinguishable on that narrow fallback.
 Performance measurements are local loopback observations, not portable
 throughput guarantees.
 
+Hardened Windows delivery no longer repeats the endpoint-token identity query
+once per delivered event. Each registration is validated once per serialized
+wait generation and both delivery and re-arm share that verdict, while a
+transient identity error stays unmemoized and every new wait re-queries.
+Submissions also reuse the provider base handle that the validating token
+covered instead of repeating the `SIO_BASE_HANDLE` traversal on every re-arm,
+and one drain pass holds `fd_table_lock` across its whole batch. On a noisy
+shared workstation, interleaved A/B runs measured roughly 8-13% lower
+`ready_batch` and `oneshot_roundtrip` latency with an instrumented endpoint
+ioctl rate halved from 2.0 to 1.0 per delivered event; single-operation
+control paths were unchanged within run-to-run noise. Synchronized lifetime
+mode already skipped these queries and is unaffected.
+
 See `README.md`, `docs/DESIGN.md`, and `docs/NGINX_INTEGRATION.md` for current
 contracts and integration constraints.

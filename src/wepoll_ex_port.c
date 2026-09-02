@@ -3142,6 +3142,39 @@ static uint32_t ep_sock_afd_events_locked(ep_sock_t *sock,
             ? sock->explicit_disarmed_classes : 0);
 }
 
+#ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
+static ep_identity_check_t ep_sock_validate_identity_locked(
+    ep_sock_t *sock, int allow_transition);
+
+/* Delivery-path identity check memoized per serialized wait generation.
+ * ep_sock_validate_identity_locked() issues an endpoint-token kernel query
+ * (~1.4us).  Draining several ready snapshots for the same registration inside
+ * one epoll_wait would otherwise repeat it once per delivered event.  The
+ * caller holds fd_table_lock, and a retired/replaced registration is removed
+ * from the fd table before any later drain observes it, so caching one verdict
+ * per (registration, wait epoch) preserves the reuse-detection guarantee.
+ * Only definitive verdicts are memoized; EP_IDENTITY_ERROR is transient and
+ * carries an errno the caller must re-derive. */
+static ep_identity_check_t ep_sock_validate_identity_for_delivery_locked(
+    ep_port_t *port, ep_sock_t *sock)
+{
+    uint64_t epoch = atomic_load_explicit(&port->active_wait_epoch,
+                                          memory_order_acquire);
+    ep_identity_check_t result;
+
+    if (epoch != 0 && sock->identity_checked_epoch == epoch) {
+        return (ep_identity_check_t)sock->identity_checked_result;
+    }
+
+    result = ep_sock_validate_identity_locked(sock, 0);
+    if (epoch != 0 && result != EP_IDENTITY_ERROR) {
+        sock->identity_checked_epoch = epoch;
+        sock->identity_checked_result = (int8_t)result;
+    }
+    return result;
+}
+#endif
+
 #ifdef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 #define EP_SOCK_SUBMIT_LOCKED(sock, identity_validated) \
     ep_sock_submit_locked((sock), NULL)
@@ -3226,7 +3259,8 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated,
 
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
     if (!identity_validated) {
-        identity_check = ep_sock_validate_identity_locked(sock, 0);
+        identity_check =
+            ep_sock_validate_identity_for_delivery_locked(port, sock);
         if (identity_check == EP_IDENTITY_ERROR) {
             return -1;
         }
@@ -5757,7 +5791,14 @@ static int ep_drain_to_buffer(ep_port_t *port,
                               int basic_events)
 {
     int delivered = 0;
+    int lock_held = 0;
 
+    /* fd_table_lock is taken once for the whole drain rather than once per
+     * ready node.  Every node in a batch performs the same table lookup and
+     * per-registration state update, so a single critical section removes
+     * O(maxevents) lock round-trips and, more importantly, stops handing the
+     * lock back to concurrent control operations between each delivered
+     * event.  The lock is released before returning. */
     while (delivered < maxevents) {
         ep_ready_node_t *node = ep_ready_drain(&port->ready_queue, 1);
         if (node == NULL) {
@@ -5765,14 +5806,17 @@ static int ep_drain_to_buffer(ep_port_t *port,
         }
 
         int valid = 0;
-        pthread_mutex_lock(&port->fd_table_lock);
+        if (!lock_held) {
+            pthread_mutex_lock(&port->fd_table_lock);
+            lock_held = 1;
+        }
         ep_sock_t *sock = ep_fd_table_lookup(port, node->fd);
         if (sock != NULL && sock->generation == node->sock_generation &&
             !atomic_load_explicit(&sock->delete_pending,
                                   memory_order_relaxed)) {
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
             ep_identity_check_t identity_check =
-                ep_sock_validate_identity_locked(sock, 0);
+                ep_sock_validate_identity_for_delivery_locked(port, sock);
 
             if (identity_check == EP_IDENTITY_STALE ||
                 identity_check == EP_IDENTITY_CLOSED) {
@@ -5871,7 +5915,6 @@ static int ep_drain_to_buffer(ep_port_t *port,
         } else {
             port->stale_events_dropped++;
         }
-        pthread_mutex_unlock(&port->fd_table_lock);
 
         if (valid) {
             if (basic_events) {
@@ -5891,6 +5934,9 @@ static int ep_drain_to_buffer(ep_port_t *port,
             delivered++;
         }
         ep_ready_node_free(port, node);
+    }
+    if (lock_held) {
+        pthread_mutex_unlock(&port->fd_table_lock);
     }
     return delivered;
 }
