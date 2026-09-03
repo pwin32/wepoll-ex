@@ -9,9 +9,20 @@
  * latency distribution, which is what any change to the drain's lock scope
  * would have to move.
  *
- * Read the A/A caveat before trusting a delta: run this against one
- * unmodified binary twice and compare, because the ctl_mod percentiles have a
- * large run-to-run spread on a shared machine.  Balance A/B orderings.
+ * Two measured caveats, both learned the hard way:
+ *
+ * 1. Run an A/A comparison first.  One unmodified binary against itself has
+ *    been observed varying by more than 40% at ctl_mod p50 across runs, so
+ *    balance A/B orderings and treat anything smaller as noise.
+ *
+ * 2. Per-operation numbers are NOT comparable to each other.  The churn loop
+ *    issues ADD, MOD and DEL back to back on the same socket; whichever
+ *    operation follows the ADD absorbs the queueing delay behind the wait
+ *    thread's in-progress drain, and the timestamps attribute that stall to
+ *    it.  Swapping MOD and DEL in the sequence moves the cost with the
+ *    position, not with the operation: DEL measured ~3900 ns in the third
+ *    slot and ~73000 ns in the second.  Compare each operation only against
+ *    the same operation in the same slot of an otherwise identical build.
  *
  * Usage: bench_mt_contention [active_sockets] [churn_sockets] [seconds]
  */

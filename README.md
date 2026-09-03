@@ -607,6 +607,12 @@ Its control-path percentiles have a wide run-to-run spread on a shared
 machine — an unmodified binary compared against itself has been observed
 varying by more than 40% at `ctl_mod` p50. Establish that A/A floor first,
 balance A/B orderings, and treat any delta smaller than the floor as noise.
+The per-operation figures are also not comparable to each other: the churn
+loop issues ADD, MOD, and DEL back to back, and whichever operation follows
+the ADD absorbs the stall behind the wait thread's in-progress drain.
+Swapping MOD and DEL moves the cost with the sequence position rather than
+the operation, so compare an operation only against the same operation in the
+same slot of an otherwise identical build.
 
 Linux qualification covers API contracts, close/wait/cancellation races,
 native `epoll_pwait2` where libc and the kernel provide it, plus a separately
