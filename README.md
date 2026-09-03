@@ -592,6 +592,22 @@ scaling, not 50,000 ready sockets. Final port close drains the resulting
 completion burst outside the per-operation samples. The benchmark
 intentionally has no pass/fail latency thresholds.
 
+`bench_mt_contention` covers what the single-threaded benchmark cannot: it
+runs a wait thread that keeps an active socket set continuously ready, so that
+thread is repeatedly inside a real drain holding the port's fd-table lock, and
+reports the latency distribution of a concurrent `epoll_ctl` thread working on
+a disjoint socket set. Use it to make changes to the drain's lock scope
+falsifiable rather than assumed.
+
+```sh
+./build-mingw/bench/bench_mt_contention.exe 256 32 2
+```
+
+Its control-path percentiles have a wide run-to-run spread on a shared
+machine — an unmodified binary compared against itself has been observed
+varying by more than 40% at `ctl_mod` p50. Establish that A/A floor first,
+balance A/B orderings, and treat any delta smaller than the floor as noise.
+
 Linux qualification covers API contracts, close/wait/cancellation races,
 native `epoll_pwait2` where libc and the kernel provide it, plus a separately
 forced fallback build, signal-mask waits, metadata changes, reused-fd identity,
