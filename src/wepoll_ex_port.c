@@ -49,7 +49,7 @@
 
 static _Atomic uint64_t g_quarantined_ports;
 
-static uint64_t ep_now_ns(void);
+static uint64_t ep_now_ns(const ep_port_t *port);
 
 #ifdef _WIN32
 static void ep_port_store_proc(void *target, size_t target_size, FARPROC proc)
@@ -606,7 +606,7 @@ static int ep_port_take_wake(ep_port_t *port, void *out,
             extended->events = event.events;
             extended->data = event.data;
             extended->flags = WEPOLL_FLAG_WAKE_EVENT;
-            extended->timestamp = ep_now_ns();
+            extended->timestamp = ep_now_ns(port);
         }
         *result_out = 1;
     } else {
@@ -2194,25 +2194,28 @@ int ep_wait_timeout_from_timespec(const struct timespec *timespec,
     return 0;
 }
 
-static uint64_t ep_now_ns(void)
+/* Monotonic delivery timestamp.  The performance-counter frequency is fixed
+ * for the lifetime of the system, so it is sampled once when the port is
+ * created and reused here: this runs once per queued ready node, and the
+ * call sites do not share a single lock, so a lazily initialized cache would
+ * be a data race for no benefit.  A zero cache means the frequency was
+ * unavailable at creation and the public contract already allows a zero
+ * timestamp. */
+static uint64_t ep_now_ns(const ep_port_t *port)
 {
-    LARGE_INTEGER frequency;
     LARGE_INTEGER counter;
+    int64_t frequency = port->qpc_frequency;
     uint64_t seconds;
     uint64_t remainder;
 
-    if (!QueryPerformanceFrequency(&frequency)) {
-        return 0;
-    }
-    if (!QueryPerformanceCounter(&counter) || frequency.QuadPart <= 0) {
+    if (frequency <= 0 || !QueryPerformanceCounter(&counter)) {
         return 0;
     }
 
-    seconds = (uint64_t)(counter.QuadPart / frequency.QuadPart);
-    remainder = (uint64_t)(counter.QuadPart % frequency.QuadPart);
+    seconds = (uint64_t)(counter.QuadPart / frequency);
+    remainder = (uint64_t)(counter.QuadPart % frequency);
     return seconds * UINT64_C(1000000000) +
-           (remainder * UINT64_C(1000000000)) /
-               (uint64_t)frequency.QuadPart;
+           (remainder * UINT64_C(1000000000)) / (uint64_t)frequency;
 }
 
 static int ep_fd_table_grow(ep_port_t *port, size_t new_size)
@@ -2783,7 +2786,7 @@ static int ep_sock_queue_local_shutdown_locked(ep_sock_t *sock,
     if ((sock->user_flags & EPOLLONESHOT) != 0) {
         node->flags |= WEPOLL_FLAG_ONESHOT_FIRED;
     }
-    node->timestamp = ep_now_ns();
+    node->timestamp = ep_now_ns(port);
 
     sock->pending_events = delivered;
     sock->et_holdoff = 0;
@@ -4153,7 +4156,7 @@ process_socket_snapshot:
         node->flags |= WEPOLL_FLAG_ONESHOT_FIRED;
         ep_sock_set_oneshot_fired_locked(sock, 1);
     }
-    node->timestamp = ep_now_ns();
+    node->timestamp = ep_now_ns(port);
 
     if ((sock->user_flags & EPOLLEXCLUSIVE) != 0 &&
         !ep_exclusive_try_claim(sock, &delivered)) {
@@ -4213,6 +4216,15 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
     if (port == NULL) {
         ep_set_errno(ENOMEM);
         return -1;
+    }
+    {
+        /* Sample the fixed performance-counter frequency before anything can
+         * publish a ready node.  Zero leaves ep_now_ns() reporting the
+         * already-permitted unspecified-origin zero timestamp. */
+        LARGE_INTEGER frequency;
+
+        port->qpc_frequency =
+            QueryPerformanceFrequency(&frequency) ? frequency.QuadPart : 0;
     }
 
     int mutex_error = pthread_mutex_init(&port->fd_table_lock, NULL);
@@ -5156,7 +5168,7 @@ int ep_port_modify(ep_port_t *port, SOCKET fd,
         if ((flags & EPOLLONESHOT) != 0) {
             replacement_node->flags |= WEPOLL_FLAG_ONESHOT_FIRED;
         }
-        replacement_node->timestamp = ep_now_ns();
+        replacement_node->timestamp = ep_now_ns(port);
         ep_ready_push(&port->ready_queue, replacement_node);
     } else if (new_waitable_dormant) {
         atomic_store_explicit(&sock->state, EP_SOCK_REGISTERED,

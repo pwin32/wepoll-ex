@@ -733,6 +733,11 @@ struct ep_port {
     uint64_t quarantine_drain_timeout_ms;
     uint64_t next_sock_generation;
 
+    /* QueryPerformanceFrequency sampled once at port creation.  The counter
+     * frequency is fixed for the life of the system, so delivery timestamps
+     * only read the counter itself.  Zero means it was unavailable. */
+    int64_t qpc_frequency;
+
     /* Atomic generation counter bumped on every ADD/DEL/MOD.  Used by
      * epoll_wait to detect ABA races when the ready queue is drained. */
     _Atomic uint64_t generation;
