@@ -40,12 +40,28 @@ jobs:
         shell: msys2 {0}
         run: |
           cmake --version
-          cmake --preset ${{ matrix.preset }}
+          cmake --preset ${{ matrix.preset }} 2>&1 | tee cmake-config.log || true
+          if [ ! -d "build/presets/${{ matrix.preset }}" ]; then
+            echo "ERROR: Configuration failed"
+            cat cmake-config.log
+            exit 1
+          fi
 
       - name: Build
         shell: msys2 {0}
         run: |
-          cmake --build build/presets/${{ matrix.preset }} --parallel
+          cmake --build build/presets/${{ matrix.preset }} --parallel 2>&1 | tee build.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-windows-${{ matrix.preset }}
+          path: |
+            cmake-config.log
+            build.log
+          retention-days: 7
 
       - name: Run Tests
         shell: msys2 {0}
@@ -91,7 +107,17 @@ jobs:
 
       - name: Build
         run: |
-          cmake --build build/presets/${{ matrix.preset }} --parallel
+          cmake --build build/presets/${{ matrix.preset }} --parallel 2>&1 | tee build.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-linux-${{ matrix.preset }}
+          path: |
+            build.log
+          retention-days: 7
 
       - name: Run Tests
         run: |
