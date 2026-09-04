@@ -44,7 +44,7 @@ jobs:
       - name: Build
         shell: msys2 {0}
         run: |
-          cmake --build --preset ${{ matrix.preset }}
+          cmake --build build/presets/${{ matrix.preset }} --parallel
 
       - name: Run Tests
         shell: msys2 {0}
@@ -85,7 +85,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake --build --preset ${{ matrix.preset }}
+          cmake --build build/presets/${{ matrix.preset }} --parallel
 
       - name: Run Tests
         run: |
@@ -133,7 +133,7 @@ jobs:
       - name: Build
         shell: msys2 {0}
         run: |
-          cmake --build --preset mingw-combined
+          cmake --build build/presets/mingw-combined --parallel
 
       - name: Run Benchmarks
         shell: msys2 {0}
@@ -178,7 +178,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake --build --preset posix-release
+          cmake --build build/presets/posix-release --parallel
 
       - name: Run Benchmarks
         run: |
