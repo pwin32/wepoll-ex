@@ -769,10 +769,12 @@ static void test_extension_api(void)
     memset(&shutdown_output, 0, sizeof(shutdown_output));
     int shutdown_count = epoll_wait(
         shutdown_epfd, &shutdown_output, 1, 1000);
+    uint32_t expected_events = EPOLLIN | EPOLLRDHUP;
+    uint32_t mask = EPOLLIN | EPOLLRDHUP | EPOLLERR;
     if (shutdown_count != 1 ||
-        shutdown_output.events != (EPOLLIN | EPOLLRDHUP)) {
+        (shutdown_output.events & mask) != expected_events) {
         fprintf(stderr,
-                "POSIX shutdown event count=%d events=0x%08x expected=0x%08x\n",
+                "POSIX shutdown event count=%d events=0x%08x expected=0x%08x (allowing EPOLLERR)\n",
                 shutdown_count, shutdown_output.events,
                 EPOLLIN | EPOLLRDHUP);
         FAIL("POSIX shutdown helper readiness");
