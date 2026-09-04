@@ -173,11 +173,8 @@ jobs:
         shell: msys2 {0}
         run: |
           cd build/presets/mingw-combined/bench
-          echo "=== Running wait scaling benchmark ==="
-          ./bench_wait_scaling.exe || true
-          echo ""
-          echo "=== Running latency benchmark ==="
-          ./bench_latency.exe || true
+          echo "=== Running Windows benchmark ==="
+          ./bench_windows.exe || true
           echo ""
           echo "=== Running MT contention benchmark ==="
           ./bench_mt_contention.exe || true
@@ -222,9 +219,6 @@ jobs:
           echo ""
           echo "=== Running latency benchmark ==="
           ./bench_latency || true
-          echo ""
-          echo "=== Running MT contention benchmark ==="
-          ./bench_mt_contention || true
 
       - name: Upload benchmark results
         if: always()
