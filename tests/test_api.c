@@ -1461,7 +1461,7 @@ static void test_mod_context_and_data(void)
         FAIL("initial context/data mismatch");
         goto mod_cleanup;
     }
-    read(pair[0], &(char){0}, 1);
+    (void)read(pair[0], &(char){0}, 1);
 
     ev.events = EPOLLIN;
     ev.data.u64 = data_b;
@@ -1476,7 +1476,7 @@ static void test_mod_context_and_data(void)
         FAIL("updated context/data mismatch");
         goto mod_cleanup;
     }
-    read(pair[0], &(char){0}, 1);
+    (void)read(pair[0], &(char){0}, 1);
 
     if (epoll_ctl_ctx(epfd, EPOLL_CTL_MOD, pair[0], &ev, NULL) != 0 ||
         write(pair[1], "c", 1) != 1) {
@@ -1581,7 +1581,7 @@ static void test_rearm_preserves_registration(void)
         FAIL("first oneshot event mismatch");
         goto rearm_cleanup;
     }
-    read(pair[0], &(char){0}, 1);
+    (void)read(pair[0], &(char){0}, 1);
 
     if (epoll_rearm(epfd, pair[0]) != 0 || write(pair[1], "2", 1) != 1) {
         FAIL("rearm/write");
@@ -1631,7 +1631,7 @@ static void test_drain_and_batch(void)
         FAIL("drain result mismatch");
         goto drain_cleanup;
     }
-    read(pair[0], &(char){0}, 1);
+    (void)read(pair[0], &(char){0}, 1);
     n = epoll_drain(epfd, out, 1);
     if (n != 0) {
         FAIL("empty drain should return zero");
@@ -1679,8 +1679,8 @@ drain_cleanup:
         FAIL("batch registrations did not deliver");
         goto batch_cleanup;
     }
-    read(pairs[0][0], &(char){0}, 1);
-    read(pairs[1][0], &(char){0}, 1);
+    (void)read(pairs[0][0], &(char){0}, 1);
+    (void)read(pairs[1][0], &(char){0}, 1);
 
     int duplicate_ops[2] = { EPOLL_CTL_ADD, EPOLL_CTL_ADD };
     int duplicate_fds[2] = { pairs[0][0], pairs[0][0] };
@@ -2711,7 +2711,7 @@ static void test_native_close_and_reuse(void)
         replacement = -1;
         goto native_close_socket_cleanup;
     }
-    read(pair[0], &(char){0}, 1);
+    (void)read(pair[0], &(char){0}, 1);
     if (epoll_ctl(replacement, EPOLL_CTL_DEL, pair[0], NULL) != 0) {
         FAIL("native replacement DEL");
         wepoll_close(replacement);
@@ -2745,7 +2745,7 @@ static void test_native_close_and_reuse(void)
         replacement = -1;
         goto native_close_socket_cleanup;
     }
-    read(pair[0], &(char){0}, 1);
+    (void)read(pair[0], &(char){0}, 1);
     wepoll_close(replacement);
     PASS();
     goto native_close_socket_cleanup;

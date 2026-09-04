@@ -57,7 +57,7 @@
       "name": "mingw-base",
       "hidden": true,
       "inherits": "base",
-      "generator": "MinGW Makefiles",
+      "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_C_FLAGS": "-O2 -Wall -Wextra -Wpedantic -Werror",
