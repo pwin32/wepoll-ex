@@ -25,6 +25,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install CMake 3.21+
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.21.x'
+
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
@@ -32,7 +37,6 @@ jobs:
           update: true
           install: >-
             mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             make
 
@@ -74,10 +78,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install CMake 3.21+
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.21.x'
+
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build
+          sudo apt-get install -y build-essential ninja-build
 
       - name: Configure CMake
         run: |
@@ -114,6 +123,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install CMake 3.21+
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.21.x'
+
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
@@ -121,7 +135,6 @@ jobs:
           update: true
           install: >-
             mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             make
 
