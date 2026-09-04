@@ -1,0 +1,203 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  build-test-windows:
+    name: Build & Test (Windows)
+    runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [mingw-combined, mingw-strict, mingw-synchronized]
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            make
+
+      - name: Configure CMake
+        shell: msys2 {0}
+        run: |
+          cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cmake --build --preset ${{ matrix.preset }}
+
+      - name: Run Tests
+        shell: msys2 {0}
+        run: |
+          ctest --preset ${{ matrix.preset }} --output-on-failure
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-windows-${{ matrix.preset }}
+          path: |
+            build/presets/${{ matrix.preset }}/Testing/
+            build/presets/${{ matrix.preset }}/**/*.log
+          retention-days: 7
+
+  build-test-linux:
+    name: Build & Test (Linux)
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [posix-release, posix-asan-ubsan, posix-pwait2-fallback]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      - name: Configure CMake
+        run: |
+          cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: |
+          cmake --build --preset ${{ matrix.preset }}
+
+      - name: Run Tests
+        run: |
+          ctest --preset ${{ matrix.preset }} --output-on-failure
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-linux-${{ matrix.preset }}
+          path: |
+            build/presets/${{ matrix.preset }}/Testing/
+            build/presets/${{ matrix.preset }}/**/*.log
+          retention-days: 7
+
+  benchmark-windows:
+    name: Benchmark (Windows)
+    runs-on: windows-2022
+    needs: build-test-windows
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            make
+
+      - name: Configure CMake (Release)
+        shell: msys2 {0}
+        run: |
+          cmake --preset mingw-combined
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cmake --build --preset mingw-combined
+
+      - name: Run Benchmarks
+        shell: msys2 {0}
+        run: |
+          cd build/presets/mingw-combined/bench
+          echo "=== Running wait scaling benchmark ==="
+          ./bench_wait_scaling.exe || true
+          echo ""
+          echo "=== Running latency benchmark ==="
+          ./bench_latency.exe || true
+          echo ""
+          echo "=== Running MT contention benchmark ==="
+          ./bench_mt_contention.exe || true
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-windows
+          path: |
+            build/presets/mingw-combined/bench/*.txt
+            build/presets/mingw-combined/bench/*.log
+          retention-days: 30
+
+  benchmark-linux:
+    name: Benchmark (Linux)
+    runs-on: ubuntu-latest
+    needs: build-test-linux
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      - name: Configure CMake (Release)
+        run: |
+          cmake --preset posix-release
+
+      - name: Build
+        run: |
+          cmake --build --preset posix-release
+
+      - name: Run Benchmarks
+        run: |
+          cd build/presets/posix-release/bench
+          echo "=== Running wait scaling benchmark ==="
+          ./bench_wait_scaling || true
+          echo ""
+          echo "=== Running latency benchmark ==="
+          ./bench_latency || true
+          echo ""
+          echo "=== Running MT contention benchmark ==="
+          ./bench_mt_contention || true
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-linux
+          path: |
+            build/presets/posix-release/bench/*.txt
+            build/presets/posix-release/bench/*.log
+          retention-days: 30
