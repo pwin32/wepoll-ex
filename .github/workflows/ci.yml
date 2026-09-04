@@ -174,12 +174,10 @@ jobs:
         run: |
           cd build/presets/mingw-combined/bench
           echo "=== Running Windows benchmark ==="
-          ./bench_windows.exe > bench_windows_results.txt 2>&1 || true
+          ./bench_windows.exe 2>&1 | tee bench_windows_results.txt || true
           echo ""
           echo "=== Running MT contention benchmark ==="
-          ./bench_mt_contention.exe > bench_mt_contention_results.txt 2>&1 || true
-          echo "Benchmark results saved to:"
-          ls -lh *.txt
+          ./bench_mt_contention.exe 2>&1 | tee bench_mt_contention_results.txt || true
 
       - name: Upload benchmark results
         if: always()
@@ -217,12 +215,10 @@ jobs:
         run: |
           cd build/presets/posix-release/bench
           echo "=== Running wait scaling benchmark ==="
-          ./bench_wait_scaling > bench_wait_scaling_results.txt 2>&1 || true
+          ./bench_wait_scaling 2>&1 | tee bench_wait_scaling_results.txt || true
           echo ""
           echo "=== Running latency benchmark ==="
-          ./bench_latency > bench_latency_results.txt 2>&1 || true
-          echo "Benchmark results saved to:"
-          ls -lh *.txt
+          ./bench_latency 2>&1 | tee bench_latency_results.txt || true
 
       - name: Upload benchmark results
         if: always()
