@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
@@ -40,9 +40,11 @@ jobs:
         shell: msys2 {0}
         run: |
           cmake --version
+          echo "::group::CMake Configure Output"
           cmake --preset ${{ matrix.preset }} 2>&1 | tee cmake-config.log || true
+          echo "::endgroup::"
           if [ ! -d "build/presets/${{ matrix.preset }}" ]; then
-            echo "ERROR: Configuration failed"
+            echo "::error::Configuration failed - see cmake-config.log"
             cat cmake-config.log
             exit 1
           fi
@@ -55,7 +57,7 @@ jobs:
 
       - name: Upload build logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build-logs-windows-${{ matrix.preset }}
           path: |
@@ -70,7 +72,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-results-windows-${{ matrix.preset }}
           path: |
@@ -89,7 +91,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install CMake 3.21+
         uses: jwlawson/actions-setup-cmake@v2
@@ -112,7 +114,7 @@ jobs:
 
       - name: Upload build logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build-logs-linux-${{ matrix.preset }}
           path: |
@@ -125,7 +127,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: test-results-linux-${{ matrix.preset }}
           path: |
@@ -144,7 +146,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
@@ -182,7 +184,7 @@ jobs:
 
       - name: Upload benchmark results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: benchmark-results-windows
           path: |
@@ -197,7 +199,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
@@ -226,7 +228,7 @@ jobs:
 
       - name: Upload benchmark results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: benchmark-results-linux
           path: |
