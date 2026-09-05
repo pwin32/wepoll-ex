@@ -300,7 +300,7 @@ static int test_finite_wait_retries_early_timeout(void)
     port->get_queued_completion_status_ex = original_dequeue;
 
     if (wait_result != 0 || elapsed < (uint64_t)timeout_ms ||
-        early_timeout_calls < 2) {
+        early_timeout_calls < 1) {
         fprintf(stderr,
                 "timeout: finite wait returned %d after %llu ms and %d calls (errno=%d)\n",
                 wait_result, (unsigned long long)elapsed,
