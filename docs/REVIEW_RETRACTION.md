@@ -113,11 +113,97 @@ from `>= 2` to `>= 1`. The test verifies that a finite wait respects its
 deadline; the number of internal retry calls is timing-dependent and a
 fast runner can satisfy the 25 ms wait in one call.
 
+## Remaining findings: second pass
+
+The rest of the review (sections 2.5, 3.1, 3.2, 4.1-4.7, 6.1-6.2) was then
+checked the same way. 56 findings total; one real, and it is unreachable.
+
+**The one real defect — generation wraparound guard (was filed MEDIUM, is
+P3).** Six of the seven `sock->generation = ++port->next_sock_generation`
+sites follow the assignment with a `== 0` guard that skips generation zero.
+`ep_port_unregister` did not. Fixed by applying the same three lines.
+
+The review's stated impact was wrong: it claimed a stale ready node could
+falsely match across the wrap. It cannot — the socket is being retired,
+`delete_pending` is set, and the delivery check requires `!delete_pending`.
+The actual (and purely theoretical) issue is that leaving the counter at
+zero would let a later `ep_sock_alloc_locked` mint generation 0 while a
+node carrying 0 still exists. Reaching it requires 2^64 registrations on
+one port. This was fixed for consistency across the seven sites, not
+because it was reachable.
+
+**False positives:**
+
+- *2.5 "TOCTOU race in `ep_afd_cancel`"* — no race. The file header of
+  `wepoll_ex_afd.c` states the contract: "Callers enter from port code
+  while holding fd_table_lock." Both reads happen under that lock. The
+  proposed fix is a reordering with identical semantics.
+- *3.1 "unbounded `DuplicateHandle` loop"* — cannot spin. Every colliding
+  duplicate is *retained* in the `collisions` array rather than closed and
+  retried, so each iteration consumes a distinct handle value from a finite
+  table; it terminates by exhaustion, returning `ENOMEM` from the growth
+  path. The retention comment in the loop says exactly this. An iteration
+  cap would add nothing.
+- *3.2 "audit seq_cst atomics under locks"* — self-refuting. It proposes
+  relaxing an `atomic_load` that its own section 6.2 then shows already
+  uses `memory_order_relaxed`. Claimed 1-2% is far below the measurement
+  floor (see below).
+- *4.2 "exclusive claim list race"* — the global SRW lock serializes all
+  mutations. The finding text itself concedes "the global lock is held, so
+  concurrent modification shouldn't occur," then files it as MEDIUM.
+- *4.6.2 "batch array bounds not validated"* — not fixable and not a
+  defect. `epoll_ctl_batch(epfd, ops, fds, events, count)` receives bare
+  pointers with no size information; validating `count` against them is
+  impossible, exactly as for `memcpy`. Caller contract, already documented.
+- *4.6.1 / 4.6.3 / 4.6.4* — `epfd_bucket` is only reachable after
+  `epfd_find_locked` rejects `fd <= 0`; `epfd_put`'s `refs > 0` test is
+  defensive depth, not a swallowed bug; `epfd_allocate_id_locked` breaks on
+  the first free slot and returns -1/EMFILE when full. Optional assertion
+  hygiene at most.
+- *4.7 "other medium/low issues"* — six items with no file, line, or
+  reproduction. Not actionable as written.
+- *4.5 / 6.1 MPSC queue "verified correct"* — independently confirmed. The
+  acquire/release pairing and stub protocol are right. This holds up.
+
+## Windows performance cannot be measured on this CI
+
+Two runs of byte-identical code (33958449218 and 33961500052, both green,
+201/201 on all three Windows configs):
+
+| metric (p50) | run A | run B | delta |
+|---|---|---|---|
+| registration_add | 3900 ns | 5100 ns | +30.8% |
+| registration_del | 6400 ns | 10500 ns | +64.1% |
+| ready_batch b=1 | 9600 ns | 12400 ns | +29.2% |
+| ready_batch b=512 | 6222200 ns | 7581000 ns | +21.8% |
+| oneshot_rearm | 1300 ns | 1600 ns | +23.1% |
+| control_churn | 8400 ns | 10400 ns | +23.8% |
+| ctl_add | 12500 ns | 15400 ns | +23.2% |
+| ctl_mod | 106300 ns | 115100 ns | +8.3% |
+| ctl_del | 2100 ns | 2600 ns | +23.8% |
+
+Identical code, +21% to +64% swing on shared GitHub Windows runners. Linux
+is stable by comparison (p50 1012 -> 1005 ns, -0.7%; rate +2.2%).
+
+No Windows performance claim below roughly 65% is measurable here. The
+review's "15-20% cache layout gain" sits under the floor. `bench_mt_contention`
+warns about this in its own header (">40% at ctl_mod p50"); the measured
+reality is worse. Windows perf work needs a dedicated quiet machine, and any
+claim needs an A/A floor established first.
+
+## Final tally
+
+56 findings. 1 real (P3, unreachable, fixed for consistency). 0 that
+required a behavioural code change. 3 labelled CRITICAL that were actively
+harmful to implement.
+
 ## Root cause
 
 The findings were produced by reading functions in isolation, without
 checking lock discipline at the call sites or the documented ownership
 contracts. Every `_locked` suffix was a signal that was not followed up.
-Any remaining finding from that review should be re-checked against its
-call sites before being acted on; the severity labels are not
-trustworthy.
+In 2.5 the governing contract was thirty lines above the cited function;
+in 3.1 and 4.2 the code comments stated the answer outright.
+
+`ARCHITECTURE_REVIEW.md` and `REVIEW_SUMMARY.md` are superseded by this
+document and are not a backlog. Do not mine them for work items.
