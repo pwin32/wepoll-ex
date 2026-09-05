@@ -38,3 +38,7 @@ Thumbs.db
 /libuv-v1.52.1.tar.gz
 /asio-develop.zip
 /mio-master.zip
+
+# Internal architecture review documents
+ARCHITECTURE_REVIEW.md
+REVIEW_SUMMARY.md
