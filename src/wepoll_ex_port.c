@@ -5276,6 +5276,10 @@ int ep_port_unregister(ep_port_t *port, SOCKET fd)
     atomic_store_explicit(&sock->state, EP_SOCK_DELETED, memory_order_relaxed);
     ep_sock_set_needs_rearm_locked(sock, 0);
     sock->generation = ++port->next_sock_generation;
+    if (port->next_sock_generation == 0) {
+        port->next_sock_generation = 1;
+        sock->generation = 1;
+    }
     atomic_fetch_add_explicit(&port->generation, 1, memory_order_relaxed);
 
     if (atomic_load_explicit(&sock->poll_status, memory_order_relaxed) ==

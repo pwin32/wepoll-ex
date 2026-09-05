@@ -39,6 +39,8 @@ Thumbs.db
 /asio-develop.zip
 /mio-master.zip
 
-# Internal architecture review documents
+# Superseded 2026-09-05 architecture review scratch documents.  Their
+# findings were retracted; see docs/REVIEW_RETRACTION.md.  Kept ignored so
+# a stray regenerated copy is never committed.
 ARCHITECTURE_REVIEW.md
 REVIEW_SUMMARY.md
