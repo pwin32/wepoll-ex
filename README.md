@@ -450,7 +450,18 @@ On Linux, `epoll_fd_count()` reports registrations owned by the extension
 metadata, including successful `epoll_ctl_batch` operations. Native
 `epoll_ctl()` additions are not counted until a successful
 `epoll_ctl_ctx(..., EPOLL_CTL_MOD, ...)` adopts them; later native MOD/DEL
-operations do not update the extension metadata view.
+operations do not update the extension metadata view. Native `dup()` aliases
+of a tracked epoll descriptor are recognized lazily and share its metadata;
+perform an extension call on each alias before closing another alias, then
+close every enrolled alias with `wepoll_close()` when extended waits are
+active.
+
+`epoll_event` does not identify the registration that produced an opaque
+`data.u64` value. If a native registration and an extension registration use
+the same value, `epoll_wait_ex()` cannot distinguish them and may return the
+extension context. Applications mixing the native and extension APIs must
+therefore use unique opaque data values across both sets (or leave
+`user_ctx` unused for that value).
 
 ### Socket lifetime and diagnostics
 

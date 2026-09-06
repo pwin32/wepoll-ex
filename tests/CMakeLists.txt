@@ -23,6 +23,20 @@ if(WEPOLL_EX_PLATFORM_POSIX)
 
         add_test(NAME wepoll_ex_pool_mpsc COMMAND test_wepoll_ex_pool)
         set_tests_properties(wepoll_ex_pool_mpsc PROPERTIES TIMEOUT 60)
+
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            add_executable(test_wepoll_ex_posix_close_cancel
+                test_posix_close_cancel.c)
+            target_link_libraries(test_wepoll_ex_posix_close_cancel PRIVATE
+                wepoll_ex_static Threads::Threads)
+            target_link_options(test_wepoll_ex_posix_close_cancel PRIVATE
+                "LINKER:--wrap=epoll_wait"
+                "LINKER:--wrap=pthread_cond_wait")
+            add_test(NAME wepoll_ex_posix_close_cancel
+                COMMAND test_wepoll_ex_posix_close_cancel)
+            set_tests_properties(wepoll_ex_posix_close_cancel PROPERTIES
+                TIMEOUT 15)
+        endif()
     else()
         message(STATUS "Skipping pool test: it requires the internal static library symbols")
     endif()

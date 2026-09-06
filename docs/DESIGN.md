@@ -262,7 +262,12 @@ A hidden identity registration also distinguishes the tracked epoll generation
 from a reused integer, so stale metadata is retired without closing a
 replacement descriptor. Plain native `close()` cannot provide this wakeup or
 metadata retirement contract; callers using extended waits should use
-`wepoll_close()` and synchronize native close/reuse against it.
+`wepoll_close()` and synchronize native close/reuse against it. Native `dup()`
+aliases are discovered lazily by validating the hidden identity registration
+and share the same metadata port; each alias must be closed through
+`wepoll_close()` before the port can be reclaimed. A raw `dup()` is not
+observable until an extension call uses that alias, so enroll aliases before
+closing another descriptor for the same epoll instance.
 
 Native `epoll_event` values carry no fd or generation tag. The wrapper indexes
 metadata by the opaque `data.u64` value and decorates only a unique match. If
@@ -278,6 +283,10 @@ waits write native packed records into the prefix of the caller's
 Descending expansion preserves unread packed records, avoids incompatible
 struct aliasing, requires no proportional internal allocation, and lets one
 native wait return any legal public `maxevents` count.
+The registry reference held by an extended wait is released by a cancellation
+cleanup handler. `wepoll_close()` drops the registry lock before waiting for
+those references, and its own condition-wait cleanup makes cancellation
+prompt without stranding the process-wide registry lock.
 `epoll_ctl_batch` is sequential and not transactional. `epoll_pwait2_ex`
 uses native `epoll_pwait2` when the libc symbol is present and the kernel
 supports it. A build-time absence, runtime `ENOSYS`, or

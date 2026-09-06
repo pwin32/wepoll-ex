@@ -63,6 +63,9 @@ typedef struct posix_port {
     size_t               n_buckets;
     size_t               count;
     size_t               refs;
+    size_t               aliases;
+    int                  retired;
+    int                  close_waiter;
     /* Incremented after every extension metadata mutation.  A wait that
      * overlaps a mutation must not guess which registration version produced
      * the native event, because epoll_event carries no generation tag. */
@@ -90,6 +93,10 @@ _Static_assert(_Alignof(struct epoll_event_ex) >=
 
 static pthread_mutex_t g_posix_lock = PTHREAD_MUTEX_INITIALIZER;
 static posix_port_t   *g_posix_map[POSIX_PORT_MAP_SIZE];
+static int              g_posix_map_epfd[POSIX_PORT_MAP_SIZE];
+
+static int port_identity_check(posix_port_t *p, int epfd);
+static void port_free(posix_port_t *p);
 
 static posix_port_t *port_lookup_locked(int epfd)
 {
@@ -99,9 +106,50 @@ static posix_port_t *port_lookup_locked(int epfd)
      * configurations (one epoll per worker). */
     for (int i = 0; i < POSIX_PORT_MAP_SIZE; i++) {
         posix_port_t *p = g_posix_map[i];
-        if (p && p->epfd == epfd) return p;
+        if (p && g_posix_map_epfd[i] == epfd) return p;
     }
     return NULL;
+}
+
+static posix_port_t *port_lookup_alias_locked(int epfd)
+{
+    for (int i = 0; i < POSIX_PORT_MAP_SIZE; i++) {
+        posix_port_t *p = g_posix_map[i];
+        if (p == NULL || p->closing || g_posix_map_epfd[i] == epfd) continue;
+        if (port_identity_check(p, epfd) == 0) return p;
+    }
+    return NULL;
+}
+
+static int port_add_alias_locked(posix_port_t *p, int epfd)
+{
+    for (int i = 0; i < POSIX_PORT_MAP_SIZE; i++) {
+        if (g_posix_map[i] == NULL) {
+            /* The canonical descriptor is retained in p->epfd; aliases are
+             * identified by their occupied registry slot and share all
+             * metadata, control, and wait references. */
+            g_posix_map[i] = p;
+            g_posix_map_epfd[i] = epfd;
+            p->aliases++;
+            (void)epfd;
+            return 0;
+        }
+    }
+    ep_set_errno(EMFILE);
+    return -1;
+}
+
+static int port_remove_epfd_locked(posix_port_t *p, int epfd)
+{
+    for (int i = 0; i < POSIX_PORT_MAP_SIZE; i++) {
+        if (g_posix_map[i] == p && g_posix_map_epfd[i] == epfd) {
+            g_posix_map[i] = NULL;
+            g_posix_map_epfd[i] = -1;
+            if (p->aliases != 0) p->aliases--;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void port_remove_locked(posix_port_t *p)
@@ -109,9 +157,21 @@ static void port_remove_locked(posix_port_t *p)
     for (int i = 0; i < POSIX_PORT_MAP_SIZE; i++) {
         if (g_posix_map[i] == p) {
             g_posix_map[i] = NULL;
+            g_posix_map_epfd[i] = -1;
+        }
+    }
+    p->aliases = 0;
+}
+
+static void port_update_canonical_locked(posix_port_t *p)
+{
+    for (int i = 0; i < POSIX_PORT_MAP_SIZE; i++) {
+        if (g_posix_map[i] == p) {
+            p->epfd = g_posix_map_epfd[i];
             return;
         }
     }
+    p->epfd = -1;
 }
 
 /* Wake every extension wait which is using this metadata port.  The eventfd
@@ -138,14 +198,43 @@ static void port_wake_waiters_locked(posix_port_t *p)
     errno = saved_errno;
 }
 
-/* Stop new users, wait for existing metadata users, and unlink the port.
- * The caller holds g_posix_lock and must free p after releasing it. */
-static void port_retire_locked(posix_port_t *p)
+/* Stop new users and unlink the port.  The caller holds g_posix_lock and
+ * waits for references after releasing it. */
+static void port_mark_closing_locked(posix_port_t *p)
 {
     p->closing = 1;
     port_wake_waiters_locked(p);
-    while (p->refs != 0) pthread_cond_wait(&p->idle, &g_posix_lock);
     port_remove_locked(p);
+}
+
+static void posix_close_wait_cancel_cleanup(void *opaque)
+{
+    posix_port_t *p = opaque;
+    int free_now = 0;
+
+    /* pthread_cond_wait reacquires g_posix_lock before cancellation cleanup.
+     * Keep the retired port alive until a waiter releases its reference. */
+    p->close_waiter = 0;
+    if (p->refs == 0) {
+        p->retired = 0;
+        free_now = 1;
+    }
+    pthread_mutex_unlock(&g_posix_lock);
+    if (free_now) port_free(p);
+}
+
+static void port_wait_and_free(posix_port_t *p)
+{
+    pthread_mutex_lock(&g_posix_lock);
+    p->retired = 1;
+    p->close_waiter = 1;
+    pthread_cleanup_push(posix_close_wait_cancel_cleanup, p);
+    while (p->refs != 0) pthread_cond_wait(&p->idle, &g_posix_lock);
+    pthread_cleanup_pop(0);
+    p->close_waiter = 0;
+    p->retired = 0;
+    pthread_mutex_unlock(&g_posix_lock);
+    port_free(p);
 }
 
 /* Validate that epfd refers to an epoll instance without changing its
@@ -222,6 +311,13 @@ static posix_port_t *port_acquire_or_create(int epfd)
     for (;;) {
         pthread_mutex_lock(&g_posix_lock);
         posix_port_t *p = port_lookup_locked(epfd);
+        if (p == NULL) {
+            p = port_lookup_alias_locked(epfd);
+            if (p != NULL && port_add_alias_locked(p, epfd) != 0) {
+                pthread_mutex_unlock(&g_posix_lock);
+                return NULL;
+            }
+        }
         if (p) {
             if (p->closing) {
                 pthread_mutex_unlock(&g_posix_lock);
@@ -248,9 +344,15 @@ static posix_port_t *port_acquire_or_create(int epfd)
             /* The integer no longer names the mapped epoll generation.
              * Retire the old metadata before validating or tracking the
              * current descriptor. */
-            port_retire_locked(p);
-            pthread_mutex_unlock(&g_posix_lock);
-            port_free(p);
+            (void)port_remove_epfd_locked(p, epfd);
+            port_update_canonical_locked(p);
+            if (p->aliases == 0) {
+                port_mark_closing_locked(p);
+                pthread_mutex_unlock(&g_posix_lock);
+                port_wait_and_free(p);
+            } else {
+                pthread_mutex_unlock(&g_posix_lock);
+            }
             continue;
         }
 
@@ -340,6 +442,8 @@ static posix_port_t *port_acquire_or_create(int epfd)
         for (int i = 0; i < POSIX_PORT_MAP_SIZE; i++) {
             if (g_posix_map[i] == NULL) {
                 g_posix_map[i] = p;
+                g_posix_map_epfd[i] = epfd;
+                p->aliases = 1;
                 pthread_mutex_unlock(&g_posix_lock);
                 return p;
             }
@@ -354,10 +458,18 @@ static posix_port_t *port_acquire_or_create(int epfd)
 
 static void port_release(posix_port_t *p)
 {
+    int free_now = 0;
+
     pthread_mutex_lock(&g_posix_lock);
     p->refs--;
     if (p->closing && p->refs == 0) pthread_cond_signal(&p->idle);
+    if (p->retired && p->aliases == 0 && p->refs == 0 &&
+        !p->close_waiter) {
+        p->retired = 0;
+        free_now = 1;
+    }
     pthread_mutex_unlock(&g_posix_lock);
+    if (free_now) port_free(p);
 }
 
 static int fd_identity_capture(int fd, posix_fd_identity_t *identity)
@@ -1281,8 +1393,18 @@ WEPOLL_EX_API int wepoll_ex_shutdown_socket(int epfd, int fd, int how)
 
 WEPOLL_EX_API int wepoll_close(int epfd)
 {
+    int free_port = 0;
+    int close_public_fd = 1;
+
     pthread_mutex_lock(&g_posix_lock);
     posix_port_t *p = port_lookup_locked(epfd);
+    if (p == NULL) {
+        p = port_lookup_alias_locked(epfd);
+        if (p != NULL && port_add_alias_locked(p, epfd) != 0) {
+            pthread_mutex_unlock(&g_posix_lock);
+            return -1;
+        }
+    }
 
     if (p) {
         if (p->closing) {
@@ -1304,31 +1426,40 @@ WEPOLL_EX_API int wepoll_close(int epfd)
             /* The tracked epoll descriptor was closed natively and its
              * integer was either invalid or reused.  Retire only the stale
              * metadata; never close the replacement descriptor. */
-            port_retire_locked(p);
-            pthread_mutex_unlock(&g_posix_lock);
-            port_free(p);
-            errno = EBADF;
-            return -1;
+            (void)port_remove_epfd_locked(p, epfd);
+            port_update_canonical_locked(p);
+            close_public_fd = 0;
+            if (p->aliases == 0) {
+                p->closing = 1;
+                port_wake_waiters_locked(p);
+                free_port = 1;
+            }
+        } else {
+            (void)port_remove_epfd_locked(p, epfd);
+            port_update_canonical_locked(p);
+            if (p->aliases == 0) {
+                p->closing = 1;
+                port_wake_waiters_locked(p);
+                free_port = 1;
+            }
         }
-
-        p->closing = 1;
-        port_wake_waiters_locked(p);
     }
 
-    /* Keep the registry lock across close so no extension call can validate
-     * the old descriptor and create a new metadata port in the final gap.
-     * Existing metadata users operate on control_epfd, so closing the public
-     * fd before waiting for them also narrows the native close/reuse window. */
-    int result = close(epfd);
+    /* Remove the alias while holding the registry lock, then release that lock
+     * before waiting for active users.  Wait cleanup needs the same lock to
+     * release its reference after observing the close wake. */
+    int result = close_public_fd ? close(epfd) : -1;
     int saved_errno = errno;
-    if (p) {
-        while (p->refs != 0) pthread_cond_wait(&p->idle, &g_posix_lock);
-        port_remove_locked(p);
-    }
     pthread_mutex_unlock(&g_posix_lock);
 
-    if (p) port_free(p);
-    if (result != 0) errno = saved_errno;
+    if (p && free_port) {
+        port_wait_and_free(p);
+    }
+    if (!close_public_fd) {
+        errno = EBADF;
+    } else if (result != 0) {
+        errno = saved_errno;
+    }
     return result;
 }
 

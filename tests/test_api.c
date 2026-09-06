@@ -903,6 +903,71 @@ cleanup:
     close(pair[0]); close(pair[1]);
 }
 
+static void test_native_dup_alias_metadata(void)
+{
+    TEST("native dup aliases share POSIX extension metadata");
+    int pair[2] = { -1, -1 };
+    int epfd = -1;
+    int alias = -1;
+    int context = 0xD0;
+    struct epoll_event event = {
+        .events = EPOLLIN,
+        .data.u64 = UINT64_C(0x445550414c494153)
+    };
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        FAIL("socketpair");
+        return;
+    }
+    epfd = epoll_create_ex(0, 0);
+    if (epfd < 0) {
+        FAIL("epoll_create_ex");
+        goto cleanup;
+    }
+    if (epoll_ctl_ctx(epfd, EPOLL_CTL_ADD, pair[0], &event, &context) != 0) {
+        FAIL("ADD through original");
+        goto cleanup;
+    }
+    alias = dup(epfd);
+    if (alias < 0) {
+        FAIL("dup");
+        goto cleanup;
+    }
+    event.data.u64 = UINT64_C(0x4455504d4f444946);
+    if (epoll_ctl_ctx(alias, EPOLL_CTL_MOD, pair[0], &event, &context) != 0 ||
+        epoll_fd_count(epfd) != 1 || epoll_fd_count(alias) != 1 ||
+        write(pair[1], "d", 1) != 1) {
+        FAIL("MOD/count through alias");
+        goto cleanup;
+    }
+
+    epoll_event_ex output;
+    if (epoll_wait_ex(epfd, &output, 1, 100) != 1 ||
+        output.user_ctx != &context || output.data.u64 != event.data.u64) {
+        FAIL("original wait lost alias metadata");
+        goto cleanup;
+    }
+    { ssize_t drained = read(pair[0], &(char){0}, 1); (void)drained; }
+    if (wepoll_close(epfd) != 0) {
+        FAIL("close original while alias remains");
+        epfd = -1;
+        goto cleanup;
+    }
+    epfd = -1;
+    if (epoll_ctl_ctx(alias, EPOLL_CTL_DEL, pair[0], NULL, NULL) != 0 ||
+        epoll_fd_count(alias) != 0) {
+        FAIL("DEL/count through alias");
+        goto cleanup;
+    }
+    PASS();
+
+cleanup:
+    if (alias >= 0) (void)wepoll_close(alias);
+    if (epfd >= 0) (void)wepoll_close(epfd);
+    if (pair[0] >= 0) close(pair[0]);
+    if (pair[1] >= 0) close(pair[1]);
+}
+
 /* --------------------------------------------------------------------- */
 /* Extended argument and timeout validation.                         */
 /* --------------------------------------------------------------------- */
@@ -3198,6 +3263,7 @@ int main(void)
     test_inert_event_bits();
     test_extension_api();
     test_user_ctx();
+    test_native_dup_alias_metadata();
     test_create_ex_and_timeout_validation();
     test_sigmask_semantics();
     test_ptr_and_u64_context();
