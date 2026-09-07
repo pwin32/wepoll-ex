@@ -422,8 +422,9 @@ WEPOLL_EX_API int  epoll_rearm_classes(int epfd, epoll_fd_t fd,
  *
  * count must be positive; all three arrays must be non-NULL, valid for count
  * elements, mutually nonoverlapping, and exclusively owned during the call.
- * Invalid count/arrays/epfd fail before writing errors. Per-entry validation,
- * ONESHOT, EBUSY, and idempotence follow epoll_rearm_classes(). Duplicate fds
+ * Nonpositive count, NULL arrays, or invalid epfd fail before writing errors.
+ * Per-entry validation, ONESHOT, EBUSY, and idempotence follow
+ * epoll_rearm_classes(). Duplicate fds
  * are processed in order, not combined. Calls may interleave with waits and
  * control operations between bounded chunks; the batch is not atomic.
  * Callers must synchronize DEL/re-ADD/native close with saved batch entries:

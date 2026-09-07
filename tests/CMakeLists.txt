@@ -242,7 +242,7 @@ else()
             WEPOLL_EX_ENABLE_FAULT_INJECTION=1 ${WEPOLL_EX_PLATFORM_DEFINITIONS})
         target_link_libraries(test_wepoll_ex_windows_rearm_batch_state PRIVATE
             wepoll_ex_fault_test_static Threads::Threads ws2_32)
-        foreach(_rearm_batch_mode IN ITEMS submit busy-close wake wake-failure)
+        foreach(_rearm_batch_mode IN ITEMS submit busy-close wake wake-failure wake-close)
             add_test(NAME wepoll_ex_windows_rearm_batch_${_rearm_batch_mode}
                 COMMAND test_wepoll_ex_windows_rearm_batch_state ${_rearm_batch_mode})
             set_tests_properties(wepoll_ex_windows_rearm_batch_${_rearm_batch_mode}

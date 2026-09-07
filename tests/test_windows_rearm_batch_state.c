@@ -152,12 +152,14 @@ cleanup:
 static int test_wake(int post_failure)
 {
     fixture_t fixture;
-    epoll_fd_t fds[2];
-    uint32_t classes[2] = {WEPOLL_EX_REARM_ALL, WEPOLL_EX_REARM_WRITE};
-    int errors[2];
+    epoll_fd_t fds[65];
+    uint32_t classes[65];
+    int errors[65];
+    int count = post_failure == 2 ? 65 : 2;
     int result = -1;
     ULONG removed = 0;
     OVERLAPPED_ENTRY entries[8];
+    wepoll_ex_error_info info;
 
     if (fixture_open(&fixture, 0, 1) != 0) goto cleanup;
     /* Isolate the synthetic-ready wake from socket scheduling.  No native
@@ -167,13 +169,31 @@ static int test_wake(int post_failure)
     atomic_store(&fixture.port->waiter_active, 1);
     fds[0] = fixture.fds[0];
     fds[1] = post_failure ? fixture.fds[1] : EPOLL_FD_INVALID;
+    classes[0] = WEPOLL_EX_REARM_ALL;
+    classes[1] = WEPOLL_EX_REARM_WRITE;
+    if (post_failure == 2) {
+        /* Idempotent acknowledgements fill the rest of the first chunk.
+         * Its failed wake closes the port before the last entry. */
+        for (int i = 1; i < count; i++) {
+            fds[i] = fixture.fds[1];
+            classes[i] = WEPOLL_EX_REARM_READ;
+        }
+    }
     if (post_failure) CHECK(ep_fault_configure(EP_FAULT_IOCP_POST, 1, EIO) == 0);
-    CHECK(ep_port_rearm_classes_batch(fixture.port, fds, classes, errors, 2) == -1);
+    CHECK(ep_port_rearm_classes_batch(fixture.port, fds, classes, errors, count) == -1);
     CHECK(errors[0] == 0 && errors[1] == (post_failure ? 0 : EBADF));
     CHECK(errno == (post_failure ? EIO : EBADF));
     if (post_failure) {
+        CHECK(wepoll_ex_get_last_error_info(&info, sizeof(info)) == 0);
+        CHECK(info.portable_error == EIO &&
+              info.native_domain == WEPOLL_EX_NATIVE_ERROR_WIN32 &&
+              info.native_code == ERROR_GEN_FAILURE);
         CHECK(atomic_load(&fixture.port->closing));
         CHECK(ep_fault_hits(EP_FAULT_IOCP_POST) == 1);
+        if (post_failure == 2) {
+            for (int i = 0; i < 64; i++) CHECK(errors[i] == 0);
+            CHECK(errors[64] == EBADF);
+        }
     } else {
         CHECK(GetQueuedCompletionStatusEx(fixture.port->iocp, entries, 8, &removed, 0, FALSE));
         CHECK(removed == 1 && entries[0].lpOverlapped == NULL);
@@ -194,6 +214,7 @@ int main(int argc, char **argv)
     else if (strcmp(argv[1], "busy-close") == 0) result = test_busy_closed();
     else if (strcmp(argv[1], "wake") == 0) result = test_wake(0);
     else if (strcmp(argv[1], "wake-failure") == 0) result = test_wake(1);
+    else if (strcmp(argv[1], "wake-close") == 0) result = test_wake(2);
     else result = -1;
     WSACleanup();
     return result == 0 ? 0 : 1;
