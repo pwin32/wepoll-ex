@@ -25,6 +25,9 @@ WINDOWS_KEYS = {
     ("control_churn", "add+mod+del"),
 }
 CONTENTION_KEYS = {("ctl_add", ""), ("ctl_mod", ""), ("ctl_del", "")}
+REARM_KEYS = {(benchmark, f"batch={size}")
+              for benchmark in ("explicit_rearm", "explicit_roundtrip")
+              for size in (1, 16, 64, 256)}
 PROGRAMS = {
     "bench_windows": ["--max-sockets", "1000", "--iterations", "500"],
     "bench_mt_contention": ["256", "32", "3"],
@@ -34,9 +37,11 @@ PROGRAMS = {
 def parse_result(program, output):
     lines = [line for line in output.splitlines() if not line.startswith("#")]
     reader = csv.DictReader(io.StringIO("\n".join(lines)))
-    expected = WINDOWS_KEYS if program == "bench_windows" else CONTENTION_KEYS
+    expected = {"bench_windows": WINDOWS_KEYS,
+                "bench_mt_contention": CONTENTION_KEYS,
+                "bench_rearm_batch": REARM_KEYS}[program]
     fields = ["p50_ns", "p95_ns", "p99_ns"]
-    fields.append("operations_per_second" if program == "bench_windows" else "mean_ns")
+    fields.append("mean_ns" if program == "bench_mt_contention" else "operations_per_second")
     metrics = {}
     seen = set()
     for row in reader:
@@ -100,8 +105,8 @@ def summarize(calibration, comparison):
     return summary
 
 
-def run_one(directory, program, log_path):
-    command = [str((directory / (program + ".exe")).resolve()), *PROGRAMS[program]]
+def run_one(directory, program, log_path, arguments):
+    command = [str((directory / (program + ".exe")).resolve()), *arguments]
     result = subprocess.run(command, capture_output=True, text=True, timeout=180)
     log_path.write_text(result.stdout + result.stderr, encoding="utf-8")
     if result.returncode:
@@ -109,16 +114,18 @@ def run_one(directory, program, log_path):
     return parse_result(program, result.stdout)
 
 
-def collect_phase(label, count, base_dir, candidate_dir, output):
+def collect_phase(label, count, base_dir, candidate_dir, output, commands):
+    if set(commands[0]) != set(commands[1]):
+        raise ValueError("benchmark program sets differ")
     pairs = []
     for pair in range(count):
         results = [{}, {}]
         order = (0, 1) if pair % 2 == 0 else (1, 0)
-        for program in PROGRAMS:
+        for program in commands[0]:
             for side in order:
                 directory = (base_dir, candidate_dir)[side]
                 path = output / f"{label}-{pair:02d}-{side}-{program}.log"
-                results[side].update(run_one(directory, program, path))
+                results[side].update(run_one(directory, program, path, commands[side][program]))
         pairs.append(results)
         print(f"{label}: pair {pair + 1}/{count} complete", flush=True)
     return pairs
@@ -133,18 +140,23 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--pairs", type=int, default=12)
     parser.add_argument("--calibration-pairs", type=int, default=6)
+    parser.add_argument("--suite", choices=("polling", "rearm-batch"), default="polling")
     args = parser.parse_args()
     if args.pairs < 6 or args.calibration_pairs < 6:
         parser.error("each phase needs at least six pairs")
     args.output.mkdir(parents=True, exist_ok=True)
+    commands = (PROGRAMS, PROGRAMS) if args.suite == "polling" else (
+        {"bench_rearm_batch": ["scalar", "500"]},
+        {"bench_rearm_batch": ["batch", "500"]})
     metadata = {"base_sha": args.base_sha, "candidate_sha": args.candidate_sha,
                 "base_dir": str(args.base_dir), "candidate_dir": str(args.candidate_dir),
-                "commands": PROGRAMS, "pairs": args.pairs,
+                "commands": commands, "suite": args.suite, "pairs": args.pairs,
                 "calibration_pairs": args.calibration_pairs}
     (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    collect_phase("warmup", 1, args.base_dir, args.candidate_dir, args.output)
-    aa = collect_phase("aa", args.calibration_pairs, args.base_dir, args.base_dir, args.output)
-    ab = collect_phase("ab", args.pairs, args.base_dir, args.candidate_dir, args.output)
+    collect_phase("warmup", 1, args.base_dir, args.candidate_dir, args.output, commands)
+    aa = collect_phase("aa", args.calibration_pairs, args.base_dir, args.base_dir,
+                       args.output, (commands[0], commands[0]))
+    ab = collect_phase("ab", args.pairs, args.base_dir, args.candidate_dir, args.output, commands)
     summary = summarize(aa, ab)
     report = {"metadata": metadata, "summary": summary, "aa": aa, "ab": ab}
     (args.output / "comparison.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

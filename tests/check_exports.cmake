@@ -27,6 +27,7 @@ if(WEPOLL_EX_EXPORT_FORMAT STREQUAL "ELF")
         epoll_pwait2_ex
         epoll_rearm
         epoll_rearm_classes
+        epoll_rearm_classes_batch
         epoll_wait_ex
         wepoll_close
         wepoll_ex_close_socket
@@ -102,6 +103,7 @@ elseif(WEPOLL_EX_EXPORT_FORMAT STREQUAL "PE")
         epoll_pwait2_ex
         epoll_rearm
         epoll_rearm_classes
+        epoll_rearm_classes_batch
         epoll_wait
         epoll_wait_ex
         wepoll_close

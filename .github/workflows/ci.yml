@@ -68,6 +68,11 @@ jobs:
         run: |
           ctest --preset ${{ matrix.preset }} --output-on-failure
 
+      - name: Repeat batch-rearm edge cases
+        shell: msys2 {0}
+        run: |
+          ctest --preset ${{ matrix.preset }} --output-on-failure -R rearm_batch --repeat until-fail:3
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v7
@@ -173,6 +178,8 @@ jobs:
           bench_dir=build/presets/mingw-combined/bench
           bash scripts/run-logged.sh "$bench_dir/bench_windows_results.txt" "$bench_dir/bench_windows.exe"
           bash scripts/run-logged.sh "$bench_dir/bench_mt_contention_results.txt" "$bench_dir/bench_mt_contention.exe"
+          bash scripts/run-logged.sh "$bench_dir/bench_rearm_scalar_results.txt" "$bench_dir/bench_rearm_batch.exe" scalar 500
+          bash scripts/run-logged.sh "$bench_dir/bench_rearm_batch_results.txt" "$bench_dir/bench_rearm_batch.exe" batch 500
 
       - name: Upload benchmark results
         if: always()
@@ -257,7 +264,8 @@ jobs:
           compare_root=$(mktemp -d)
           git worktree add --detach "$compare_root/base" "$base_sha"
           mkdir -p benchmark-comparison
-          gcc --version
+          gcc --version | tee benchmark-comparison/compiler.txt
+          MSYS2_ARG_CONV_EXCL='*' cmd.exe /c ver | tee benchmark-comparison/windows.txt
           for variant in base candidate; do
             source_dir=$PWD
             if [ "$variant" = base ]; then source_dir="$compare_root/base"; fi
@@ -265,12 +273,21 @@ jobs:
               cmake --preset mingw-combined -S "$source_dir" -B "$compare_root/$variant-build"
             bash scripts/run-logged.sh "benchmark-comparison/$variant-build.log" \
               cmake --build "$compare_root/$variant-build" --parallel 4 --target bench_windows bench_mt_contention
+            bash scripts/run-logged.sh "benchmark-comparison/$variant-cache.log" \
+              cmake -N -LA "$compare_root/$variant-build"
           done
+          bash scripts/run-logged.sh benchmark-comparison/rearm-build.log \
+            cmake --build "$compare_root/candidate-build" --parallel 4 --target bench_rearm_batch
           python -B scripts/compare-windows-bench.py \
             --base-dir "$compare_root/base-build/bench" \
             --candidate-dir "$compare_root/candidate-build/bench" \
             --base-sha "$base_sha" --candidate-sha "$candidate_sha" \
             --output benchmark-comparison
+          python -B scripts/compare-windows-bench.py --suite rearm-batch \
+            --base-dir "$compare_root/candidate-build/bench" \
+            --candidate-dir "$compare_root/candidate-build/bench" \
+            --base-sha "$candidate_sha" --candidate-sha "$candidate_sha" \
+            --output benchmark-comparison/rearm-batch
       - name: Upload comparison evidence
         if: always()
         uses: actions/upload-artifact@v7

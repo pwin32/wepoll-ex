@@ -136,6 +136,7 @@ Windows-engine implementation.
 The header [`include/wepoll_ex.h`](include/wepoll_ex.h) declares
 `epoll_create_ex`, `epoll_ctl_ctx`, `epoll_wait_ex`, `epoll_pwait2_ex`,
 `epoll_ctl_batch`, `epoll_drain`, `epoll_rearm`, `epoll_rearm_classes`,
+`epoll_rearm_classes_batch`,
 `epoll_fd_count`, version helpers, capability/socket-lifetime/statistics
 queries, `wepoll_ex_get_last_error_info`, `wepoll_ex_wake`,
 `wepoll_ex_wake_event`, `wepoll_ex_dup`, `wepoll_ex_close_socket`,
@@ -210,6 +211,22 @@ of nginx-style continuously writable registrations.  Rearming an
 incompletely drained class immediately reports its still-true level once and
 disarms it again.  MOD clears all disarms, `epoll_rearm()` acknowledges all
 classes, and DEL works while the registration is idle or pending.
+
+`epoll_rearm_classes_batch(epfd, fds, classes, errors, count)` acknowledges
+several sockets in order, using the same class and ONESHOT rules. Each
+`errors[i]` is zero or a portable errno; failures do not stop later entries or
+roll back successful ones. The return is zero only when all entries and any
+required waiter wakes succeed, otherwise -1 with the first failure preserved
+in the error-info channel. A fatal wake failure can leave every entry successful
+while returning -1, in which case the port must be torn down. Counts must be
+positive and the three arrays must be valid, disjoint, and caller-owned for the
+duration of the call. Invalid count, null arrays, or invalid epfd leave the
+error array untouched. Duplicates are processed in order, not combined; the
+batch is not atomic with respect to waits or control operations. Applications
+must synchronize saved entries against DEL/re-ADD and native close because
+numeric descriptors do not identify a registration generation. Windows reports
+`WEPOLL_EX_CAP_BATCH_EXPLICIT_REARM`; POSIX returns `EOPNOTSUPP` without
+touching the output. Scalar callers and default polling paths are unchanged.
 
 This explicit contract is socket-only and rejects `EPOLLEXCLUSIVE`; it does
 not change ordinary observed-edge ports, pipe/waitable ET, or POSIX native

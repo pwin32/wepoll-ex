@@ -572,6 +572,22 @@ temporary fallback signal mask before unwinding.
   API as unsupported. The mode supplies a deterministic drain/ack primitive
   for an nginx experiment; nginx still needs per-handler rearm hooks and cannot
   use its unmodified Linux module.
+- `epoll_rearm_classes_batch()` is an opt-in Windows control-path optimization
+  over the same explicit-class state transition. One public epfd reference
+  protects the whole call, while `fd_table_lock` covers at most 64 entries at a
+  time. There is no batch-sized allocation and no change to the scalar or wait
+  path. Entries retain per-socket identity checks, cancellation/queued-completion
+  handling, ONESHOT rollback, and ready-node `EBUSY` rules. Duplicate fds are
+  processed sequentially, not unioned. Closing the port marks remaining entries
+  `EBADF`; independent entry failures do not stop later acknowledgements.
+  Successful local-shutdown acknowledgements coalesce their waiter wake within
+  each chunk, even if another entry fails. A fatal post failure leaves applied
+  entries intact and can fail the call with all-zero entry errors. The first
+  entry or wake failure is restored to both portable and native error channels
+  after all processing. Callers must not concurrently mutate/overlap the arrays
+  or reuse a saved numeric fd for a different registration. Chunking bounds work
+  per lock acquisition, not worst-case scheduling latency or cross-thread
+  atomicity. It does not combine AFD submissions across sockets.
 - `EPOLLEXCLUSIVE` applies only to socket registrations and may be set only by
   ADD. It may be combined with `EPOLLET`, but not with `EPOLLONESHOT`,
   `EPOLLRDHUP`, or unsupported event bits. Every MOD of a registration added

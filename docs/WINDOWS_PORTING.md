@@ -139,6 +139,19 @@ returns `EBUSY`. `EPOLLEXCLUSIVE` remains incompatible with explicit-rearm ET,
 and pipes/waitable HANDLEs retain their separate observed-edge adapters. POSIX
 reports the creation mode and class-rearm operations unsupported.
 
+Loops with several completed handlers can use
+`epoll_rearm_classes_batch(epfd, fds, classes, errors, count)` when
+`WEPOLL_EX_CAP_BATCH_EXPLICIT_REARM` is present. Supply one positive class mask
+per socket after consuming its ready record; inspect every entry error even
+when the call returns -1. Entries with zero errors remain applied, and later
+entries are attempted after a failure. Invalid top-level arguments leave the
+error array untouched. Fatal waiter-wake failure can fail the whole call with
+all-zero entry errors and requires port teardown. The batch may interleave
+with other control/wait calls and must not outlive the application's registration
+ownership: synchronize DEL/re-ADD/native close against saved entries. It is
+not a generation-tagged deferred command queue. Scalar rearm remains available
+for individual completions; the nginx adapter is not switched automatically.
+
 This facility makes Mio-style `WouldBlock` ownership and an nginx-style
 handler-completion experiment expressible. It does not automatically discover
 that a handler drained a socket. The checked-in nginx adapter now places the

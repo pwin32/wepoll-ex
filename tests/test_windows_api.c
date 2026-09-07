@@ -177,7 +177,8 @@ static void test_operational_stats(void)
         WEPOLL_EX_CAP_EXPLICIT_REARM_ONESHOT |
         WEPOLL_EX_CAP_VIRTUAL_EPOLL_DUP |
         WEPOLL_EX_CAP_ERROR_INFO |
-        WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER;
+        WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER |
+        WEPOLL_EX_CAP_BATCH_EXPLICIT_REARM;
     wepoll_ex_capabilities capabilities;
     wepoll_ex_global_stats global_stats;
     wepoll_ex_stats stats;

@@ -1211,6 +1211,20 @@ WEPOLL_EX_API int epoll_rearm_classes(int epfd, int fd, uint32_t classes)
     return -1;
 }
 
+WEPOLL_EX_API int epoll_rearm_classes_batch(int epfd,
+                                            const epoll_fd_t *fds,
+                                            const uint32_t *classes,
+                                            int *errors, int count)
+{
+    (void)epfd;
+    (void)fds;
+    (void)classes;
+    (void)errors;
+    (void)count;
+    errno = EOPNOTSUPP;
+    return -1;
+}
+
 WEPOLL_EX_API int epoll_fd_count(int epfd)
 {
     posix_port_t *p = port_acquire_or_create(epfd);

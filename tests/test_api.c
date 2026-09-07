@@ -683,6 +683,18 @@ static void test_extension_api(void)
         FAIL("POSIX explicit rearm support boundary");
         return;
     }
+    epoll_fd_t batch_fd = EPOLL_FD_INVALID;
+    uint32_t batch_classes = WEPOLL_EX_REARM_ALL;
+    int batch_error = 123;
+    if (epoll_rearm_classes_batch(-1, &batch_fd, &batch_classes,
+                                  &batch_error, 1) != -1 ||
+        errno != EOPNOTSUPP || batch_error != 123 ||
+        epoll_rearm_classes_batch(-1, NULL, NULL, NULL, 0) != -1 ||
+        errno != EOPNOTSUPP ||
+        (capabilities.flags & WEPOLL_EX_CAP_BATCH_EXPLICIT_REARM) != 0) {
+        FAIL("POSIX batch rearm support boundary");
+        return;
+    }
     PASS();
 
     TEST("portable error information exposes the current POSIX errno");

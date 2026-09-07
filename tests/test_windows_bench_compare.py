@@ -25,6 +25,16 @@ class ComparisonTests(unittest.TestCase):
             with self.subTest(body=body), self.assertRaises(ValueError):
                 compare.parse_result("bench_mt_contention", header + body)
 
+    def test_rearm_requires_all_sizes_and_both_timings(self):
+        header = "benchmark,parameter,samples,p50_ns,p95_ns,p99_ns,operations_per_second\n"
+        rows = [f"{name},{size},500,100,200,300,100000\n"
+                for name, size in sorted(compare.REARM_KEYS)]
+        self.assertEqual(len(compare.parse_result("bench_rearm_batch", header + "".join(rows))), 32)
+        for body in ("".join(rows[1:]), "".join(rows + rows[:1]),
+                     "".join(rows).replace(",100000\n", ",0\n")):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                compare.parse_result("bench_rearm_batch", header + body)
+
     def test_paired_direction_and_interval(self):
         self.assertAlmostEqual(compare.paired_change(100, 110), 10)
         self.assertAlmostEqual(compare.paired_change(110, 100, throughput=True), 10)

@@ -25,6 +25,27 @@ int main(void)
     if (epfd < 0) {
         return 3;
     }
+    epoll_fd_t batch_fd = EPOLL_FD_INVALID;
+    uint32_t batch_class = WEPOLL_EX_REARM_ALL;
+    int batch_error = 123;
+    if (epoll_rearm_classes_batch(epfd, &batch_fd, &batch_class,
+                                  &batch_error, 1) != -1) {
+        (void)wepoll_close(epfd);
+        return 7;
+    }
+#ifdef _WIN32
+    if (errno != EBADF || batch_error != EBADF ||
+        (capabilities.flags & WEPOLL_EX_CAP_BATCH_EXPLICIT_REARM) == 0) {
+        (void)wepoll_close(epfd);
+        return 8;
+    }
+#else
+    if (errno != EOPNOTSUPP || batch_error != 123 ||
+        (capabilities.flags & WEPOLL_EX_CAP_BATCH_EXPLICIT_REARM) != 0) {
+        (void)wepoll_close(epfd);
+        return 8;
+    }
+#endif
 
     struct epoll_event wake_event;
     memset(&wake_event, 0, sizeof(wake_event));

@@ -5648,6 +5648,75 @@ int ep_port_rearm_classes(ep_port_t *port, SOCKET fd, uint32_t classes)
     return result;
 }
 
+int ep_port_rearm_classes_batch(ep_port_t *port, const epoll_fd_t *fds,
+                                 const uint32_t *classes, int *errors,
+                                 int count)
+{
+    enum { REARM_CHUNK_SIZE = 64 };
+    wepoll_ex_error_info first_error = {0};
+    int failed = 0;
+    int offset = 0;
+
+    /* Only batch callers share this lock scope.  Limit its size so large
+     * arrays do not exclude waits/control for the entire submission. */
+    while (offset < count) {
+        int end = count - offset > REARM_CHUNK_SIZE
+            ? offset + REARM_CHUNK_SIZE : count;
+        int wake_ready_waiter = 0;
+
+        pthread_mutex_lock(&port->fd_table_lock);
+        for (int i = offset; i < end; i++) {
+            ep_sock_t *sock;
+            int result = -1;
+            int wake = 0;
+
+            if (atomic_load_explicit(&port->closing, memory_order_acquire)) {
+                ep_set_errno(EBADF);
+            } else if (fds[i] == EPOLL_FD_INVALID) {
+                ep_set_errno(EBADF);
+            } else if (classes[i] == 0 ||
+                       (classes[i] & ~WEPOLL_EX_REARM_ALL) != 0) {
+                ep_set_errno(EINVAL);
+            } else if ((sock = ep_fd_table_lookup(port, fds[i])) == NULL) {
+                (void)ep_target_fail_absent(fds[i]);
+            } else if (ep_sock_validate_control_locked(port, sock) != 0) {
+                /* Validation can retire a stale registration. */
+            } else if (!ep_sock_explicit_rearm_enabled(sock)) {
+                ep_set_errno(EOPNOTSUPP);
+            } else {
+                result = ep_sock_rearm_classes_locked(
+                    port, sock, (uint8_t)classes[i], &wake);
+            }
+            errors[i] = result == 0 ? 0 : ep_last_err();
+            if (result != 0 && !failed) {
+                ep_get_last_error_info(&first_error);
+                failed = 1;
+            }
+            wake_ready_waiter |= wake;
+        }
+        pthread_mutex_unlock(&port->fd_table_lock);
+
+        /* Earlier successful local-shutdown rearms still need a wake even
+         * if a later entry failed.  Coalesce only within this lock chunk. */
+        if (wake_ready_waiter) {
+            DWORD post_error = ERROR_SUCCESS;
+
+            if (!ep_port_post_iocp(port, 0, NULL, EP_FAULT_IOCP_POST,
+                                   &post_error)) {
+                ep_port_fail_iocp_post(port, post_error);
+                ep_set_win32_error(post_error);
+                if (!failed) {
+                    ep_get_last_error_info(&first_error);
+                    failed = 1;
+                }
+            }
+        }
+        offset = end;
+    }
+    if (failed) ep_restore_last_error_info(&first_error);
+    return failed ? -1 : 0;
+}
+
 int ep_port_rearm(ep_port_t *port, SOCKET fd)
 {
     uint32_t old_pending_events;

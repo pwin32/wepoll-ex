@@ -730,6 +730,30 @@ WEPOLL_EX_API int epoll_rearm_classes(int epfd, epoll_fd_t fd,
     return result;
 }
 
+WEPOLL_EX_API int epoll_rearm_classes_batch(int epfd,
+                                            const epoll_fd_t *fds,
+                                            const uint32_t *classes,
+                                            int *errors, int count)
+{
+    epfd_shared_t *entry;
+    int result;
+
+    if (count <= 0) {
+        ep_set_errno(EINVAL);
+        return -1;
+    }
+    if (fds == NULL || classes == NULL || errors == NULL) {
+        ep_set_errno(EFAULT);
+        return -1;
+    }
+    entry = epfd_require(epfd);
+    if (entry == NULL) return -1;
+    result = ep_port_rearm_classes_batch(
+        entry->port, fds, classes, errors, count);
+    epfd_put(entry);
+    return result;
+}
+
 WEPOLL_EX_API int epoll_fd_count(int epfd)
 {
     epfd_shared_t *entry = epfd_require(epfd);
@@ -810,7 +834,8 @@ WEPOLL_EX_API int wepoll_ex_get_capabilities(
                      WEPOLL_EX_CAP_EXPLICIT_REARM_ONESHOT |
                      WEPOLL_EX_CAP_VIRTUAL_EPOLL_DUP |
                      WEPOLL_EX_CAP_ERROR_INFO |
-                     WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER;
+                     WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER |
+                     WEPOLL_EX_CAP_BATCH_EXPLICIT_REARM;
     return copy_versioned_snapshot(capabilities, capabilities_size,
                                    &snapshot, sizeof(snapshot));
 }

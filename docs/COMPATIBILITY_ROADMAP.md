@@ -148,9 +148,14 @@ and evaluate batched qualification before changing correctness behavior.
 The nginx explicit-rearm comparison now supplies application-level evidence.
 Ten paired tiny-response runs measured edge 8.64% below level at the paired
 median. Counters showed approximately one READ acknowledgement per request and
-zero WRITE rearms, so a batched class-acknowledgement API is a concrete future
-optimization candidate. It must define partial failure, stale registration,
-and per-entry error behavior before becoming a public API.
+zero WRITE rearms, motivating the opt-in `epoll_rearm_classes_batch()` API.
+It now defines ordered, independent entry errors, preserves earlier successes,
+and requires application synchronization against stale saved registrations.
+Same-runner CI compares actual scalar/batch readiness cycles separately from
+ordinary pre-change polling. The earlier nginx result motivates measurement;
+it does not prove that the acknowledgement lock caused the application-level
+gap, and the nginx adapter remains unchanged pending separate integration
+and end-to-end evidence.
 
 ### Exclusive wake scope
 

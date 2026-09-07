@@ -837,6 +837,9 @@ int  ep_port_unregister(ep_port_t *port, SOCKET fd);
 int  ep_port_shutdown_socket(ep_port_t *port, SOCKET fd, int how);
 int  ep_port_rearm(ep_port_t *port, SOCKET fd);
 int  ep_port_rearm_classes(ep_port_t *port, SOCKET fd, uint32_t classes);
+int  ep_port_rearm_classes_batch(ep_port_t *port, const epoll_fd_t *fds,
+                                 const uint32_t *classes, int *errors,
+                                 int count);
 int  ep_port_wake(ep_port_t *port);
 int  ep_port_wake_event(ep_port_t *port,
                         const struct epoll_event *event);

@@ -6,6 +6,24 @@ This is an experimental preview of the extended epoll-shaped API, the Windows
 IOCP/AFD backend, the Linux development wrapper, and the optional nginx 1.31.3
 adapter. The API and ABI may change before a stable release.
 
+The opt-in Windows `epoll_rearm_classes_batch()` extension acknowledges several
+explicit-rearm socket registrations with per-entry portable errors and first-
+failure native diagnostics. Independent failures do not stop later entries;
+successful acknowledgements remain applied. It shares the scalar transition,
+including partial ONESHOT acknowledgement, submission rollback, and ready-node
+`EBUSY`, while amortizing the epfd reference and taking the control lock in
+bounded chunks. Ordinary scalar calls and polling are unchanged. The new
+`WEPOLL_EX_CAP_BATCH_EXPLICIT_REARM` bit advertises it; the POSIX symbol returns
+`EOPNOTSUPP` without modifying output. PE/ELF export checks and installed
+consumers intentionally include the new preview API; package/SONAME exact
+version policy remains unchanged. Focused tests cover validation, mixed errors,
+duplicate descriptors, multiple chunks, alias/ONESHOT/terminal behavior,
+incomplete drains, waiter close, and injected submission/wake failures. CI
+repeats these cases and compares scalar versus batch acknowledgement and full
+readiness cycles at 1/16/64/256 sockets, separately from the same-runner
+pre-change-versus-candidate ordinary-polling regression comparison. No nginx
+adapter or supplemental AFD request changes are included.
+
 The Windows review follow-up frees an unused reaper context when the bounded
 quarantine worker pool is full. Kernel-owned port storage is still retained
 as required by the existing abandonment contract. The contention benchmark

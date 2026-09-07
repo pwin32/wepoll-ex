@@ -237,6 +237,8 @@ typedef struct wepoll_ex_global_stats {
     (UINT64_C(1) << 13)
 #define WEPOLL_EX_CAP_SHUTDOWN_SOCKET_HELPER \
     (UINT64_C(1) << 14)
+#define WEPOLL_EX_CAP_BATCH_EXPLICIT_REARM \
+    (UINT64_C(1) << 15)
 
 typedef struct wepoll_ex_capabilities {
     uint32_t version;
@@ -408,6 +410,29 @@ WEPOLL_EX_API int  epoll_rearm(int epfd, epoll_fd_t fd);
  * POSIX reports EOPNOTSUPP. */
 WEPOLL_EX_API int  epoll_rearm_classes(int epfd, epoll_fd_t fd,
                                        uint32_t classes);
+
+/* Ordered, nontransactional explicit-class acknowledgements for one port.
+ * Each errors[i] is zero on success or a portable errno for that entry; an
+ * entry failure does not prevent later entries from being attempted. Returns
+ * zero only when every entry and any required waiter wake succeed, otherwise
+ * -1 with the first failure in errno/the native error channel. A failed wake
+ * can return -1 even when every errors[i] is zero: those acknowledgements
+ * remain applied, but the port is unusable. Close leaves unprocessed entries
+ * with EBADF. Successful entries are never rolled back.
+ *
+ * count must be positive; all three arrays must be non-NULL, valid for count
+ * elements, mutually nonoverlapping, and exclusively owned during the call.
+ * Invalid count/arrays/epfd fail before writing errors. Per-entry validation,
+ * ONESHOT, EBUSY, and idempotence follow epoll_rearm_classes(). Duplicate fds
+ * are processed in order, not combined. Calls may interleave with waits and
+ * control operations between bounded chunks; the batch is not atomic.
+ * Callers must synchronize DEL/re-ADD/native close with saved batch entries:
+ * numeric fds are not registration-generation tokens. POSIX returns
+ * EOPNOTSUPP without touching errors. */
+WEPOLL_EX_API int epoll_rearm_classes_batch(int epfd,
+                                            const epoll_fd_t *fds,
+                                            const uint32_t *classes,
+                                            int *errors, int count);
 
 /* Return the number of registrations tracked by this extension.  Windows
  * counts registrations in the virtual epoll instance.  POSIX counts entries
