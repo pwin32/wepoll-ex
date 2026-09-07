@@ -244,6 +244,7 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-python
+            git
             make
       - name: Build and compare
         shell: msys2 {0}
