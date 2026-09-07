@@ -231,11 +231,15 @@ jobs:
           retention-days: 30
 
   compare-windows:
-    name: Paired Benchmark (Windows)
+    name: Paired Benchmark (Windows, ${{ matrix.preset }})
     if: github.event_name == 'workflow_dispatch' && inputs.benchmark_base != ''
     needs: build-test-windows
     runs-on: windows-2022
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [mingw-combined, mingw-strict, mingw-synchronized]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -257,6 +261,7 @@ jobs:
         shell: msys2 {0}
         env:
           BENCHMARK_BASE: ${{ inputs.benchmark_base }}
+          BENCHMARK_PRESET: ${{ matrix.preset }}
         run: |
           set -euo pipefail
           base_sha=$(git rev-parse --verify --end-of-options "$BENCHMARK_BASE^{commit}")
@@ -270,7 +275,7 @@ jobs:
             source_dir=$PWD
             if [ "$variant" = base ]; then source_dir="$compare_root/base"; fi
             bash scripts/run-logged.sh "benchmark-comparison/$variant-configure.log" \
-              cmake --preset mingw-combined -S "$source_dir" -B "$compare_root/$variant-build"
+              cmake --preset "$BENCHMARK_PRESET" -S "$source_dir" -B "$compare_root/$variant-build"
             bash scripts/run-logged.sh "benchmark-comparison/$variant-build.log" \
               cmake --build "$compare_root/$variant-build" --parallel 4 --target bench_windows bench_mt_contention
             bash scripts/run-logged.sh "benchmark-comparison/$variant-cache.log" \
@@ -292,6 +297,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: windows-paired-comparison
+          name: windows-paired-comparison-${{ matrix.preset }}
           path: benchmark-comparison/
           retention-days: 30

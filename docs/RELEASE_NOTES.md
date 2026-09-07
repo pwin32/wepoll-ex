@@ -21,8 +21,12 @@ duplicate descriptors, multiple chunks, alias/ONESHOT/terminal behavior,
 incomplete drains, waiter close, and injected submission/wake failures. CI
 repeats these cases and compares scalar versus batch acknowledgement and full
 readiness cycles at 1/16/64/256 sockets, separately from the same-runner
-pre-change-versus-candidate ordinary-polling regression comparison. No nginx
-adapter or supplemental AFD request changes are included.
+pre-change-versus-candidate ordinary-polling regression comparison. The paired
+CI dispatch covers best-effort, strict, and synchronized lifetime policies,
+with compiler, Windows version, effective CMake flags, and raw runs archived.
+Benefit depends on policy and workload; per-socket identity checks and native
+submissions are not eliminated by batching. No nginx adapter or supplemental
+AFD request changes are included.
 
 The Windows review follow-up frees an unused reaper context when the bounded
 quarantine worker pool is full. Kernel-owned port storage is still retained
