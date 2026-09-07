@@ -32,6 +32,7 @@
 
 #include "wepoll_ex.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -110,6 +111,7 @@ typedef struct wait_context {
     struct epoll_event *events;
     uint64_t waits;
     uint64_t delivered;
+    uint64_t active_delivered;
 } wait_context_t;
 
 static unsigned __stdcall wait_thread(void *argument)
@@ -120,12 +122,21 @@ static unsigned __stdcall wait_thread(void *argument)
         int count;
 
         for (unsigned i = 0; i < context->active_count; i++) {
-            (void)send(context->active[i].client, "x", 1, 0);
+            if (send(context->active[i].client, "x", 1, 0) != 1) {
+                fprintf(stderr, "wait_thread: send failed (WSA=%d)\n",
+                        WSAGetLastError());
+                return 1;
+            }
         }
         count = epoll_wait(context->epfd, context->events,
                            (int)context->active_count, 50);
         context->waits++;
-        if (count <= 0) continue;
+        if (count < 0) {
+            fprintf(stderr, "wait_thread: epoll_wait failed (errno=%d)\n",
+                    errno);
+            return 1;
+        }
+        if (count == 0) continue;
 
         context->delivered += (uint64_t)count;
         for (int i = 0; i < count; i++) {
@@ -133,8 +144,17 @@ static unsigned __stdcall wait_thread(void *argument)
             char sink[64];
 
             if (index < context->active_count) {
-                (void)recv(context->active[index].server, sink,
-                           (int)sizeof(sink), 0);
+                int received = recv(context->active[index].server, sink,
+                                     (int)sizeof(sink), 0);
+
+                if (received > 0) {
+                    context->active_delivered++;
+                } else if (received == 0 ||
+                           WSAGetLastError() != WSAEWOULDBLOCK) {
+                    fprintf(stderr, "wait_thread: recv failed (WSA=%d)\n",
+                            received == 0 ? 0 : WSAGetLastError());
+                    return 1;
+                }
             }
         }
     }
@@ -185,6 +205,7 @@ int main(int argc, char **argv)
     HANDLE thread = NULL;
     int epfd = -1;
     int result = 1;
+    DWORD worker_result;
     uint64_t deadline;
 
     if (active_count == 0 || churn_count == 0 || seconds == 0) {
@@ -200,6 +221,18 @@ int main(int argc, char **argv)
     add_samples = (uint64_t *)calloc(sample_capacity, sizeof(uint64_t));
     mod_samples = (uint64_t *)calloc(sample_capacity, sizeof(uint64_t));
     del_samples = (uint64_t *)calloc(sample_capacity, sizeof(uint64_t));
+    if (active != NULL) {
+        for (unsigned i = 0; i < active_count; i++) {
+            active[i].listener = active[i].client = active[i].server =
+                INVALID_SOCKET;
+        }
+    }
+    if (churn != NULL) {
+        for (unsigned i = 0; i < churn_count; i++) {
+            churn[i].listener = churn[i].client = churn[i].server =
+                INVALID_SOCKET;
+        }
+    }
     if (active == NULL || churn == NULL || events == NULL ||
         add_samples == NULL || mod_samples == NULL || del_samples == NULL) {
         goto cleanup;
@@ -253,6 +286,7 @@ int main(int argc, char **argv)
             start = now_ticks();
             if (epoll_ctl(epfd, EPOLL_CTL_ADD, churn[i].server,
                           &event) != 0) {
+                fprintf(stderr, "ctl_add failed (errno=%d)\n", errno);
                 goto stop;
             }
             if (add_count < sample_capacity) {
@@ -263,6 +297,7 @@ int main(int argc, char **argv)
             start = now_ticks();
             if (epoll_ctl(epfd, EPOLL_CTL_MOD, churn[i].server,
                           &event) != 0) {
+                fprintf(stderr, "ctl_mod failed (errno=%d)\n", errno);
                 goto stop;
             }
             if (mod_count < sample_capacity) {
@@ -271,6 +306,7 @@ int main(int argc, char **argv)
 
             start = now_ticks();
             if (epoll_ctl(epfd, EPOLL_CTL_DEL, churn[i].server, NULL) != 0) {
+                fprintf(stderr, "ctl_del failed (errno=%d)\n", errno);
                 goto stop;
             }
             if (del_count < sample_capacity) {
@@ -278,26 +314,32 @@ int main(int argc, char **argv)
             }
         }
     }
+    result = 0;
 
 stop:
     InterlockedExchange(&g_stop, 1);
-    WaitForSingleObject(thread, 5000);
+    if (WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0) {
+        /* The worker still owns context and socket storage.  Process exit
+         * is safe; ordinary cleanup after a timed-out join is not. */
+        fprintf(stderr, "wait_thread: join failed\n");
+        ExitProcess(1);
+    }
+    if (!GetExitCodeThread(thread, &worker_result) || worker_result != 0 ||
+        context.active_delivered == 0) {
+        fprintf(stderr, "wait_thread: failed or no active readiness delivered\n");
+        result = 1;
+    }
     CloseHandle(thread);
     thread = NULL;
 
+    if (result != 0) goto cleanup;
     report("ctl_add", add_samples, add_count);
     report("ctl_mod", mod_samples, mod_count);
     report("ctl_del", del_samples, del_count);
     fprintf(stderr, "wait_thread: waits=%" PRIu64 " delivered=%" PRIu64 "\n",
             context.waits, context.delivered);
-    result = 0;
 
 cleanup:
-    if (thread != NULL) {
-        InterlockedExchange(&g_stop, 1);
-        WaitForSingleObject(thread, 5000);
-        CloseHandle(thread);
-    }
     if (epfd >= 0) (void)wepoll_close(epfd);
     if (churn != NULL) {
         for (unsigned i = 0; i < churn_count; i++) pair_close(&churn[i]);

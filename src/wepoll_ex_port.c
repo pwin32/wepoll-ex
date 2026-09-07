@@ -4704,6 +4704,7 @@ static int ep_port_quarantine_recoverable_locked(ep_port_t *port, int error)
     atomic_fetch_add_explicit(&g_quarantined_ports, 1,
                               memory_order_relaxed);
     if (!ep_port_reaper_admit()) {
+        free(context);
         ep_port_abandon_locked(port);
         ep_set_errno(error);
         return -1;

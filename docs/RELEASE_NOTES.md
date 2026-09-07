@@ -6,6 +6,21 @@ This is an experimental preview of the extended epoll-shaped API, the Windows
 IOCP/AFD backend, the Linux development wrapper, and the optional nginx 1.31.3
 adapter. The API and ABI may change before a stable release.
 
+The Windows review follow-up frees an unused reaper context when the bounded
+quarantine worker pool is full. Kernel-owned port storage is still retained
+as required by the existing abandonment contract. The contention benchmark
+now rejects failed control/worker operations, absent active readiness, and
+failed worker joins instead of publishing successful timing results. CI log
+capture preserves command and log-write failures for configure, build, and
+benchmark steps. Focused regressions exercise reaper saturation, benchmark
+ADD/MOD/DEL and worker failures, and logged-command exit status.
+An optional CI dispatch `benchmark_base` runs both revisions on one Windows
+runner with identical build settings, six A/A calibration pairs, and twelve
+alternating-order A/B pairs after warmup. Raw output, exact commit IDs, paired
+deltas, and distribution-free median confidence intervals are archived for
+review. A successful collection job alone is not a performance acceptance
+gate; noisy comparisons need more evidence before merging.
+
 On August 4, 2026, compatibility follow-up work began with a documented nginx
 and Linux-semantic roadmap. A versioned capability query now distinguishes
 native Linux edge queues from Windows observed-edge filtering, process-local

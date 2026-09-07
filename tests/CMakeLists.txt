@@ -1,3 +1,18 @@
+find_program(WEPOLL_EX_BASH_EXECUTABLE bash)
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME wepoll_ex_windows_bench_compare
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${PROJECT_SOURCE_DIR}/tests/test_windows_bench_compare.py")
+    set_tests_properties(wepoll_ex_windows_bench_compare PROPERTIES TIMEOUT 15)
+endif()
+if(WEPOLL_EX_BASH_EXECUTABLE)
+    add_test(NAME wepoll_ex_ci_logging
+        COMMAND "${WEPOLL_EX_BASH_EXECUTABLE}"
+            "${PROJECT_SOURCE_DIR}/tests/test_ci_logging.sh")
+    set_tests_properties(wepoll_ex_ci_logging PROPERTIES TIMEOUT 15)
+endif()
+
 if(WEPOLL_EX_PLATFORM_POSIX)
     add_executable(test_wepoll_ex test_api.c)
     target_link_libraries(test_wepoll_ex PRIVATE wepoll_ex::wepoll_ex)
@@ -41,6 +56,28 @@ if(WEPOLL_EX_PLATFORM_POSIX)
         message(STATUS "Skipping pool test: it requires the internal static library symbols")
     endif()
 else()
+    add_executable(test_wepoll_ex_windows_benchmark test_windows_benchmark.c)
+    target_compile_definitions(test_wepoll_ex_windows_benchmark PRIVATE
+        ${WEPOLL_EX_PLATFORM_DEFINITIONS})
+    if(WEPOLL_EX_BUILD_STATIC)
+        target_link_libraries(test_wepoll_ex_windows_benchmark PRIVATE
+            wepoll_ex_static ws2_32)
+    else()
+        target_link_libraries(test_wepoll_ex_windows_benchmark PRIVATE
+            wepoll_ex::wepoll_ex ws2_32)
+    endif()
+    foreach(_benchmark_mode IN ITEMS add mod del wait empty send recv join success)
+        add_test(NAME wepoll_ex_windows_benchmark_${_benchmark_mode}
+            COMMAND test_wepoll_ex_windows_benchmark ${_benchmark_mode})
+        set_tests_properties(wepoll_ex_windows_benchmark_${_benchmark_mode}
+            PROPERTIES TIMEOUT 15)
+        if(NOT WEPOLL_EX_BUILD_STATIC)
+            set_tests_properties(wepoll_ex_windows_benchmark_${_benchmark_mode}
+                PROPERTIES ENVIRONMENT
+                    "PATH=$<TARGET_FILE_DIR:wepoll_ex_shared>\;$ENV{PATH}")
+        endif()
+    endforeach()
+
     add_executable(test_wepoll_ex_windows test_windows_api.c)
     target_compile_definitions(test_wepoll_ex_windows PRIVATE
         _WIN32_WINNT=0x0602
@@ -96,6 +133,19 @@ else()
         WIN32_LEAN_AND_MEAN)
 
     if(WEPOLL_EX_BUILD_STATIC)
+        add_executable(test_wepoll_ex_windows_reaper_capacity
+            test_windows_reaper_capacity.c)
+        target_include_directories(test_wepoll_ex_windows_reaper_capacity PRIVATE
+            ${PROJECT_SOURCE_DIR}/src)
+        target_compile_definitions(test_wepoll_ex_windows_reaper_capacity PRIVATE
+            ${WEPOLL_EX_PLATFORM_DEFINITIONS})
+        target_link_libraries(test_wepoll_ex_windows_reaper_capacity PRIVATE
+            wepoll_ex_static Threads::Threads ws2_32)
+        add_test(NAME wepoll_ex_windows_reaper_capacity
+            COMMAND test_wepoll_ex_windows_reaper_capacity)
+        set_tests_properties(wepoll_ex_windows_reaper_capacity PROPERTIES
+            TIMEOUT 15)
+
         target_link_libraries(test_wepoll_ex_windows PRIVATE
             wepoll_ex_static Threads::Threads ws2_32)
         target_link_libraries(test_wepoll_ex_windows_identity PRIVATE

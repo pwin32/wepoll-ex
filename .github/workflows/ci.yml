@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ master, main ]
   workflow_dispatch:
+    inputs:
+      benchmark_base:
+        description: 'Optional base commit for a same-runner Windows comparison'
+        type: string
+        default: ''
 
 jobs:
   build-test-windows:
@@ -15,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [mingw-combined, mingw-strict, mingw-synchronized]
+        preset: [mingw-combined, mingw-static, mingw-shared, mingw-strict, mingw-strict-shared, mingw-synchronized, mingw-synchronized-shared]
 
     defaults:
       run:
@@ -39,21 +44,14 @@ jobs:
       - name: Configure CMake
         shell: msys2 {0}
         run: |
+          set -e
           cmake --version
-          echo "::group::CMake Configure Output"
-          cmake --preset ${{ matrix.preset }} 2>&1 | tee cmake-config.log || true
-          echo "::endgroup::"
-          if [ ! -d "build/presets/${{ matrix.preset }}" ]; then
-            echo "::error::Configuration failed - see cmake-config.log"
-            cat cmake-config.log
-            exit 1
-          fi
+          bash scripts/run-logged.sh cmake-config.log cmake --preset ${{ matrix.preset }}
 
       - name: Build
         shell: msys2 {0}
         run: |
-          cmake --build build/presets/${{ matrix.preset }} --parallel 2>&1 | tee build.log
-          exit ${PIPESTATUS[0]}
+          bash scripts/run-logged.sh build.log cmake --build build/presets/${{ matrix.preset }} --parallel
 
       - name: Upload build logs on failure
         if: failure()
@@ -109,8 +107,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake --build build/presets/${{ matrix.preset }} --parallel 2>&1 | tee build.log
-          exit ${PIPESTATUS[0]}
+          bash scripts/run-logged.sh build.log cmake --build build/presets/${{ matrix.preset }} --parallel
 
       - name: Upload build logs on failure
         if: failure()
@@ -172,12 +169,10 @@ jobs:
       - name: Run Benchmarks
         shell: msys2 {0}
         run: |
-          cd build/presets/mingw-combined/bench
-          echo "=== Running Windows benchmark ==="
-          ./bench_windows.exe 2>&1 | tee bench_windows_results.txt || true
-          echo ""
-          echo "=== Running MT contention benchmark ==="
-          ./bench_mt_contention.exe 2>&1 | tee bench_mt_contention_results.txt || true
+          set -e
+          bench_dir=build/presets/mingw-combined/bench
+          bash scripts/run-logged.sh "$bench_dir/bench_windows_results.txt" "$bench_dir/bench_windows.exe"
+          bash scripts/run-logged.sh "$bench_dir/bench_mt_contention_results.txt" "$bench_dir/bench_mt_contention.exe"
 
       - name: Upload benchmark results
         if: always()
@@ -213,12 +208,10 @@ jobs:
 
       - name: Run Benchmarks
         run: |
-          cd build/presets/posix-release/bench
-          echo "=== Running wait scaling benchmark ==="
-          ./bench_wait_scaling 2>&1 | tee bench_wait_scaling_results.txt || true
-          echo ""
-          echo "=== Running latency benchmark ==="
-          ./bench_latency 2>&1 | tee bench_latency_results.txt || true
+          set -e
+          bench_dir=build/presets/posix-release/bench
+          bash scripts/run-logged.sh "$bench_dir/bench_wait_scaling_results.txt" "$bench_dir/bench_wait_scaling"
+          bash scripts/run-logged.sh "$bench_dir/bench_latency_results.txt" "$bench_dir/bench_latency"
 
       - name: Upload benchmark results
         if: always()
@@ -228,4 +221,59 @@ jobs:
           path: |
             build/presets/posix-release/bench/*.txt
             build/presets/posix-release/bench/*.log
+          retention-days: 30
+
+  compare-windows:
+    name: Paired Benchmark (Windows)
+    if: github.event_name == 'workflow_dispatch' && inputs.benchmark_base != ''
+    needs: build-test-windows
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-python
+            make
+      - name: Build and compare
+        shell: msys2 {0}
+        env:
+          BENCHMARK_BASE: ${{ inputs.benchmark_base }}
+        run: |
+          set -euo pipefail
+          base_sha=$(git rev-parse --verify --end-of-options "$BENCHMARK_BASE^{commit}")
+          candidate_sha=$(git rev-parse HEAD)
+          compare_root=$(mktemp -d)
+          git worktree add --detach "$compare_root/base" "$base_sha"
+          mkdir -p benchmark-comparison
+          gcc --version
+          for variant in base candidate; do
+            source_dir=$PWD
+            if [ "$variant" = base ]; then source_dir="$compare_root/base"; fi
+            bash scripts/run-logged.sh "benchmark-comparison/$variant-configure.log" \
+              cmake --preset mingw-combined -S "$source_dir" -B "$compare_root/$variant-build"
+            bash scripts/run-logged.sh "benchmark-comparison/$variant-build.log" \
+              cmake --build "$compare_root/$variant-build" --parallel 4 --target bench_windows bench_mt_contention
+          done
+          python -B scripts/compare-windows-bench.py \
+            --base-dir "$compare_root/base-build/bench" \
+            --candidate-dir "$compare_root/candidate-build/bench" \
+            --base-sha "$base_sha" --candidate-sha "$candidate_sha" \
+            --output benchmark-comparison
+      - name: Upload comparison evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-paired-comparison
+          path: benchmark-comparison/
           retention-days: 30
