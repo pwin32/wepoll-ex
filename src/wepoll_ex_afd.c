@@ -309,9 +309,8 @@ void ep_afd_poll_key_release(ep_sock_t *sock)
 }
 
 /* --------------------------------------------------------------------- */
-/* Open the AFD device.  wepoll opens a single handle per port and uses */
-/* it as the file handle in NtDeviceIoControlFile calls against each    */
-/* socket fd.                                                            */
+/* Open an AFD control handle for one bounded group of registrations.   */
+/* Every group on a port delivers its completions to the same IOCP.     */
 /* --------------------------------------------------------------------- */
 
 int ep_afd_open(HANDLE iocp, HANDLE *out)
@@ -707,7 +706,8 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
     if (pending_out != NULL) {
         *pending_out = 0;
     }
-    if (sock == NULL || sock->port == NULL || sock->port->afd == NULL ||
+    if (sock == NULL || sock->port == NULL || sock->afd_group == NULL ||
+        sock->afd_group->afd == NULL ||
         g_ntdll.NtDeviceIoControlFile == NULL) {
         ep_set_errno(EINVAL);
         return -1;
@@ -820,7 +820,7 @@ int ep_afd_poll_submit(ep_sock_t *sock, uint32_t afd_events, int *pending_out)
     }
 
     status = g_ntdll.NtDeviceIoControlFile(
-        sock->port->afd,
+        sock->afd_group->afd,
         NULL,                           /* Event — we use IOCP instead */
         NULL,                           /* ApcRoutine */
         &sock->io_status_block,         /* ApcContext returned by IOCP */
@@ -883,7 +883,8 @@ int ep_afd_cancel(ep_sock_t *sock)
     IO_STATUS_BLOCK cancel_status_block;
     NTSTATUS status;
 
-    if (sock == NULL || sock->port == NULL ||
+    if (sock == NULL || sock->port == NULL || sock->afd_group == NULL ||
+        sock->afd_group->afd == NULL ||
         g_ntdll.NtCancelIoFileEx == NULL) {
         ep_set_errno(EINVAL);
         return -1;
@@ -897,7 +898,7 @@ int ep_afd_cancel(ep_sock_t *sock)
         return -1;
 
     memset(&cancel_status_block, 0, sizeof(cancel_status_block));
-    status = g_ntdll.NtCancelIoFileEx(sock->port->afd,
+    status = g_ntdll.NtCancelIoFileEx(sock->afd_group->afd,
                                      &sock->io_status_block,
                                      &cancel_status_block);
 

@@ -6,6 +6,16 @@ This is an experimental preview of the extended epoll-shaped API, the Windows
 IOCP/AFD backend, the Linux development wrapper, and the optional nginx 1.31.3
 adapter. The API and ABI may change before a stable release.
 
+Windows socket registrations now share AFD control handles in groups of at
+most 128, bounding the native cancellation search at large registration counts.
+Groups retain deleted sockets until their completion packets settle; failed
+growth rolls back ADD, and close/reaper paths retain the existing ownership
+rules across every group. TCP ET/exclusive delivery also reuses a successful
+nonterminal `WSAPoll` sample instead of repeating read/write `select()` calls.
+The rearm benchmark accepts an optional TCP workload. Local measurements and
+remaining optimization candidates are recorded in
+[`docs/WINDOWS_PERFORMANCE_REVIEW.md`](WINDOWS_PERFORMANCE_REVIEW.md).
+
 The opt-in Windows `epoll_rearm_classes_batch()` extension acknowledges several
 explicit-rearm socket registrations with per-entry portable errors and first-
 failure native diagnostics. Independent failures do not stop later entries;

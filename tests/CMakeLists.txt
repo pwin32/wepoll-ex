@@ -346,6 +346,7 @@ else()
                 pending-expansion-ready-race
                 tcp-current-rdhup
                 tcp-current-reset
+                tcp-current-et-snapshot
                 transitional-idle
                 udp-readless-error
                 udp-readless-park
@@ -625,6 +626,7 @@ else()
                 pool-init
                 pool-grow
                 afd-open
+                afd-groups
                 afd-submit
                 afd-submit-batch
                 afd-refresh-submit

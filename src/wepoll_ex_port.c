@@ -1059,8 +1059,9 @@ done:
     return result;
 }
 
-static void ep_socket_merge_current_levels(ep_sock_t *sock,
-                                           uint32_t *delivered)
+static int ep_socket_merge_current_levels(ep_sock_t *sock,
+                                          uint32_t *delivered,
+                                          short *revents_out)
 {
     uint32_t read_interest;
     uint32_t write_interest;
@@ -1069,7 +1070,7 @@ static void ep_socket_merge_current_levels(ep_sock_t *sock,
 
     if (sock->socket_protocol != EP_SOCKET_PROTOCOL_TCP ||
         (*delivered & (EPOLLERR | EPOLLHUP)) != 0) {
-        return;
+        return 0;
     }
 
     /* AFD snapshots the first matching class that completes an eagerly armed
@@ -1117,6 +1118,18 @@ static void ep_socket_merge_current_levels(ep_sock_t *sock,
         ep_socket_select_priority_ready(sock->fd) > 0) {
         *delivered |= EPOLLPRI;
     }
+
+    /* Ordinary established-TCP read/write levels also qualify an ET or
+     * exclusive snapshot.  Reuse this observation instead of issuing one
+     * select() per direction immediately after WSAPoll.  Terminal reports
+     * retain the select path because Winsock's POLLERR/POLLHUP mapping is not
+     * equivalent to membership in readfds/writefds.  An unavailable provider
+     * snapshot likewise leaves the existing fallback intact. */
+    if (polled && (revents & (POLLERR | POLLHUP)) == 0) {
+        if (revents_out != NULL) *revents_out = revents;
+        return 1;
+    }
+    return 0;
 }
 
 typedef struct ep_file_mode_information {
@@ -2687,7 +2700,7 @@ static uint32_t ep_sock_local_shutdown_level_locked(ep_sock_t *sock)
     /* Merge ordinary current levels first.  This keeps writable readiness and
      * a concurrently observed peer reset in the same snapshot instead of
      * letting the synthetic local level permanently starve native polling. */
-    ep_socket_merge_current_levels(sock, &level);
+    (void)ep_socket_merge_current_levels(sock, &level, NULL);
     ep_sock_merge_local_shutdown_locked(sock, &level);
     level &= sock->user_events | EPOLLERR | EPOLLHUP;
     if (ep_sock_explicit_rearm_enabled(sock)) {
@@ -2938,6 +2951,101 @@ static ep_identity_check_t ep_sock_validate_identity_locked(
 }
 #endif
 
+static void ep_afd_group_remove_available_locked(ep_port_t *port,
+                                                 ep_afd_group_t *group)
+{
+    if (group->available_prev != NULL) {
+        group->available_prev->available_next = group->available_next;
+    } else {
+        port->afd_available = group->available_next;
+    }
+    if (group->available_next != NULL) {
+        group->available_next->available_prev = group->available_prev;
+    }
+    group->available_next = NULL;
+    group->available_prev = NULL;
+}
+
+static void ep_afd_group_add_available_locked(ep_port_t *port,
+                                              ep_afd_group_t *group)
+{
+    group->available_next = port->afd_available;
+    group->available_prev = NULL;
+    if (port->afd_available != NULL) {
+        port->afd_available->available_prev = group;
+    }
+    port->afd_available = group;
+}
+
+static int ep_sock_acquire_afd_group_locked(ep_sock_t *sock)
+{
+    ep_port_t *port = sock->port;
+    ep_afd_group_t *group;
+
+    if (sock->afd_group != NULL) return 0;
+    group = port->afd_available;
+    if (group == NULL) {
+        if (ep_fault_hit(EP_FAULT_AFD_GROUP_ALLOC) != 0) return -1;
+        group = (ep_afd_group_t *)calloc(1, sizeof(*group));
+        if (group == NULL) {
+            ep_set_errno(ENOMEM);
+            return -1;
+        }
+        if (ep_afd_open(port->iocp, &group->afd) != 0) {
+            free(group);
+            return -1;
+        }
+        group->next = port->afd_group.next;
+        group->prev = &port->afd_group;
+        if (group->next != NULL) group->next->prev = group;
+        port->afd_group.next = group;
+        ep_afd_group_add_available_locked(port, group);
+    }
+    assert(group->afd != NULL);
+    assert(group->socket_count < WEPOLL_AFD_GROUP_SIZE);
+    group->socket_count++;
+    if (group->socket_count == WEPOLL_AFD_GROUP_SIZE) {
+        ep_afd_group_remove_available_locked(port, group);
+    }
+    sock->afd_group = group;
+    return 0;
+}
+
+static void ep_sock_release_afd_group_locked(ep_sock_t *sock)
+{
+    ep_port_t *port = sock->port;
+    ep_afd_group_t *group = sock->afd_group;
+
+    if (group == NULL) return;
+    assert(group->socket_count > 0);
+    assert(atomic_load_explicit(&sock->poll_status,
+                                memory_order_relaxed) == EP_POLL_IDLE);
+    sock->afd_group = NULL;
+    if (group->socket_count-- == WEPOLL_AFD_GROUP_SIZE) {
+        ep_afd_group_add_available_locked(port, group);
+    }
+    if (group->socket_count == 0 && group != &port->afd_group) {
+        ep_afd_group_remove_available_locked(port, group);
+        group->prev->next = group->next;
+        if (group->next != NULL) group->next->prev = group->prev;
+        if (group->afd != NULL) (void)CloseHandle(group->afd);
+        free(group);
+    }
+}
+
+/* Closing a group cancels its IRPs, but neither socket nor group storage can
+ * be reclaimed until the corresponding IOCP packets have settled. */
+static void ep_port_close_afd_groups(ep_port_t *port)
+{
+    for (ep_afd_group_t *group = &port->afd_group;
+         group != NULL; group = group->next) {
+        if (group->afd != NULL) {
+            (void)CloseHandle(group->afd);
+            group->afd = NULL;
+        }
+    }
+}
+
 static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd,
                                        const ep_target_info_t *target)
 {
@@ -3050,6 +3158,7 @@ static void ep_sock_free_locked(ep_port_t *port, ep_sock_t *sock)
     assert(sock->afd_poll_target == NULL);
     assert(sock->afd_poll_key_reservation == NULL);
     assert(sock->afd_poll_key_next == NULL);
+    ep_sock_release_afd_group_locked(sock);
     ep_sock_set_needs_rearm_locked(sock, 0);
     ep_sock_set_oneshot_fired_locked(sock, 0);
     if ((sock->user_flags & EPOLLEXCLUSIVE) != 0) {
@@ -3436,6 +3545,9 @@ static int ep_sock_submit_locked(ep_sock_t *sock, int identity_validated,
         return 0;
     }
     int poll_pending = 0;
+    if (ep_sock_acquire_afd_group_locked(sock) != 0) {
+        return -1;
+    }
     old_submitted_wait_epoch = sock->submitted_wait_epoch;
     sock->submitted_wait_epoch = atomic_load_explicit(
         &port->active_wait_epoch, memory_order_acquire);
@@ -3726,6 +3838,8 @@ void ep_sock_handle_completion(ep_sock_t *sock, DWORD bytes, NTSTATUS status)
     uint32_t old_observed_events = 0;
     uint32_t old_poll_status;
     int udp_receive_parked_now = 0;
+    short current_revents = 0;
+    int current_levels_valid = 0;
 
     (void)bytes;
     pthread_mutex_lock(&port->fd_table_lock);
@@ -4003,8 +4117,10 @@ process_socket_snapshot:
     } else if (status < 0) {
         delivered = EPOLLERR;
     }
-    if (sock->kind == EP_REG_SOCKET)
-        ep_socket_merge_current_levels(sock, &delivered);
+    if (sock->kind == EP_REG_SOCKET) {
+        current_levels_valid = ep_socket_merge_current_levels(
+            sock, &delivered, &current_revents);
+    }
     if (ep_sock_explicit_rearm_enabled(sock)) {
         /* A stale completion or the current-level merge can still contain a
          * class that another delivery already disarmed.  Filter it before the
@@ -4021,11 +4137,15 @@ process_socket_snapshot:
 
         if (sample_all ||
             (delivered & (EPOLLIN | EPOLLRDNORM | EPOLLRDHUP)) != 0) {
-            read_ready = ep_socket_select_ready(sock->fd, 0);
+            read_ready = current_levels_valid
+                ? (current_revents & POLLRDNORM) != 0
+                : ep_socket_select_ready(sock->fd, 0);
         }
         if (sample_all ||
             (delivered & (EPOLLOUT | EPOLLWRNORM)) != 0) {
-            write_ready = ep_socket_select_ready(sock->fd, 1);
+            write_ready = current_levels_valid
+                ? (current_revents & POLLWRNORM) != 0
+                : ep_socket_select_ready(sock->fd, 1);
         }
         if (read_ready == 0) {
             delivered &= ~(EPOLLIN | EPOLLRDNORM | EPOLLRDHUP);
@@ -4340,9 +4460,10 @@ int ep_port_create(int size_hint, int flags, ep_port_t **out)
         goto fail;
     }
     port->iocp_post_handle = port->iocp;
-    if (ep_afd_open(port->iocp, &port->afd) != 0) {
+    if (ep_afd_open(port->iocp, &port->afd_group.afd) != 0) {
         goto fail;
     }
+    port->afd_available = &port->afd_group;
     /* Qualification is optional.  If this private event cannot be allocated,
      * UDP delivery keeps the conservative AFD-only behavior. */
     {
@@ -4385,9 +4506,7 @@ fail:
         wepoll_ex_error_info saved_error;
 
         ep_get_last_error_info(&saved_error);
-        if (port->afd != NULL) {
-            CloseHandle(port->afd);
-        }
+        ep_port_close_afd_groups(port);
         if (port->udp_probe_event != NULL) {
             CloseHandle(port->udp_probe_event);
         }
@@ -4563,10 +4682,7 @@ static void ep_port_finish_destroy_locked(ep_port_t *port)
     }
     ep_ready_destroy(&port->ready_queue);
 
-    if (port->afd != NULL) {
-        (void)CloseHandle(port->afd);
-        port->afd = NULL;
-    }
+    ep_port_close_afd_groups(port);
     if (port->udp_probe_event != NULL) {
         (void)CloseHandle(port->udp_probe_event);
         port->udp_probe_event = NULL;
@@ -4595,10 +4711,7 @@ static void ep_port_finish_destroy_locked(ep_port_t *port)
 
 static void ep_port_abandon_locked(ep_port_t *port)
 {
-    if (port->afd != NULL) {
-        (void)CloseHandle(port->afd);
-        port->afd = NULL;
-    }
+    ep_port_close_afd_groups(port);
     if (port->udp_probe_event != NULL) {
         (void)CloseHandle(port->udp_probe_event);
         port->udp_probe_event = NULL;
@@ -4762,11 +4875,10 @@ int ep_port_destroy(ep_port_t *port)
             cancel_failed = 1;
         }
     }
-    if (cancel_failed && port->afd != NULL) {
-        /* Closing the AFD control handle is a bulk cancellation fallback.
+    if (cancel_failed) {
+        /* Closing every AFD group is a bulk cancellation fallback.
          * Completions remain asynchronous and must still be drained. */
-        (void)CloseHandle(port->afd);
-        port->afd = NULL;
+        ep_port_close_afd_groups(port);
     }
     if (port->fd_table != NULL) {
         memset(port->fd_table, 0,

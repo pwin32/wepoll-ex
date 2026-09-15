@@ -304,13 +304,31 @@ static int test_late_completion_reap(void)
     wepoll_ex_global_stats before;
     wepoll_ex_global_stats after;
     ep_port_t *port = NULL;
-    SOCKET socket_fd = INVALID_SOCKET;
+    SOCKET sockets[WEPOLL_AFD_GROUP_SIZE + 1];
+    epoll_data_t data = {0};
     int destroy_result;
     int destroy_error;
+    int result = -1;
 
+    for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i++) {
+        sockets[i] = INVALID_SOCKET;
+    }
     if (wepoll_ex_get_global_stats(&before, sizeof(before)) != 0 ||
-        make_pending_port(&port, &socket_fd) != 0) {
-        return -1;
+        make_pending_port(&port, &sockets[0]) != 0) {
+        goto cleanup;
+    }
+    /* Both the embedded AFD group and an allocated group must survive the
+     * timeout and be reclaimed by the detached completion reaper. */
+    for (size_t i = 1; i < sizeof(sockets) / sizeof(sockets[0]); i++) {
+        sockets[i] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sockets[i] == INVALID_SOCKET ||
+            ep_port_register(port, sockets[i], EPOLLIN, 0, data, NULL) != 0) {
+            goto cleanup;
+        }
+    }
+    if (port->afd_group.next == NULL ||
+        port->pending_poll_count != WEPOLL_AFD_GROUP_SIZE + 1) {
+        goto cleanup;
     }
 
     late_reap_native_dequeue = GetQueuedCompletionStatusEx;
@@ -324,8 +342,7 @@ static int test_late_completion_reap(void)
     destroy_error = errno;
     port = NULL; /* timeout transfers ownership to the detached reaper */
     if (destroy_result != -1 || destroy_error != ETIMEDOUT) {
-        if (socket_fd != INVALID_SOCKET) closesocket(socket_fd);
-        return -1;
+        goto cleanup;
     }
 
     InterlockedExchange(&late_reap_allow_dequeue, 1);
@@ -334,14 +351,21 @@ static int test_late_completion_reap(void)
         if (after.quarantined_ports == before.quarantined_ports + 1 &&
             after.reaped_ports == before.reaped_ports + 1 &&
             after.irrecoverable_ports == before.irrecoverable_ports) {
-            closesocket(socket_fd);
-            return 0;
+            result = 0;
+            break;
         }
         Sleep(10);
     }
 
-    if (socket_fd != INVALID_SOCKET) closesocket(socket_fd);
-    return -1;
+cleanup:
+    InterlockedExchange(&late_reap_allow_dequeue, 1);
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i++) {
+        if (sockets[i] != INVALID_SOCKET && closesocket(sockets[i]) != 0) {
+            result = -1;
+        }
+    }
+    return result;
 }
 
 typedef struct internal_wait_context {

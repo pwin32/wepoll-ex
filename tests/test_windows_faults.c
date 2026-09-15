@@ -290,6 +290,148 @@ cleanup:
     return result;
 }
 
+static int test_afd_groups(void)
+{
+    static const struct {
+        ep_fault_point_t point;
+        int error;
+    } failures[] = {
+        {EP_FAULT_AFD_GROUP_ALLOC, ENOMEM},
+        {EP_FAULT_AFD_OPEN, EACCES},
+        {EP_FAULT_AFD_SUBMIT, EAGAIN}
+    };
+    SOCKET sockets[WEPOLL_AFD_GROUP_SIZE + 1];
+    ep_port_t *port = NULL;
+    ep_afd_group_t *extra_group;
+    epoll_data_t data = {0};
+    epoll_event_ex event;
+    DWORD baseline_handles = 0;
+    DWORD full_handles = 0;
+    DWORD handles = 0;
+    const char *stage = "setup";
+    int result = -1;
+
+    for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i++) {
+        sockets[i] = INVALID_SOCKET;
+    }
+    ep_fault_reset();
+    if (ep_global_init() != 0) goto cleanup;
+    for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i++) {
+        struct sockaddr_in address = {0};
+
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sockets[i] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sockets[i] == INVALID_SOCKET ||
+            bind(sockets[i], (const struct sockaddr *)&address,
+                 (int)sizeof(address)) != 0) goto cleanup;
+    }
+    /* Warm a socket registration cycle before counting port-owned handles;
+     * provider/runtime initialization can retain process-wide resources. */
+    if (ep_port_create(0, 0, &port) != 0 ||
+        ep_port_register(port, sockets[0], EPOLLIN, 0, data, NULL) != 0) {
+        goto cleanup;
+    }
+    {
+        ep_port_t *warm_port = port;
+        port = NULL;
+        if (ep_port_destroy(warm_port) != 0) goto cleanup;
+    }
+    if (!GetProcessHandleCount(GetCurrentProcess(), &baseline_handles) ||
+        ep_port_create(0, 0, &port) != 0) goto cleanup;
+    for (size_t i = 0; i < WEPOLL_AFD_GROUP_SIZE; i++) {
+        data.u64 = i;
+        if (ep_port_register(port, sockets[i], EPOLLIN, 0, data, NULL) != 0) {
+            goto cleanup;
+        }
+    }
+    if (!GetProcessHandleCount(GetCurrentProcess(), &full_handles)) goto cleanup;
+
+    stage = "growth rollback";
+    for (size_t i = 0; i < sizeof(failures) / sizeof(failures[0]); i++) {
+        int worklists_valid;
+
+        ep_fault_reset();
+        if (ep_fault_configure(failures[i].point, 1, failures[i].error) != 0) {
+            goto cleanup;
+        }
+        errno = 0;
+        if (ep_port_register(port, sockets[WEPOLL_AFD_GROUP_SIZE],
+                              EPOLLIN, 0, data, NULL) != -1 ||
+            errno != failures[i].error ||
+            ep_fault_hits(failures[i].point) != 1 ||
+            port->fd_table_count != WEPOLL_AFD_GROUP_SIZE ||
+            port->pending_poll_count != WEPOLL_AFD_GROUP_SIZE ||
+            port->afd_group.socket_count != WEPOLL_AFD_GROUP_SIZE ||
+            port->afd_group.next != NULL || port->afd_available != NULL ||
+            !GetProcessHandleCount(GetCurrentProcess(), &handles) ||
+            handles != full_handles) goto cleanup;
+        pthread_mutex_lock(&port->fd_table_lock);
+        worklists_valid = ep_port_worklists_valid_locked(port);
+        pthread_mutex_unlock(&port->fd_table_lock);
+        if (!worklists_valid) goto cleanup;
+    }
+
+    ep_fault_reset();
+    stage = "deleted group stays pinned";
+    if (ep_port_register(port, sockets[WEPOLL_AFD_GROUP_SIZE],
+                          EPOLLIN, 0, data, NULL) != 0) goto cleanup;
+    extra_group = port->sock_list_head->afd_group;
+    if (extra_group == &port->afd_group || extra_group == NULL ||
+        extra_group->socket_count != 1 ||
+        extra_group->afd == port->afd_group.afd ||
+        ep_port_unregister(port, sockets[WEPOLL_AFD_GROUP_SIZE]) != 0 ||
+        port->afd_group.next != extra_group ||
+        extra_group->socket_count != 1 ||
+        port->pending_poll_count != WEPOLL_AFD_GROUP_SIZE + 1) goto cleanup;
+    if (ep_port_wait(port, &event, 1, 0, NULL) != 0 ||
+        port->pending_poll_count != WEPOLL_AFD_GROUP_SIZE ||
+        port->afd_group.next != NULL ||
+        !GetProcessHandleCount(GetCurrentProcess(), &handles) ||
+        handles != full_handles) goto cleanup;
+
+    stage = "reuse free group capacity";
+    if (ep_port_register(port, sockets[WEPOLL_AFD_GROUP_SIZE],
+                          EPOLLIN, 0, data, NULL) != 0) goto cleanup;
+    extra_group = port->sock_list_head->afd_group;
+    if (ep_port_unregister(port, sockets[0]) != 0 ||
+        ep_port_wait(port, &event, 1, 0, NULL) != 0 ||
+        ep_port_register(port, sockets[0], EPOLLIN, 0, data, NULL) != 0 ||
+        port->sock_list_head->afd_group != &port->afd_group ||
+        port->afd_group.next != extra_group || extra_group->next != NULL ||
+        port->pending_poll_count != WEPOLL_AFD_GROUP_SIZE + 1) goto cleanup;
+
+    /* The newest registration uses the first group, and the next one uses
+     * the extra group.  Fail the latter cancellation so close must revoke
+     * every group's HANDLE and drain its packet before reclaiming storage. */
+    stage = "multi-group close fallback";
+    if (ep_fault_configure(EP_FAULT_AFD_CANCEL, 2, EBUSY) != 0) goto cleanup;
+    {
+        ep_port_t *closing_port = port;
+        port = NULL;
+        if (ep_port_destroy(closing_port) != 0) goto cleanup;
+    }
+    stage = "close handle count";
+    if (!GetProcessHandleCount(GetCurrentProcess(), &handles) ||
+        handles != baseline_handles) goto cleanup;
+    result = 0;
+
+cleanup:
+    if (result != 0) {
+        fprintf(stderr, "afd-groups stage: %s (handles=%lu baseline=%lu full=%lu)\n",
+                stage, (unsigned long)handles, (unsigned long)baseline_handles,
+                (unsigned long)full_handles);
+    }
+    ep_fault_reset();
+    if (port != NULL && ep_port_destroy(port) != 0) result = -1;
+    for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i++) {
+        if (sockets[i] != INVALID_SOCKET && closesocket(sockets[i]) != 0) {
+            result = -1;
+        }
+    }
+    return result;
+}
+
 static int g_submit_calls;
 static NTSTATUS g_submit_status = STATUS_PENDING;
 
@@ -324,6 +466,7 @@ static void submit_sock_init(ep_sock_t *sock, ep_port_t *port,
     sock->base_socket = INVALID_SOCKET;
 #endif
     sock->port = port;
+    sock->afd_group = &port->afd_group;
     sock->submitted_afd_events = submitted;
     atomic_init(&sock->poll_status, EP_POLL_IDLE);
 }
@@ -343,7 +486,7 @@ static int test_afd_submit(void)
     memset(&port, 0, sizeof(port));
     memset(&first, 0, sizeof(first));
     memset(&second, 0, sizeof(second));
-    port.afd = (HANDLE)(uintptr_t)1;
+    port.afd_group.afd = (HANDLE)(uintptr_t)1;
     ep_fault_reset();
     if (ep_global_init() != 0)
         goto cleanup;
@@ -480,7 +623,7 @@ static int test_afd_key_fallback(void)
     memset(&port, 0, sizeof(port));
     memset(socks, 0, sizeof(socks));
     memset(g_afd_key_captured, 0, sizeof(g_afd_key_captured));
-    port.afd = (HANDLE)(uintptr_t)1;
+    port.afd_group.afd = (HANDLE)(uintptr_t)1;
     ep_fault_reset();
     failure_stage = "global-init";
     if (ep_global_init() != 0)
@@ -680,6 +823,7 @@ static void cancel_sock_init(ep_sock_t *sock, ep_port_t *port)
 {
     memset(sock, 0, sizeof(*sock));
     sock->port = port;
+    sock->afd_group = &port->afd_group;
     sock->io_status_block.Status = STATUS_PENDING;
     atomic_init(&sock->poll_status, EP_POLL_PENDING);
 }
@@ -693,7 +837,7 @@ static int test_afd_cancel(void)
     int result = -1;
 
     memset(&port, 0, sizeof(port));
-    port.afd = (HANDLE)(uintptr_t)1;
+    port.afd_group.afd = (HANDLE)(uintptr_t)1;
     cancel_sock_init(&first, &port);
     cancel_sock_init(&second, &port);
     ep_fault_reset();
@@ -2552,6 +2696,7 @@ static const fault_test_case_t g_tests[] = {
     { "pool-grow", test_pool_growth },
     { "provider-base", test_provider_base },
     { "afd-open", test_afd_open },
+    { "afd-groups", test_afd_groups },
     { "afd-submit", test_afd_submit },
     { "afd-submit-batch", test_afd_submit_batch },
     { "afd-refresh-submit", test_afd_refresh_submit },
@@ -2626,7 +2771,7 @@ int main(int argc, char **argv)
     fprintf(stderr,
             "usage: %s [all|framework|pool-init|pool-grow|provider-base|"
             "error-info-native|"
-            "afd-open|afd-submit|afd-submit-batch|afd-refresh-submit|"
+            "afd-open|afd-groups|afd-submit|afd-submit-batch|afd-refresh-submit|"
             "afd-key-fallback|"
             "afd-cancel|"
             "endpoint-identity|"

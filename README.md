@@ -49,6 +49,11 @@ temporary duplicate/reservation HANDLEs. An immediately satisfied idle poll
 is consumed synchronously, discarded, and left on the rearm queue so the first
 wait samples the then-current level without retaining an idle IOCP packet.
 
+Socket registrations use AFD control handles in groups of at most 128, all
+feeding the same IOCP. This bounds native cancellation work at large socket
+counts. Deleted registrations keep their group alive until pending completion
+packets are consumed; unused extra groups are then closed.
+
 An eager AFD request can complete on the first ready class before another
 class becomes ready. The AFD control handle suppresses native IOCP packets for
 synchronous success. Completions queued during an idle interval or an earlier
@@ -63,6 +68,9 @@ behind unread data; `POLLERR | POLLHUP` merges unrequested
 `EPOLLERR | EPOLLHUP` for reset without clearing the application's later
 `WSAECONNRESET`. Unknown protocols and providers that reject `WSAPoll` retain
 the original conservative AFD/select result.
+
+For ordinary nonterminal TCP state, the same `WSAPoll` result qualifies
+ET/exclusive read/write readiness, avoiding duplicate `select()` calls.
 
 Direct Winsock local receive shutdown remains a platform boundary:
 `shutdown(SD_RECEIVE)` and `shutdown(SD_BOTH)` do not raise an AFD, `WSAPoll`,
@@ -619,6 +627,20 @@ Its 50k point now measures armed-idle AFD ADD and cancellation-initiation
 scaling, not 50,000 ready sockets. Final port close drains the resulting
 completion burst outside the per-operation samples. The benchmark
 intentionally has no pass/fail latency thresholds.
+
+`bench_rearm_batch` compares scalar and batched explicit acknowledgement at
+1/16/64/256 sockets. UDP writable readiness is the default; the optional `tcp`
+argument uses established sockets with persistent read and write readiness.
+Both modes check unique delivery and report acknowledgement and full-cycle
+latency separately:
+
+```sh
+./build-mingw/bench/bench_rearm_batch.exe scalar 2000 tcp
+./build-mingw/bench/bench_rearm_batch.exe batch 2000 tcp
+```
+
+See [the Windows performance review](docs/WINDOWS_PERFORMANCE_REVIEW.md) for
+measurements, remaining bottlenecks, and the scope of the comparisons.
 
 `bench_mt_contention` covers what the single-threaded benchmark cannot: it
 runs a wait thread that keeps an active socket set continuously ready, so that

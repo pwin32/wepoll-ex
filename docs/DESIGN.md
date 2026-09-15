@@ -96,6 +96,16 @@ the nginx-embedded source build independent of a generated CMake header.
    accepts a provider that
    cannot expose an endpoint token, strict mode rejects it with
    `EOPNOTSUPP`, and synchronized mode omits token queries entirely.
+   Socket registrations share bounded AFD control-handle groups, currently
+   128 registrations per group, all associated with the same port IOCP.
+   This bounds the per-file pending-request list searched by native
+   cancellation. A registration retains its group until final reclamation,
+   including after DEL while its cancellation packet is still outstanding.
+   The first group is embedded in the port; extra groups are allocated on
+   demand and closed when their last registration is reclaimed. Allocation,
+   AFD-open, and first-submission failures roll back the new registration and
+   any otherwise-unused group. Bulk-close fallback revokes every group before
+   draining completions; quarantine retains group storage along with sockets.
    The AFD control handle suppresses native completion packets for synchronous
    success. Each serialized public wait publishes an epoch; a socket packet
    queued during an idle interval, an earlier wait epoch, or a cancellation-
@@ -111,6 +121,10 @@ the nginx-embedded source build independent of a generated CMake header.
    established non-inline priority qualification. Providers that reject
    `WSAPoll`, error/HUP snapshots already supplied by AFD, and unknown protocol
    metadata retain the conservative prior path.
+   A successful nonterminal TCP snapshot also supplies ET/exclusive read/write
+   qualification, avoiding a second `select()` for each normal direction.
+   FIN/reset snapshots keep their separate select qualification because
+   Winsock terminal poll flags differ from readfds/writefds membership.
 4. Socket IOCP completions translate both the AFD per-handle `Events` bits and
    its `Status`; a negative per-handle status contributes `EPOLLERR` even when
    the event bitset is empty. Ready nodes snapshot the data, context, socket

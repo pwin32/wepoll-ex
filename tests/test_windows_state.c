@@ -1082,7 +1082,7 @@ static NTSTATUS NTAPI expansion_refresh_submit_stub(
     (void)event;
     (void)apc_routine;
     if (expansion_refresh_port == NULL ||
-        file_handle != expansion_refresh_port->afd ||
+        file_handle != expansion_refresh_port->afd_group.afd ||
         apc_context != io_status_block || io_status_block == NULL ||
         io_control_code != IOCTL_AFD_POLL || input_buffer != output_buffer ||
         info == NULL || input_buffer_length < sizeof(*info) ||
@@ -1124,7 +1124,8 @@ static NTSTATUS NTAPI tcp_current_submit_stub(
 
     (void)event;
     (void)apc_routine;
-    if (tcp_current_port == NULL || file_handle != tcp_current_port->afd ||
+    if (tcp_current_port == NULL ||
+        file_handle != tcp_current_port->afd_group.afd ||
         apc_context != io_status_block || io_status_block == NULL ||
         io_control_code != IOCTL_AFD_POLL || input_buffer != output_buffer ||
         info == NULL || input_buffer_length < sizeof(*info) ||
@@ -1239,7 +1240,7 @@ static NTSTATUS NTAPI immediate_success_submit_stub(
     (void)event;
     (void)apc_routine;
     if (immediate_success_port == NULL ||
-        file_handle != immediate_success_port->afd ||
+        file_handle != immediate_success_port->afd_group.afd ||
         apc_context != io_status_block || io_status_block == NULL ||
         io_control_code != IOCTL_AFD_POLL || input_buffer != output_buffer ||
         info == NULL || input_buffer_length < sizeof(*info) ||
@@ -1397,8 +1398,9 @@ static int test_cached_base_submit(void)
 
     memset(&port, 0, sizeof(port));
     memset(&sock, 0, sizeof(sock));
-    port.afd = (HANDLE)(uintptr_t)1;
+    port.afd_group.afd = (HANDLE)(uintptr_t)1;
     sock.port = &port;
+    sock.afd_group = &port.afd_group;
     sock.fd = INVALID_SOCKET;
     sock.base_socket = expected_base;
     atomic_init(&sock.poll_status, EP_POLL_IDLE);
@@ -3909,6 +3911,97 @@ static int test_tcp_current_reset(void)
         TCP_CURRENT_RESET, EPOLLOUT | EPOLLERR | EPOLLHUP);
 }
 
+static int test_tcp_current_et_snapshot(void)
+{
+    const uint32_t interests = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT;
+    const uint32_t expected_flags = WEPOLL_FLAG_ET_DELIVERED |
+        WEPOLL_FLAG_EDGE_ARMED | WEPOLL_FLAG_ONESHOT_FIRED;
+    state_fixture_t fixture;
+    PNtDeviceIoControlFile original_submit;
+    ep_sock_t *sock = NULL;
+    epoll_event_ex event;
+    int registered = 0;
+    int fake_pending = 0;
+    int context;
+    char byte;
+    int result = -1;
+
+    if (fixture_open(&fixture) != 0) return -1;
+    original_submit = g_ntdll.NtDeviceIoControlFile;
+    tcp_current_port = fixture.port;
+    InterlockedExchange(&tcp_current_submit_calls, 0);
+    InterlockedExchange(&tcp_current_submit_invalid, 0);
+    g_ntdll.NtDeviceIoControlFile = tcp_current_submit_stub;
+    atomic_store_explicit(&fixture.port->active_wait_epoch, 1,
+                          memory_order_release);
+    atomic_store_explicit(&fixture.port->waiter_active, 1,
+                          memory_order_release);
+    if (register_events(&fixture, interests, EPOLLET | EPOLLONESHOT,
+                        UINT64_C(0x65742d736e6170), &context) != 0) {
+        goto cleanup;
+    }
+    registered = 1;
+    fake_pending = 1;
+    sock = fixture_sock(&fixture);
+    if (sock == NULL) goto cleanup;
+
+    /* Model a read/write AFD packet whose readable byte another consumer
+     * drained before completion handling.  ET must use the current level to
+     * suppress the stale read class while preserving the writable class. */
+    if (send_byte(fixture.client) != 0 ||
+        tcp_current_wait_poll(fixture.server, POLLRDNORM, 0, NULL) != 0 ||
+        recv(fixture.server, &byte, 1, 0) != 1 ||
+        tcp_current_wait_poll(fixture.server, POLLWRNORM,
+                              POLLRDNORM | POLLERR | POLLHUP, NULL) != 0) {
+        goto cleanup;
+    }
+    sock->afd_info->NumberOfHandles = 1;
+    sock->afd_info->Handles[0].Events = AFD_POLL_RECEIVE | AFD_POLL_SEND;
+    sock->afd_info->Handles[0].Status = STATUS_SUCCESS;
+    sock->io_status_block.Status = STATUS_SUCCESS;
+    fake_pending = 0;
+    ep_sock_handle_completion(sock, 0, STATUS_SUCCESS);
+    g_ntdll.NtDeviceIoControlFile = original_submit;
+    atomic_store_explicit(&fixture.port->waiter_active, 0,
+                          memory_order_release);
+    atomic_store_explicit(&fixture.port->active_wait_epoch, 0,
+                          memory_order_release);
+
+    if (ep_port_wait(fixture.port, &event, 1, 0, NULL) != 1 ||
+        event.events != EPOLLOUT || event.flags != expected_flags ||
+        event.data.u64 != UINT64_C(0x65742d736e6170) ||
+        event.user_ctx != &context ||
+        ep_port_wait(fixture.port, &event, 1, 0, NULL) != 0) {
+        goto cleanup;
+    }
+    if (ep_port_rearm(fixture.port, fixture.server) != 0 ||
+        send_byte(fixture.client) != 0 ||
+        tcp_current_wait_poll(fixture.server, POLLRDNORM, 0, NULL) != 0 ||
+        ep_port_wait(fixture.port, &event, 1, 1000, NULL) != 1 ||
+        event.events != (EPOLLIN | EPOLLOUT) ||
+        event.flags != expected_flags) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    g_ntdll.NtDeviceIoControlFile = original_submit;
+    atomic_store_explicit(&fixture.port->waiter_active, 0,
+                          memory_order_release);
+    atomic_store_explicit(&fixture.port->active_wait_epoch, 0,
+                          memory_order_release);
+    if (registered) {
+        (void)ep_port_unregister(fixture.port, fixture.server);
+        if (fake_pending && sock != NULL) {
+            sock->io_status_block.Status = STATUS_CANCELLED;
+            ep_sock_handle_completion(sock, 0, STATUS_CANCELLED);
+        }
+    }
+    tcp_current_port = NULL;
+    fixture_close(&fixture);
+    return result;
+}
+
 static int test_transitional_idle(void)
 {
     state_fixture_t fixture;
@@ -5052,6 +5145,8 @@ int main(int argc, char **argv)
         result = test_tcp_current_rdhup();
     } else if (strcmp(argv[1], "tcp-current-reset") == 0) {
         result = test_tcp_current_reset();
+    } else if (strcmp(argv[1], "tcp-current-et-snapshot") == 0) {
+        result = test_tcp_current_et_snapshot();
     } else if (strcmp(argv[1], "transitional-idle") == 0) {
         result = test_transitional_idle();
     } else if (strcmp(argv[1], "aux-posted-cancel") == 0) {

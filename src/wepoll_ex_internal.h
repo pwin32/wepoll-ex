@@ -120,6 +120,9 @@
 /* Number of AFD poll buffers to keep in the per-port pool. */
 #define WEPOLL_AFD_POOL_SIZE     64
 
+/* Bound the native per-file pending-IRP list searched by cancellation. */
+#define WEPOLL_AFD_GROUP_SIZE    128
+
 /* Linux bounds maxevents by the size of its userspace epoll_event transfer
  * record.  The public Windows type mirrors that architecture-specific UAPI
  * layout, so every backend can derive the ceiling directly from its type. */
@@ -142,6 +145,16 @@
 typedef struct ep_port      ep_port_t;
 typedef struct ep_sock      ep_sock_t;
 typedef struct ep_poll_ctx  ep_poll_ctx_t;
+typedef struct ep_afd_group ep_afd_group_t;
+
+struct ep_afd_group {
+    HANDLE afd;
+    size_t socket_count;
+    ep_afd_group_t *next;
+    ep_afd_group_t *prev;
+    ep_afd_group_t *available_next;
+    ep_afd_group_t *available_prev;
+};
 
 /* ----------------------------------------------------------------------- */
 /* AFD — Ancillary Function Driver.                                        */
@@ -539,6 +552,10 @@ struct ep_sock {
      * waitable-HANDLE registrations. */
     AFD_POLL_INFO *afd_info;
 
+    /* Assigned on first submission and retained through final reclamation,
+     * including a deleted registration's outstanding cancellation packet. */
+    ep_afd_group_t *afd_group;
+
     /* RegisterWaitForSingleObject cookie for waitable HANDLE registrations,
      * or a timer-queue timer for pipe polling.  NULL when idle. */
     HANDLE wait_registration;
@@ -619,8 +636,11 @@ struct ep_port {
     HANDLE iocp_post_handle;
     pthread_mutex_t iocp_post_lock;
 
-    /* Handle to AFD, opened once per port. */
-    HANDLE afd;
+    /* The first AFD group is embedded and opened with the port.  Additional
+     * groups share its IOCP and each serve at most WEPOLL_AFD_GROUP_SIZE
+     * registrations.  fd_table_lock protects both lists and group counts. */
+    ep_afd_group_t afd_group;
+    ep_afd_group_t *afd_available;
 
     /* Private completion event for synchronous settlement of internal direct
      * AFD UDP qualifiers.  Its packets never enter an application IOCP. */
@@ -774,6 +794,7 @@ typedef enum ep_fault_point {
     EP_FAULT_POOL_INIT_ALLOC = 0,
     EP_FAULT_POOL_GROW,
     EP_FAULT_AFD_OPEN,
+    EP_FAULT_AFD_GROUP_ALLOC,
     EP_FAULT_AFD_SUBMIT,
     EP_FAULT_AFD_CANCEL,
     EP_FAULT_AFD_KEY_RESERVATION,
