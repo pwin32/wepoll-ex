@@ -1,7 +1,8 @@
 /* Scalar versus batch explicit acknowledgement of repeatedly writable UDP
  * sockets, or readable/writable TCP sockets with the optional tcp argument.
  * Every timed acknowledgement changes delivered/disarmed state; each
- * roundtrip includes the following native readiness delivery. */
+ * roundtrip includes the following native readiness delivery. Optional idle
+ * registrations on another port expose process-wide scaling costs. */
 #include "wepoll_ex.h"
 
 #include <errno.h>
@@ -187,6 +188,31 @@ cleanup:
     return result;
 }
 
+static int open_background(int count, int *epfd_out, SOCKET **sockets_out)
+{
+    SOCKET *sockets;
+    struct epoll_event event = {0};
+
+    if (count == 0) return 0;
+    sockets = calloc((size_t)count, sizeof(*sockets));
+    if (sockets == NULL) return -1;
+    *sockets_out = sockets;
+    for (int i = 0; i < count; i++) sockets[i] = INVALID_SOCKET;
+    *epfd_out = epoll_create_ex(count, 0);
+    if (*epfd_out < 0) return -1;
+    event.events = EPOLLIN;
+    for (int i = 0; i < count; i++) {
+        /* Unbound UDP sockets stay idle without consuming local port numbers. */
+        sockets[i] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        event.data.u32 = (uint32_t)i;
+        if (sockets[i] == INVALID_SOCKET ||
+            epoll_ctl(*epfd_out, EPOLL_CTL_ADD, sockets[i], &event) != 0) {
+            return -1;
+        }
+    }
+    return epoll_fd_count(*epfd_out) == count ? 0 : -1;
+}
+
 int main(int argc, char **argv)
 {
     WSADATA data;
@@ -194,31 +220,48 @@ int main(int argc, char **argv)
     const int sizes[] = {1, 16, 64, MAX_BATCH};
     char *end = NULL;
     long iterations;
+    long idle_count = 0;
+    SOCKET *idle_sockets = NULL;
+    int idle_epfd = -1;
     int result = 0;
     int batched;
     int tcp;
 
-    if ((argc != 3 && argc != 4) ||
+    if ((argc < 3 || argc > 5) ||
         (strcmp(argv[1], "scalar") != 0 && strcmp(argv[1], "batch") != 0) ||
-        (argc == 4 && strcmp(argv[3], "tcp") != 0 &&
+        (argc >= 4 && strcmp(argv[3], "tcp") != 0 &&
          strcmp(argv[3], "udp") != 0)) {
-        fprintf(stderr, "usage: %s scalar|batch ITERATIONS [udp|tcp]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s scalar|batch ITERATIONS [udp|tcp [IDLE_SOCKETS]]\n",
+                argv[0]);
         return 2;
     }
-    tcp = argc == 4 && strcmp(argv[3], "tcp") == 0;
+    tcp = argc >= 4 && strcmp(argv[3], "tcp") == 0;
     errno = 0;
     iterations = strtol(argv[2], &end, 10);
     if (errno != 0 || end == argv[2] || *end != '\0' || iterations < 1 || iterations > 1000000)
         return 2;
+    if (argc == 5) {
+        errno = 0;
+        idle_count = strtol(argv[4], &end, 10);
+        if (errno != 0 || end == argv[4] || *end != '\0' ||
+            idle_count < 0 || idle_count > 1000000) return 2;
+    }
     batched = strcmp(argv[1], "batch") == 0;
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return 1;
     if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) {
         WSACleanup();
         return 1;
     }
-    printf("# mode=%s iterations=%ld lifetime_policy=%d protocol=%s\n",
+    if (open_background((int)idle_count, &idle_epfd, &idle_sockets) != 0) {
+        fprintf(stderr, "background setup failed: errno=%d WSA=%d\n",
+                errno, WSAGetLastError());
+        result = 1;
+        goto cleanup;
+    }
+    printf("# mode=%s iterations=%ld lifetime_policy=%d protocol=%s idle=%ld\n",
            argv[1], iterations, (int)wepoll_ex_get_socket_lifetime_policy(),
-           tcp ? "tcp" : "udp");
+           tcp ? "tcp" : "udp", idle_count);
     printf("benchmark,parameter,samples,p50_ns,p95_ns,p99_ns,operations_per_second\n");
     for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
         if (run_case(batched, sizes[i], (int)iterations,
@@ -228,6 +271,15 @@ int main(int argc, char **argv)
         }
     }
     if (fflush(stdout) != 0 || ferror(stdout)) result = 1;
+cleanup:
+    if (idle_epfd >= 0 && wepoll_close(idle_epfd) != 0) result = 1;
+    if (idle_sockets != NULL) {
+        for (int i = 0; i < idle_count; i++) {
+            if (idle_sockets[i] != INVALID_SOCKET &&
+                closesocket(idle_sockets[i]) != 0) result = 1;
+        }
+    }
+    free(idle_sockets);
     WSACleanup();
     return result;
 }

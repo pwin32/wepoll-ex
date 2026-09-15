@@ -71,6 +71,8 @@ option(WEPOLL_EX_BUILD_TESTS    "Build test suite"
        ${PROJECT_IS_TOP_LEVEL})
 option(WEPOLL_EX_BUILD_BENCH    "Build microbenchmarks"     OFF)
 option(WEPOLL_EX_BUILD_NGINX    "Compile-check nginx adapter" OFF)
+option(WEPOLL_EX_LARGE_AFD_INDEX
+       "Use a larger Windows AFD index with per-bucket locks and direct unlinking" OFF)
 option(WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK
        "Force Linux epoll_pwait2_ex through the millisecond fallback" OFF)
 set(WEPOLL_EX_SOCKET_LIFETIME_MODE "best-effort" CACHE STRING
@@ -187,6 +189,11 @@ if(WEPOLL_EX_PLATFORM_WINDOWS)
         _WIN32_WINNT=0x0602  # Win8 — required for AFD poll bits
         WIN32_LEAN_AND_MEAN
         _CRT_SECURE_NO_WARNINGS)
+    if(WEPOLL_EX_LARGE_AFD_INDEX)
+        list(APPEND WEPOLL_EX_PLATFORM_DEFINITIONS WEPOLL_EX_LARGE_AFD_INDEX=1)
+    else()
+        list(APPEND WEPOLL_EX_PLATFORM_DEFINITIONS WEPOLL_EX_LARGE_AFD_INDEX=0)
+    endif()
     if(WEPOLL_EX_SOCKET_LIFETIME_MODE STREQUAL "strict")
         list(APPEND WEPOLL_EX_PLATFORM_DEFINITIONS
             WEPOLL_EX_STRICT_SOCKET_IDENTITY=1)
@@ -199,6 +206,8 @@ if(WEPOLL_EX_PLATFORM_WINDOWS)
     endif()
     message(STATUS
         "wepoll-ex Windows socket lifetime policy: ${WEPOLL_EX_SOCKET_LIFETIME_MODE}")
+    message(STATUS
+        "wepoll-ex Windows large AFD index: ${WEPOLL_EX_LARGE_AFD_INDEX}")
 else()
     if(WEPOLL_EX_FORCE_EPOLL_PWAIT2_FALLBACK)
         message(STATUS

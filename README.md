@@ -421,7 +421,10 @@ assigns every outstanding wepoll-ex poll a distinct target value. The first
 request can use the provider base directly; a collision uses a transient
 duplicate only through submission, then normally reserves that numeric slot
 with a non-socket event until completion. The logical index remains
-authoritative if slot reservation is unavailable. This lets every ordinary
+authoritative if slot reservation is unavailable. The default index has 256
+buckets and one lock. `WEPOLL_EX_LARGE_AFD_INDEX=ON` selects 4,096 independently
+locked buckets and direct completion unlinking, trading memory for shorter
+searches and less contention between ports. This lets every ordinary
 local epoll instance receive matching readiness without retaining the socket
 or delaying native `closesocket()`/peer FIN, while the claim index admits at
 least one local exclusive instance and filters the rest. Windows
@@ -614,6 +617,16 @@ For MinGW, use the toolchain shell explicitly:
 best-effort variants plus combined and shared-only strict-identity and
 synchronized-lifetime variants. The seeded Windows stress test has bounded
 defaults and accepts `--long` or `WEPOLL_EX_STRESS_*` overrides.
+
+`-DWEPOLL_EX_LARGE_AFD_INDEX=ON` opts into the larger Windows AFD target index.
+It uses 64 KiB of global index storage on x64 instead of about 2 KiB and adds
+one pointer per registration. The default is `OFF`, including direct-source
+builds. When embedding the backend sources, pass
+`-DWEPOLL_EX_LARGE_AFD_INDEX=1` consistently to every source using the internal
+header; this also applies to nginx's source-embedding build. Public headers
+and the package ABI are unchanged. To qualify both settings, run the MinGW
+script with `WEPOLL_EX_LARGE_AFD_INDEX=OFF` and `ON` in separate build roots.
+
 `bench_windows` emits CSV percentiles for 1k/10k/50k registration points,
 ready batches, oneshot rearming, and armed control churn:
 
@@ -639,7 +652,16 @@ latency separately:
 ./build-mingw/bench/bench_rearm_batch.exe batch 2000 tcp
 ```
 
-See [the Windows performance review](docs/WINDOWS_PERFORMANCE_REVIEW.md) for
+An optional `IDLE_SOCKETS` argument after the protocol keeps unbound UDP
+registrations pending on a separate epoll instance throughout the measurement.
+This exposes process-wide index costs even when the timed port is small:
+
+```sh
+./build-mingw/bench/bench_rearm_batch.exe batch 1000 udp 50000
+```
+
+See [the initial Windows performance review](docs/WINDOWS_PERFORMANCE_REVIEW.md)
+and [the index follow-up](docs/WINDOWS_INDEX_PERFORMANCE_REVIEW.md) for
 measurements, remaining bottlenecks, and the scope of the comparisons.
 
 `bench_mt_contention` covers what the single-threaded benchmark cannot: it

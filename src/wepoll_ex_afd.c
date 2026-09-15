@@ -32,13 +32,38 @@
  * the same numeric HANDLE value, including across independently opened AFD
  * control handles.  Keep one active owner for every target value in this
  * process.  Callers enter from port code while holding fd_table_lock, so the
- * only permitted nesting order is port fd_table_lock -> this lock. */
+ * only permitted nesting order is port fd_table_lock -> one index lock.
+ * Claims never hold two index locks, including duplicate-target retries. */
+#if WEPOLL_EX_LARGE_AFD_INDEX
+#define EP_AFD_POLL_KEY_BUCKETS 4096u
+#else
 #define EP_AFD_POLL_KEY_BUCKETS 256u
-
 static SRWLOCK g_afd_poll_key_lock = SRWLOCK_INIT;
-static ep_sock_t *g_afd_poll_key_buckets[EP_AFD_POLL_KEY_BUCKETS];
+#endif
 
-static size_t ep_afd_poll_key_bucket(HANDLE target)
+typedef struct ep_afd_poll_key_bucket {
+#if WEPOLL_EX_LARGE_AFD_INDEX
+    SRWLOCK lock;
+#endif
+    ep_sock_t *head;
+} ep_afd_poll_key_bucket_t;
+
+/* SRWLOCK_INIT is the all-zero static initializer.  Bucket storage never
+ * moves, and the index needs no allocation or growth failure path. */
+static ep_afd_poll_key_bucket_t
+    g_afd_poll_key_buckets[EP_AFD_POLL_KEY_BUCKETS];
+
+static SRWLOCK *ep_afd_poll_key_lock(ep_afd_poll_key_bucket_t *bucket)
+{
+#if WEPOLL_EX_LARGE_AFD_INDEX
+    return &bucket->lock;
+#else
+    (void)bucket;
+    return &g_afd_poll_key_lock;
+#endif
+}
+
+static ep_afd_poll_key_bucket_t *ep_afd_poll_key_bucket(HANDLE target)
 {
     uintptr_t value = (uintptr_t)target;
 
@@ -47,14 +72,14 @@ static size_t ep_afd_poll_key_bucket(HANDLE target)
      * power-of-two table. */
     value ^= value >> 4;
     value ^= value >> 12;
-    return (size_t)(value & (EP_AFD_POLL_KEY_BUCKETS - 1u));
+    return &g_afd_poll_key_buckets[
+        value & (EP_AFD_POLL_KEY_BUCKETS - 1u)];
 }
 
-static int ep_afd_poll_key_is_active_locked(HANDLE target)
+static int ep_afd_poll_key_is_active_locked(
+    const ep_afd_poll_key_bucket_t *bucket, HANDLE target)
 {
-    size_t bucket = ep_afd_poll_key_bucket(target);
-
-    for (ep_sock_t *active = g_afd_poll_key_buckets[bucket];
+    for (ep_sock_t *active = bucket->head;
          active != NULL;
          active = active->afd_poll_key_next) {
         assert(active->afd_poll_key_owned != 0);
@@ -87,46 +112,76 @@ static void ep_afd_error_state_restore(ep_afd_error_state_t state)
     SetLastError(state.last_error);
 }
 
-static HANDLE ep_afd_poll_key_release_locked(ep_sock_t *sock)
+static HANDLE ep_afd_poll_key_release_locked(
+    ep_afd_poll_key_bucket_t *bucket, ep_sock_t *sock)
 {
-    ep_sock_t **link;
     HANDLE reservation;
 
-    if (sock->afd_poll_key_owned == 0) {
-        assert(sock->afd_poll_key_next == NULL);
-        assert(sock->afd_poll_key_reservation == NULL);
-        return NULL;
+    assert(sock->afd_poll_key_owned != 0);
+#if WEPOLL_EX_LARGE_AFD_INDEX
+    if (sock->afd_poll_key_prev != NULL) {
+        sock->afd_poll_key_prev->afd_poll_key_next = sock->afd_poll_key_next;
+    } else {
+        assert(bucket->head == sock);
+        bucket->head = sock->afd_poll_key_next;
     }
+    if (sock->afd_poll_key_next != NULL) {
+        sock->afd_poll_key_next->afd_poll_key_prev = sock->afd_poll_key_prev;
+    }
+#else
+    ep_sock_t **link = &bucket->head;
 
-    link = &g_afd_poll_key_buckets[
-        ep_afd_poll_key_bucket(sock->afd_poll_target)];
     while (*link != NULL && *link != sock)
         link = &(*link)->afd_poll_key_next;
     assert(*link == sock);
     if (*link == sock)
         *link = sock->afd_poll_key_next;
+#endif
 
     reservation = sock->afd_poll_key_reservation;
     sock->afd_poll_target = NULL;
     sock->afd_poll_key_reservation = NULL;
     sock->afd_poll_key_next = NULL;
+#if WEPOLL_EX_LARGE_AFD_INDEX
+    sock->afd_poll_key_prev = NULL;
+#endif
     sock->afd_poll_key_owned = 0;
     return reservation;
 }
 
-static void ep_afd_poll_key_insert_locked(ep_sock_t *sock, HANDLE target)
+static void ep_afd_poll_key_insert_locked(ep_afd_poll_key_bucket_t *bucket,
+                                          ep_sock_t *sock, HANDLE target)
 {
-    size_t bucket = ep_afd_poll_key_bucket(target);
-
     assert(sock->afd_poll_key_owned == 0);
     assert(sock->afd_poll_key_next == NULL);
+#if WEPOLL_EX_LARGE_AFD_INDEX
+    assert(sock->afd_poll_key_prev == NULL);
+#endif
     assert(sock->afd_poll_key_reservation == NULL);
-    assert(!ep_afd_poll_key_is_active_locked(target));
+    assert(!ep_afd_poll_key_is_active_locked(bucket, target));
     sock->afd_poll_target = target;
     sock->afd_poll_key_reservation = NULL;
-    sock->afd_poll_key_next = g_afd_poll_key_buckets[bucket];
+    sock->afd_poll_key_next = bucket->head;
+#if WEPOLL_EX_LARGE_AFD_INDEX
+    if (bucket->head != NULL) bucket->head->afd_poll_key_prev = sock;
+#endif
     sock->afd_poll_key_owned = 1;
-    g_afd_poll_key_buckets[bucket] = sock;
+    bucket->head = sock;
+}
+
+static int ep_afd_poll_key_try_claim(ep_sock_t *sock, HANDLE target)
+{
+    ep_afd_poll_key_bucket_t *bucket = ep_afd_poll_key_bucket(target);
+    SRWLOCK *lock = ep_afd_poll_key_lock(bucket);
+    int claimed = 0;
+
+    AcquireSRWLockExclusive(lock);
+    if (!ep_afd_poll_key_is_active_locked(bucket, target)) {
+        ep_afd_poll_key_insert_locked(bucket, sock, target);
+        claimed = 1;
+    }
+    ReleaseSRWLockExclusive(lock);
+    return claimed;
 }
 
 static int ep_afd_poll_key_claim(ep_sock_t *sock, HANDLE base_target,
@@ -140,16 +195,15 @@ static int ep_afd_poll_key_claim(ep_sock_t *sock, HANDLE base_target,
 
     assert(sock->afd_poll_key_owned == 0);
     assert(sock->afd_poll_key_next == NULL);
+#if WEPOLL_EX_LARGE_AFD_INDEX
+    assert(sock->afd_poll_key_prev == NULL);
+#endif
     assert(sock->afd_poll_key_reservation == NULL);
 
-    AcquireSRWLockExclusive(&g_afd_poll_key_lock);
-    if (!ep_afd_poll_key_is_active_locked(base_target)) {
-        ep_afd_poll_key_insert_locked(sock, base_target);
-        ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
+    if (ep_afd_poll_key_try_claim(sock, base_target)) {
         *duplicated_out = 0;
         return 0;
     }
-    ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
 
     {
         HANDLE process = GetCurrentProcess();
@@ -176,15 +230,11 @@ static int ep_afd_poll_key_claim(ep_sock_t *sock, HANDLE base_target,
             force_collision =
                 ep_fault_hit_through(EP_FAULT_AFD_KEY_FORCE_COLLISION) != 0;
 
-            AcquireSRWLockExclusive(&g_afd_poll_key_lock);
             if (!force_collision &&
-                !ep_afd_poll_key_is_active_locked(duplicate)) {
-                ep_afd_poll_key_insert_locked(sock, duplicate);
-                ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
+                ep_afd_poll_key_try_claim(sock, duplicate)) {
                 *duplicated_out = 1;
                 break;
             }
-            ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
 
             /* An active key normally has a live base or reservation handle,
              * making a numeric collision impossible.  Reservation can fail,
@@ -261,12 +311,15 @@ static void ep_afd_poll_duplicate_finish(ep_sock_t *sock, int reserve_slot)
     }
 
     if (reservation != NULL) {
-        AcquireSRWLockExclusive(&g_afd_poll_key_lock);
+        ep_afd_poll_key_bucket_t *bucket = ep_afd_poll_key_bucket(target);
+        SRWLOCK *lock = ep_afd_poll_key_lock(bucket);
+
+        AcquireSRWLockExclusive(lock);
         assert(sock->afd_poll_key_owned != 0);
         assert(sock->afd_poll_target == target);
         assert(sock->afd_poll_key_reservation == NULL);
         sock->afd_poll_key_reservation = reservation;
-        ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
+        ReleaseSRWLockExclusive(lock);
     }
 
     /* CloseHandle/CreateEventW are bookkeeping only after AFD has accepted
@@ -286,15 +339,29 @@ void ep_afd_poll_key_release(ep_sock_t *sock)
 {
 #ifdef _WIN32
     HANDLE reservation;
+    ep_afd_poll_key_bucket_t *bucket;
+    SRWLOCK *lock;
 
     if (sock == NULL)
         return;
+    /* The owning port serializes ownership changes and keeps the target
+     * immutable while indexed.  Cross-port link changes need the index lock. */
+    if (sock->afd_poll_key_owned == 0) {
+        assert(sock->afd_poll_key_next == NULL);
+#if WEPOLL_EX_LARGE_AFD_INDEX
+        assert(sock->afd_poll_key_prev == NULL);
+#endif
+        assert(sock->afd_poll_key_reservation == NULL);
+        return;
+    }
 
-    AcquireSRWLockExclusive(&g_afd_poll_key_lock);
-    reservation = ep_afd_poll_key_release_locked(sock);
-    ReleaseSRWLockExclusive(&g_afd_poll_key_lock);
+    bucket = ep_afd_poll_key_bucket(sock->afd_poll_target);
+    lock = ep_afd_poll_key_lock(bucket);
+    AcquireSRWLockExclusive(lock);
+    reservation = ep_afd_poll_key_release_locked(bucket, sock);
+    ReleaseSRWLockExclusive(lock);
 
-    /* Detach under the registry lock, then close outside it.  A live handle
+    /* Detach under the index lock, then close outside it.  A live handle
      * prevents numeric reuse on its own, so no kernel call needs to serialize
      * unrelated AFD submissions. */
     if (reservation != NULL) {

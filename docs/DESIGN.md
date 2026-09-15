@@ -611,7 +611,19 @@ temporary fallback signal mask before unwinding.
   Non-exclusive requests can still interfere when their single AFD handle
   entry contains the same numeric process HANDLE value. An intrusive active
   target-key index therefore gives each outstanding wepoll-ex request a
-  distinct numeric key. An uncontended request uses the provider base handle
+  distinct numeric key. The default compact index has 256 buckets, one SRW
+  lock, and singly linked chains. The opt-in CMake setting
+  `WEPOLL_EX_LARGE_AFD_INDEX=ON` selects 4,096 independently locked buckets
+  and intrusive previous/next links for constant-time completion unlinking.
+  All registrations for a numeric key use the same bucket; a claim holds only
+  its selected index lock, nested inside the owning port's fd-table lock.
+  Duplicate retries release one lock before attempting another. Static bucket
+  storage avoids allocation and rehash failure paths. On x64 the opt-in index
+  occupies 64 KiB instead of about 2 KiB and adds one pointer per registration;
+  the compact build compiles out both extra locks and the previous pointer.
+  Direct-source builds default to numeric `WEPOLL_EX_LARGE_AFD_INDEX=0` and
+  must use the same value in every internal-header consumer.
+  An uncontended request uses the provider base handle
   directly. On collision, submission retains colliding duplicates while it
   allocates a distinct provider-handle value, inserts that value before the
   IOCTL, and closes the duplicate after the kernel captures it. For a pending

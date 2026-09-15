@@ -1,5 +1,9 @@
 # Windows performance review — September 15, 2026
 
+This report covers the initial changes in `6749abb`. The
+[follow-up review](WINDOWS_INDEX_PERFORMANCE_REVIEW.md) investigates and
+optimizes the remaining AFD target-index cost.
+
 The review found two useful changes: bound native cancellation work with AFD
 control-handle groups, and reuse the existing TCP readiness sample during edge
 delivery. The public API, lifetime policies, and completion-ownership rules

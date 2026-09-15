@@ -3158,6 +3158,9 @@ static void ep_sock_free_locked(ep_port_t *port, ep_sock_t *sock)
     assert(sock->afd_poll_target == NULL);
     assert(sock->afd_poll_key_reservation == NULL);
     assert(sock->afd_poll_key_next == NULL);
+#if WEPOLL_EX_LARGE_AFD_INDEX
+    assert(sock->afd_poll_key_prev == NULL);
+#endif
     ep_sock_release_afd_group_locked(sock);
     ep_sock_set_needs_rearm_locked(sock, 0);
     ep_sock_set_oneshot_fired_locked(sock, 0);

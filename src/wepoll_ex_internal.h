@@ -123,6 +123,15 @@
 /* Bound the native per-file pending-IRP list searched by cancellation. */
 #define WEPOLL_AFD_GROUP_SIZE    128
 
+/* Opt in to a larger target index, per-bucket locks, and direct unlinking.
+ * Direct-source builds must use the same value in every internal consumer. */
+#ifndef WEPOLL_EX_LARGE_AFD_INDEX
+#  define WEPOLL_EX_LARGE_AFD_INDEX 0
+#endif
+#if WEPOLL_EX_LARGE_AFD_INDEX != 0 && WEPOLL_EX_LARGE_AFD_INDEX != 1
+#  error "WEPOLL_EX_LARGE_AFD_INDEX must be 0 or 1"
+#endif
+
 /* Linux bounds maxevents by the size of its userspace epoll_event transfer
  * record.  The public Windows type mirrors that architecture-specific UAPI
  * layout, so every backend can derive the ceiling directly from its type. */
@@ -518,12 +527,16 @@ struct ep_sock {
      * afd_poll_key_reservation keeps that numeric slot occupied until the
      * completion releases the index entry.  It is a non-socket event; a
      * failed duplicate close is never retried by numeric HANDLE because reuse
-     * could target an unrelated object.  The global AFD key lock protects
-     * mutations and cross-port traversal of these fields; the owning port's
-     * fd_table_lock serializes ordinary same-registration reads. */
+     * could target an unrelated object.  The selected AFD index lock protects
+     * mutations and cross-port traversal of these fields; the owning
+     * port's fd_table_lock serializes ordinary same-registration reads.
+     * The large index adds a previous link for direct completion unlinking. */
     HANDLE afd_poll_target;
     HANDLE afd_poll_key_reservation;
     struct ep_sock *afd_poll_key_next;
+#if WEPOLL_EX_LARGE_AFD_INDEX
+    struct ep_sock *afd_poll_key_prev;
+#endif
     uint8_t afd_poll_key_owned;
 
     /* Intrusive membership in the process-wide EPOLLEXCLUSIVE claim index.

@@ -6,6 +6,17 @@ This is an experimental preview of the extended epoll-shaped API, the Windows
 IOCP/AFD backend, the Linux development wrapper, and the optional nginx 1.31.3
 adapter. The API and ABI may change before a stable release.
 
+The opt-in CMake setting `WEPOLL_EX_LARGE_AFD_INDEX=ON` enables 4,096
+independently locked Windows AFD target-index buckets and direct completion
+unlinking. The default `OFF` retains the compact 256-bucket index and omits
+the extra per-registration pointer. On x64 the opt-in index trades about
+62 KiB of additional global storage and one pointer per registration for
+shorter searches and less contention between epoll instances, preserving
+numeric target uniqueness, duplicate reservations, and socket lifetime rules.
+The explicit-rearm benchmark accepts an optional background registration
+count on a separate epoll instance. Measurements and validation are recorded
+in [`docs/WINDOWS_INDEX_PERFORMANCE_REVIEW.md`](WINDOWS_INDEX_PERFORMANCE_REVIEW.md).
+
 Windows socket registrations now share AFD control handles in groups of at
 most 128, bounding the native cancellation search at large registration counts.
 Groups retain deleted sockets until their completion packets settle; failed

@@ -631,6 +631,7 @@ else()
                 afd-submit-batch
                 afd-refresh-submit
                 afd-key-fallback
+                afd-key-order
                 afd-cancel
                 endpoint-identity
                 endpoint-policy

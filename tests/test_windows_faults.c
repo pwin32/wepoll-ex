@@ -600,10 +600,162 @@ static int afd_key_owner_valid(const ep_sock_t *sock, HANDLE key)
 
 static int afd_key_released(const ep_sock_t *sock)
 {
+#if WEPOLL_EX_LARGE_AFD_INDEX
+    if (sock->afd_poll_key_prev != NULL) return 0;
+#endif
     return sock->afd_poll_key_owned == 0 &&
            sock->afd_poll_target == NULL &&
            sock->afd_poll_key_reservation == NULL &&
            sock->afd_poll_key_next == NULL;
+}
+
+static int afd_key_compare(const void *left, const void *right)
+{
+    uintptr_t a = (uintptr_t)*(const HANDLE *)left;
+    uintptr_t b = (uintptr_t)*(const HANDLE *)right;
+
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static int afd_index_keys_unique(ep_sock_t *polls, size_t count, HANDLE *keys)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (!polls[i].afd_poll_key_owned || polls[i].afd_poll_target == NULL) {
+            return 0;
+        }
+        keys[i] = polls[i].afd_poll_target;
+    }
+    qsort(keys, count, sizeof(*keys), afd_key_compare);
+    for (size_t i = 1; i < count; i++) {
+        if (keys[i] == keys[i - 1]) return 0;
+    }
+    return 1;
+}
+
+static int afd_index_probe_owners(ep_port_t *port, const SOCKET *sockets,
+                                  size_t count, const HANDLE *keys,
+                                  size_t key_count)
+{
+    for (size_t i = 0; i < count; i++) {
+        ep_sock_t probe;
+        int valid;
+
+        submit_sock_init(&probe, port, sockets[i], 0);
+        /* Every original target remains occupied.  A new request for that
+         * socket must choose a key distinct from every retained request,
+         * even after unrelated completions changed the index chains. */
+        valid = ep_afd_poll_submit(&probe, AFD_POLL_RECEIVE, NULL) == 0 &&
+            bsearch(&probe.afd_poll_target, keys, key_count, sizeof(*keys),
+                     afd_key_compare) == NULL;
+        ep_afd_poll_key_release(&probe);
+        free(probe.afd_info);
+        if (!valid || !afd_key_released(&probe)) return 0;
+    }
+    return 1;
+}
+
+static int test_afd_key_order(void)
+{
+    enum { SOCKET_COUNT = 8192, ALIAS_COUNT = 64,
+           POLL_COUNT = SOCKET_COUNT + ALIAS_COUNT };
+    ep_sock_t *polls = NULL;
+    SOCKET *sockets = NULL;
+    HANDLE *keys = NULL;
+    ep_port_t port;
+    PNtDeviceIoControlFile original_submit = NULL;
+    const char *stage = "setup";
+    int result = -1;
+
+    memset(&port, 0, sizeof(port));
+    port.afd_group.afd = (HANDLE)(uintptr_t)1;
+    ep_fault_reset();
+    if (ep_global_init() != 0) goto cleanup;
+    polls = calloc(POLL_COUNT, sizeof(*polls));
+    sockets = malloc(SOCKET_COUNT * sizeof(*sockets));
+    keys = malloc(POLL_COUNT * sizeof(*keys));
+    if (sockets != NULL) {
+        for (size_t i = 0; i < SOCKET_COUNT; i++) sockets[i] = INVALID_SOCKET;
+    }
+    if (polls == NULL || sockets == NULL || keys == NULL) goto cleanup;
+    original_submit = g_ntdll.NtDeviceIoControlFile;
+    g_ntdll.NtDeviceIoControlFile = submit_stub;
+    g_submit_status = STATUS_PENDING;
+    g_submit_calls = 0;
+
+    /* Keep enough unrelated requests live to exercise colliding index entries,
+     * plus aliases that require distinct numeric targets for the same socket.
+     * The submit stub lets the test choose arbitrary completion order. */
+    stage = "initial owners";
+    for (size_t i = 0; i < SOCKET_COUNT; i++) {
+        sockets[i] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sockets[i] == INVALID_SOCKET) goto cleanup;
+        submit_sock_init(&polls[i], &port, sockets[i], 0);
+        if (ep_afd_poll_submit(&polls[i], AFD_POLL_RECEIVE, NULL) != 0) {
+            goto cleanup;
+        }
+    }
+    for (size_t i = 0; i < ALIAS_COUNT; i++) {
+        ep_sock_t *alias = &polls[SOCKET_COUNT + i];
+
+        submit_sock_init(alias, &port, sockets[(i * 127) % SOCKET_COUNT], 0);
+        if (ep_afd_poll_submit(alias, AFD_POLL_RECEIVE, NULL) != 0) {
+            goto cleanup;
+        }
+    }
+    if (!afd_index_keys_unique(polls, POLL_COUNT, keys) ||
+        !afd_index_probe_owners(&port, sockets, SOCKET_COUNT,
+                                keys, POLL_COUNT)) goto cleanup;
+
+    for (size_t round = 0; round < 4; round++) {
+        stage = "non-LIFO completion";
+        for (size_t i = round % 2; i < SOCKET_COUNT; i += 2) {
+            ep_sock_t *sock = &polls[(i * 4051) % SOCKET_COUNT];
+
+            ep_afd_poll_key_release(sock);
+            atomic_store(&sock->poll_status, EP_POLL_IDLE);
+            if (!afd_key_released(sock)) goto cleanup;
+        }
+        stage = "resubmit and rollback";
+        for (size_t offset = 0; offset < SOCKET_COUNT / 2; offset++) {
+            size_t i = SOCKET_COUNT - 2 - offset * 2 + round % 2;
+            ep_sock_t *sock = &polls[(i * 4051) % SOCKET_COUNT];
+
+            if (offset == 0) {
+                if (ep_fault_configure(EP_FAULT_AFD_SUBMIT, 1, EAGAIN) != 0 ||
+                    ep_afd_poll_submit(sock, AFD_POLL_SEND, NULL) != -1 ||
+                    errno != EAGAIN || !afd_key_released(sock)) goto cleanup;
+                ep_fault_reset();
+            }
+            if (ep_afd_poll_submit(sock, AFD_POLL_SEND, NULL) != 0) goto cleanup;
+        }
+        if (!afd_index_keys_unique(polls, POLL_COUNT, keys) ||
+            !afd_index_probe_owners(&port, sockets, SOCKET_COUNT,
+                                    keys, POLL_COUNT)) goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (result != 0) fprintf(stderr, "afd-key-order stage: %s\n", stage);
+    ep_fault_reset();
+    if (original_submit != NULL) g_ntdll.NtDeviceIoControlFile = original_submit;
+    if (polls != NULL) {
+        for (size_t i = 0; i < POLL_COUNT; i++) {
+            ep_afd_poll_key_release(&polls[i]);
+            if (!afd_key_released(&polls[i])) result = -1;
+            free(polls[i].afd_info);
+        }
+    }
+    if (sockets != NULL) {
+        for (size_t i = 0; i < SOCKET_COUNT; i++) {
+            if (sockets[i] != INVALID_SOCKET && closesocket(sockets[i]) != 0) {
+                result = -1;
+            }
+        }
+    }
+    free(keys);
+    free(sockets);
+    free(polls);
+    return result;
 }
 
 static int test_afd_key_fallback(void)
@@ -2701,6 +2853,7 @@ static const fault_test_case_t g_tests[] = {
     { "afd-submit-batch", test_afd_submit_batch },
     { "afd-refresh-submit", test_afd_refresh_submit },
     { "afd-key-fallback", test_afd_key_fallback },
+    { "afd-key-order", test_afd_key_order },
     { "afd-cancel", test_afd_cancel },
     { "endpoint-identity", test_endpoint_identity },
     { "endpoint-policy", test_endpoint_policy },
@@ -2772,7 +2925,7 @@ int main(int argc, char **argv)
             "usage: %s [all|framework|pool-init|pool-grow|provider-base|"
             "error-info-native|"
             "afd-open|afd-groups|afd-submit|afd-submit-batch|afd-refresh-submit|"
-            "afd-key-fallback|"
+            "afd-key-fallback|afd-key-order|"
             "afd-cancel|"
             "endpoint-identity|"
             "endpoint-policy|endpoint-closed-token-loss|iocp-create|"
