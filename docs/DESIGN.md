@@ -525,7 +525,11 @@ temporary fallback signal mask before unwinding.
   successful AFD receive completion is qualified with a one-byte direct
   `IOCTL_AFD_RECV` normal-plus-peek request issued through `DeviceIoControl`.
   Eligibility requires an unlayered base-provider protocol chain because this
-  native request bypasses Winsock provider transformations. Each request
+  native request bypasses Winsock provider transformations. Registration derives
+  protocol classification and this eligibility from one `SO_PROTOCOL_INFOW`
+  snapshot, using the existing cached fields. Failed or incomplete metadata
+  leaves the protocol unknown and direct receive qualification disabled;
+  the query preserves the caller's error state. Each request
   duplicates the provider base handle, revalidates endpoint identity in
   hardened lifetime modes, and pins that duplicate through settlement. Its
   private low-bit event prevents a qualifier packet from entering an

@@ -72,6 +72,10 @@ the original conservative AFD/select result.
 For ordinary nonterminal TCP state, the same `WSAPoll` result qualifies
 ET/exclusive read/write readiness, avoiding duplicate `select()` calls.
 
+Socket registration uses one `SO_PROTOCOL_INFOW` snapshot for both protocol
+classification and base-provider UDP receive eligibility. This removes a
+duplicate UDP metadata query while retaining the conservative provider checks.
+
 Direct Winsock local receive shutdown remains a platform boundary:
 `shutdown(SD_RECEIVE)` and `shutdown(SD_BOTH)` do not raise an AFD, `WSAPoll`,
 or `select` read event. `wepoll_ex_shutdown_socket()` is the opt-in
@@ -661,7 +665,8 @@ This exposes process-wide index costs even when the timed port is small:
 ```
 
 See [the initial Windows performance review](docs/WINDOWS_PERFORMANCE_REVIEW.md)
-and [the index follow-up](docs/WINDOWS_INDEX_PERFORMANCE_REVIEW.md) for
+and the [index](docs/WINDOWS_INDEX_PERFORMANCE_REVIEW.md) and
+[registration/API](docs/WINDOWS_API_PERFORMANCE_REVIEW.md) follow-ups for
 measurements, remaining bottlenecks, and the scope of the comparisons.
 
 `bench_mt_contention` covers what the single-threaded benchmark cannot: it

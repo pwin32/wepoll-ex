@@ -956,7 +956,10 @@ int      ep_socket_get_endpoint_id_with_ioctl(
 #endif
 #endif
 SOCKET   ep_socket_get_base(SOCKET socket);
-uint8_t  ep_socket_get_protocol(SOCKET socket);
+/* Query both classifications from one provider metadata snapshot. A failed
+ * or incomplete query leaves UNKNOWN protocol and an ineligible qualifier. */
+uint8_t  ep_socket_get_protocol(SOCKET socket,
+                                 uint8_t *udp_afd_qualifier_out);
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
 int      ep_socket_get_endpoint_id(SOCKET socket, uint64_t *endpoint_id);
 #endif

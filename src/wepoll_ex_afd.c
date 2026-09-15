@@ -667,10 +667,25 @@ uint8_t ep_socket_protocol_from_info(const WSAPROTOCOL_INFOW *protocol_info,
     }
     return EP_SOCKET_PROTOCOL_UNKNOWN;
 }
+
+/* Direct AFD receive bypasses Winsock provider-layer semantics. Restrict it
+ * to exact UDP/IP sockets with only the base provider in their chain. */
+int ep_socket_udp_afd_qualifier_from_info(
+    const WSAPROTOCOL_INFOW *protocol_info, int protocol_info_length)
+{
+    return ep_socket_protocol_from_info(protocol_info,
+                                        protocol_info_length) ==
+               EP_SOCKET_PROTOCOL_UDP &&
+        protocol_info != NULL &&
+        protocol_info_length >= (int)sizeof(*protocol_info) &&
+        protocol_info->ProtocolChain.ChainLen == BASE_PROTOCOL;
+}
 #endif
 
-uint8_t ep_socket_get_protocol(SOCKET socket)
+uint8_t ep_socket_get_protocol(SOCKET socket,
+                               uint8_t *udp_afd_qualifier_out)
 {
+    if (udp_afd_qualifier_out != NULL) *udp_afd_qualifier_out = 0;
 #ifdef _WIN32
     WSAPROTOCOL_INFOW protocol_info;
     int protocol_info_length = (int)sizeof(protocol_info);
@@ -685,6 +700,11 @@ uint8_t ep_socket_get_protocol(SOCKET socket)
                    (char *)&protocol_info, &protocol_info_length) == 0) {
         protocol = ep_socket_protocol_from_info(&protocol_info,
                                                 protocol_info_length);
+        if (udp_afd_qualifier_out != NULL) {
+            *udp_afd_qualifier_out =
+                (uint8_t)ep_socket_udp_afd_qualifier_from_info(
+                    &protocol_info, protocol_info_length);
+        }
     }
     WSASetLastError(saved_wsa_error);
     ep_restore_last_error_info(&saved_error);

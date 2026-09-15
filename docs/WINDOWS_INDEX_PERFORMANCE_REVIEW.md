@@ -8,6 +8,8 @@ Numeric target uniqueness and the socket lifetime contracts are preserved.
 The optimization is opt-in: CMake's `WEPOLL_EX_LARGE_AFD_INDEX` defaults to
 `OFF`. The measurements below compare the compact baseline with the larger
 index enabled; they do not describe a change to the default memory footprint.
+The [registration/API follow-up](WINDOWS_API_PERFORMANCE_REVIEW.md) examines
+duplicate protocol queries and descriptor-table locking after this change.
 
 ## Environment and method
 

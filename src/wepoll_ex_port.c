@@ -1148,42 +1148,6 @@ static ep_identity_check_t ep_sock_validate_identity_locked(
     ep_sock_t *sock, int allow_transition);
 #endif
 
-int ep_socket_udp_afd_qualifier_from_info(
-    const WSAPROTOCOL_INFOW *protocol_info, int protocol_info_length)
-{
-    return ep_socket_protocol_from_info(protocol_info,
-                                        protocol_info_length) ==
-               EP_SOCKET_PROTOCOL_UDP &&
-        protocol_info != NULL &&
-        protocol_info_length >= (int)sizeof(*protocol_info) &&
-        protocol_info->ProtocolChain.ChainLen == BASE_PROTOCOL;
-}
-
-/* Direct AFD receive bypasses Winsock provider-layer semantics.  Restrict it
- * to exact UDP/IP sockets whose protocol chain contains only the base
- * provider; layered/custom chains retain the conservative poll mapping. */
-static uint8_t ep_socket_udp_afd_qualifier_eligible(SOCKET fd)
-{
-    WSAPROTOCOL_INFOW protocol_info;
-    int protocol_info_length = (int)sizeof(protocol_info);
-    int saved_errno = ep_last_err();
-    int saved_wsa_error = WSAGetLastError();
-    DWORD saved_last_error = GetLastError();
-    uint8_t eligible = 0;
-
-    memset(&protocol_info, 0, sizeof(protocol_info));
-    if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL_INFOW,
-                   (char *)&protocol_info, &protocol_info_length) == 0 &&
-        ep_socket_udp_afd_qualifier_from_info(
-            &protocol_info, protocol_info_length)) {
-        eligible = 1;
-    }
-    WSASetLastError(saved_wsa_error);
-    SetLastError(saved_last_error);
-    ep_set_errno(saved_errno);
-    return eligible;
-}
-
 /* Determine whether a provider handle supports overlapped I/O.  Registration
  * caches the initial answer, and each pinned per-probe duplicate is checked
  * again so native close/reuse cannot transfer that capability to another file
@@ -3097,14 +3061,11 @@ static ep_sock_t *ep_sock_alloc_locked(ep_port_t *port, SOCKET fd,
         sock->endpoint_id_state = EP_SOCKET_ID_UNAVAILABLE;
 #endif
     } else {
-        sock->socket_protocol = ep_socket_get_protocol(fd);
-        if (sock->socket_protocol == EP_SOCKET_PROTOCOL_UDP) {
-            sock->udp_afd_qualifier_eligible =
-                ep_socket_udp_afd_qualifier_eligible(fd);
-            if (sock->udp_afd_qualifier_eligible) {
-                sock->async_read_capability =
-                    ep_socket_async_read_capability(sock->base_socket);
-            }
+        sock->socket_protocol = ep_socket_get_protocol(
+            fd, &sock->udp_afd_qualifier_eligible);
+        if (sock->udp_afd_qualifier_eligible) {
+            sock->async_read_capability =
+                ep_socket_async_read_capability(sock->base_socket);
         }
 #ifndef WEPOLL_EX_ASSUME_SYNCHRONIZED_SOCKET_LIFETIME
         identity_result = ep_socket_get_endpoint_id(fd, &sock->endpoint_id);

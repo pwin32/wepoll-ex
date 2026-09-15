@@ -207,6 +207,86 @@ static SOCKET make_tcp_listener_socket(void)
     return socket_fd;
 }
 
+static int check_protocol_query(const char *name, SOCKET socket_fd,
+                                uint8_t expected_protocol,
+                                uint8_t expected_qualifier)
+{
+    wepoll_ex_error_info expected_error;
+    wepoll_ex_error_info actual_error;
+    uint8_t qualifier = UINT8_MAX;
+    uint8_t protocol;
+    int saved_wsa_error;
+    DWORD saved_last_error;
+
+    ep_set_ntstatus_error(STATUS_CANCELLED);
+    ep_get_last_error_info(&expected_error);
+    WSASetLastError(WSAEINPROGRESS);
+    saved_wsa_error = WSAGetLastError();
+    saved_last_error = GetLastError();
+    protocol = ep_socket_get_protocol(socket_fd, &qualifier);
+    ep_get_last_error_info(&actual_error);
+    if (protocol != expected_protocol || qualifier != expected_qualifier ||
+        ep_last_err() != expected_error.portable_error ||
+        WSAGetLastError() != saved_wsa_error ||
+        GetLastError() != saved_last_error ||
+        memcmp(&actual_error, &expected_error, sizeof(actual_error)) != 0) {
+        fprintf(stderr, "%s: protocol query changed classification or errors\n",
+                name);
+        return -1;
+    }
+    return check_protocol(name, ep_socket_get_protocol(socket_fd, NULL),
+                           expected_protocol);
+}
+
+static int test_protocol_query(void)
+{
+    static const struct {
+        const char *name;
+        int family;
+        int type;
+        int protocol;
+        uint8_t expected_protocol;
+        uint8_t expected_qualifier;
+    } cases[] = {
+        { "UDP IPv4 query", AF_INET, SOCK_DGRAM, IPPROTO_UDP,
+          EP_SOCKET_PROTOCOL_UDP, 1 },
+        { "UDP IPv6 query", AF_INET6, SOCK_DGRAM, IPPROTO_UDP,
+          EP_SOCKET_PROTOCOL_UDP, 1 },
+        { "TCP IPv4 query", AF_INET, SOCK_STREAM, IPPROTO_TCP,
+          EP_SOCKET_PROTOCOL_TCP, 0 },
+        { "TCP IPv6 query", AF_INET6, SOCK_STREAM, IPPROTO_TCP,
+          EP_SOCKET_PROTOCOL_TCP, 0 }
+    };
+    HANDLE event;
+    int result;
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        SOCKET socket_fd = socket(cases[i].family, cases[i].type,
+                                   cases[i].protocol);
+
+        if (socket_fd == INVALID_SOCKET) {
+            if (cases[i].family == AF_INET6 &&
+                WSAGetLastError() == WSAEAFNOSUPPORT) continue;
+            return -1;
+        }
+        result = check_protocol_query(cases[i].name, socket_fd,
+                                       cases[i].expected_protocol,
+                                       cases[i].expected_qualifier);
+        if (closesocket(socket_fd) != 0 || result != 0) return -1;
+    }
+    if (check_protocol_query("invalid socket query", INVALID_SOCKET,
+                              EP_SOCKET_PROTOCOL_UNKNOWN, 0) != 0) return -1;
+
+    /* A valid non-socket HANDLE exercises a failed provider query, including
+     * clearing a previously nonzero qualifier and preserving exact errors. */
+    event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (event == NULL) return -1;
+    result = check_protocol_query("non-socket query", (SOCKET)(uintptr_t)event,
+                                   EP_SOCKET_PROTOCOL_UNKNOWN, 0);
+    if (!CloseHandle(event)) return -1;
+    return result;
+}
+
 static int test_protocol_metadata(void)
 {
     WSAPROTOCOL_INFOW protocol_info;
@@ -380,7 +460,7 @@ static int test_mapping(void)
         AFD_POLL_DISCONNECT | AFD_POLL_ABORT | AFD_POLL_LOCAL_CLOSE |
         AFD_POLL_ACCEPT | AFD_POLL_CONNECT_FAIL;
 
-    if (test_protocol_metadata() != 0 ||
+    if (test_protocol_metadata() != 0 || test_protocol_query() != 0 ||
         check_mask("AFD receive",
                    ep_afd_to_epoll_events(AFD_POLL_RECEIVE,
                                           STATUS_SUCCESS,

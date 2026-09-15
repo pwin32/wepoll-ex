@@ -6,6 +6,15 @@ This is an experimental preview of the extended epoll-shaped API, the Windows
 IOCP/AFD backend, the Linux development wrapper, and the optional nginx 1.31.3
 adapter. The API and ABI may change before a stable release.
 
+Windows socket registration now derives protocol classification and
+base-provider UDP receive eligibility from one `SO_PROTOCOL_INFOW` query.
+This removes a duplicate UDP query without adding persistent storage or
+changing the provider, identity, or asynchronous-I/O checks. Live TCP/UDP
+IPv4/IPv6 and failed-query regressions cover classification and preservation
+of the caller's error state. The modest warmed-registration benefit and an
+unretained descriptor-lock experiment are documented in
+[`docs/WINDOWS_API_PERFORMANCE_REVIEW.md`](WINDOWS_API_PERFORMANCE_REVIEW.md).
+
 The opt-in CMake setting `WEPOLL_EX_LARGE_AFD_INDEX=ON` enables 4,096
 independently locked Windows AFD target-index buckets and direct completion
 unlinking. The default `OFF` retains the compact 256-bucket index and omits
